@@ -81,32 +81,16 @@ endif
 nythera_lib_dep = dependency('nythera-lib', method: 'pkg-config',
   version: ['>=0.1.0', '<0.2.0'], static: false, allow_fallback: false)
 wayland_client_dep  = dependency('wayland-client')
-wayland_egl_dep     = dependency('wayland-egl')
-freetype2_dep       = dependency('freetype2')
-fontconfig_dep      = dependency('fontconfig')
-cairo_dep           = dependency('cairo')
-cairo_ft_dep        = dependency('cairo-ft')
-pango_dep           = dependency('pango', version: '>=1.50')
-pangocairo_dep      = dependency('pangocairo')
-pangoft2_dep        = dependency('pangoft2')
-harfbuzz_dep        = dependency('harfbuzz')
-librsvg_dep         = dependency('librsvg-2.0')
 xkbcommon_dep       = dependency('xkbcommon')
 glib_dep            = dependency('glib-2.0')
 gobject_dep         = dependency('gobject-2.0')
 gio_dep             = dependency('gio-2.0')
 gio_unix_dep        = dependency('gio-unix-2.0')
 polkit_gobject_dep  = dependency('polkit-gobject-1')
-curl_dep            = dependency('libcurl')
-md4c_dep            = dependency('md4c')
-nlohmann_dep        = dependency('nlohmann_json')
-tomlplusplus_dep    = dependency('tomlplusplus')
-dl_dep              = cpp.find_library('dl', required: false)
 
 jemalloc_option = get_option('jemalloc')
 is_glibc = cpp.get_define('__GLIBC__', prefix: '#include <features.h>') != ''
 jemalloc_deps = []
-jemalloc_cpp_args = []
 
 if jemalloc_option.enabled() and not is_glibc
   error('jemalloc support requires glibc')
@@ -116,29 +100,8 @@ if is_glibc
   jemalloc_dep = dependency('jemalloc', required: jemalloc_option)
   if jemalloc_dep.found()
     jemalloc_deps += [jemalloc_dep]
-    jemalloc_cpp_args += ['-DNYTHERA_USE_JEMALLOC=1']
   endif
 endif
-
-egl_dep = dependency('egl', required: false)
-gles2_dep = dependency('glesv2', required: false)
-
-if not egl_dep.found()
-  egl_dep = dependency('wayland-egl', required: false)
-endif
-
-if not egl_dep.found()
-  egl_dep = dependency('epoxy')
-endif
-
-if not gles2_dep.found()
-  gles2_dep = dependency('epoxy')
-endif
-
-libwebp_dep       = dependency('libwebp', required: true)
-libwebpdemux_dep  = dependency('libwebpdemux', required: true)
-libjxl_dep          = dependency('libjxl', required: true)
-libjxl_threads_dep  = dependency('libjxl_threads', required: true)
 
 _nythera_files_sources = files(
   'src/filemanager/file_manager.cpp',
@@ -200,39 +163,19 @@ _nythera_inc = [
 _nythera_files_dependencies = [
   nythera_lib_dep,
   wayland_client_dep,
-  egl_dep,
-  gles2_dep,
-  wayland_egl_dep,
-  freetype2_dep,
-  fontconfig_dep,
-  cairo_dep,
-  cairo_ft_dep,
-  pango_dep,
-  pangocairo_dep,
-  pangoft2_dep,
-  harfbuzz_dep,
-  librsvg_dep,
   xkbcommon_dep,
   glib_dep,
   gobject_dep,
   gio_dep,
   gio_unix_dep,
   polkit_gobject_dep,
-  curl_dep,
-  nlohmann_dep,
-  tomlplusplus_dep,
-  md4c_dep,
-  libwebp_dep,
-  libwebpdemux_dep,
-  libjxl_dep,
-  libjxl_threads_dep,
-] + jemalloc_deps + (dl_dep.found() ? [dl_dep] : [])
+] + jemalloc_deps
 
 _nythera_compile_definitions = [
   '-DNYTHERA_INSTALL_PREFIX="' + get_option('prefix') + '"',
   '-DNYTHERA_INSTALL_DATADIR="' + get_option('datadir') + '"',
   '-DNYTHERA_VERSION="' + meson.project_version() + '"',
-] + jemalloc_cpp_args
+]
 
 _nythera_cpp_args = [
   '-Wall', '-Wextra', '-Wno-missing-field-initializers', '-Wpedantic', '-Wconversion', '-Wshadow',
