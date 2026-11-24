@@ -109,11 +109,21 @@ You can follow development and report issues through the [GitHub issue tracker](
 
 Nythera Files is currently experimental and primarily developed on **Arch Linux with Umbriel**.
 
-It uses Meson and C++23, and requires a compatible installed version of NytheraLib.
+It uses Meson, `just`, and C++23, and requires a compatible installed version of NytheraLib (`>=0.1.0, <0.2.0`).
 
-An Arch `PKGBUILD` is provided in [`packaging/arch/`](packaging/arch/).
+For local development after building and installing NytheraLib:
 
-For development builds, use the repository's Meson configuration. Other environments have not been extensively tested.
+```sh
+just configure
+just build
+just test
+```
+
+The default `debug` mode uses `build-debug/` configured with Meson's `debugoptimized` build type. When `nythera-lib` is not already resolvable via system `pkg-config` or an explicit `PKG_CONFIG_PATH`, `just` automatically falls back to `$HOME/.local/opt/nythera-lib/lib/pkgconfig` while keeping explicit paths and system installs prioritized.
+
+During coordinated `0.1.x` development, always build and install `nythera-lib` before building `nythera-files`. Rebuild `nythera-files` whenever `nythera-lib` public headers, inline/template implementations, or ABI-affecting build options change, and restart running `nythera-file-manager` processes to load reinstalled `.cpp`-only library updates (see NytheraLib's `README.md`).
+
+An Arch `PKGBUILD` is provided in [`packaging/arch/`](packaging/arch/). Note that `just install debug` installs under `/usr/local` (and `/usr/share/polkit-1/actions/`) and requires elevated privileges, whereas `packaging/arch/PKGBUILD` installs under `/usr`; avoid mixing both helper locations on one host. Other environments have not been extensively tested.
 
 There is no stable packaged release yet.
 
