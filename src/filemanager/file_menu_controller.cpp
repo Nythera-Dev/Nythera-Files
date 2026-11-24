@@ -1409,6 +1409,7 @@ namespace filemanager {
         .preferredWidth = 500.0F,
         .preferredHeight = 500.0F,
         .nativeWindow = true,
+        .nativeAppId = "dev.nythera.FileManager.OpenWith",
         .nativeParent = surface ? surface->xdgToplevel() : nullptr,
         .nativeParentSurface = surface ? surface->wlSurface() : nullptr
     };

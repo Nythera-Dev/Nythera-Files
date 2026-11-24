@@ -7,9 +7,13 @@ arch=(x86_64 aarch64)
 url='https://github.com/Nythera-Dev/Nythera-Files'
 license=(MIT)
 depends=('nythera-lib>=0.1.0' 'nythera-lib<0.2.0' libnythera_lib.so
-         cairo curl fontconfig freetype2 glib2 harfbuzz jemalloc libgcc libglvnd
-         libjxl librsvg libstdc++ libwebp libxkbcommon md4c nlohmann-json pango
-         polkit tomlplusplus wayland)
+         glib2 jemalloc libgcc libstdc++ libxkbcommon polkit tomlplusplus wayland)
+optdepends=(
+  'gvfs: Wastebin (trash://), removable media mounting, and remote filesystem support'
+  'gvfs-smb: SMB/CIFS network share browsing'
+  'gvfs-mtp: MTP device browsing'
+  'gvfs-nfs: NFS network share browsing'
+)
 makedepends=(git meson ninja pkgconf)
 
 build() {

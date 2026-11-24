@@ -5,6 +5,4 @@ install_data('LICENSE',
 
 subdir('dialogue-window-artwork')
 subdir('concepts')
-subdir('fonts')
-subdir('translations')
 subdir('templates')

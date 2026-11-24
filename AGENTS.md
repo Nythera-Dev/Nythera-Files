@@ -1,40 +1,55 @@
 # Nythera Files Agent Instructions
 
-Repository-specific guidance supplementing the global Codex `AGENTS.md`. Follow global instructions for general research, initiative, safety, efficient tool use and reporting; do not treat this file as replacing them.
+Repository-specific guidance supplementing global agent instructions. Follow global rules alongside this document; do not treat this file as replacing them.
 
-## Project context and invariants
+## Common development rules
 
-- **Nythera Files** is a standalone C++23 native Wayland file manager (`nythera-file-manager`) with Polkit helpers (`nythera-properties-helper`, `nythera-admin-helper`) and its own asset bundle (`files-assets/`), built with **Meson/Ninja** and orchestrated by `just`.
+### Workflow, scope and tool efficiency
+
+- **Orient and inspect:** Check `git status --short` before edits. Identify the owning subsystem with `rg --files`, focused `rg -n` searches, and bounded `sed -n` reads. Exclude `third_party/`, build trees, generated output, caches, and unrelated large assets unless relevant.
+- **Implement coherently:** Keep related edits together. Avoid touching unrelated code, speculative abstractions, unnecessary refactoring, or mass reformatting. For research-only requests, inspect and explain without editing.
+- **Preserve behaviour and invariants:** Preserve dark sci-fi/fantasy aesthetics, configurable styling, Umbriel compatibility, and approved architectural decisions. Surface conflicts with documented technical invariants rather than silently bypassing them.
+- **Tool efficiency:** Prefer repository source over external browsing; prefer direct Git, `rg`/`sed`, and focused patches over heavy scripts (use Python or shell only for structured processing or reproducible diagnostics). Keep compiler/test output in local logs and inspect excerpts rather than dumping full logs. Await completion without repeated polling; check exit codes. Do not use subagents for routine work; delegate only independent bounded work where coordination costs are justified. Reuse existing visual captures for unchanged visual states.
+
+### Build, formatting and validation safeguards
+
+- Use the existing `build-debug/` directory (`debugoptimized` default) and incremental `just build` (which configures if necessary; do not run `just configure` before every build).
+- Do not run `just rebuild`, `just clean`, ASan, release builds, full `just lint`, or full `just test` by default.
+- Format **only touched C++ files** under `src/` and `tests/` with the project's configured `clang-format` version (22+). Do not run repo-wide `just format-code` for narrow changes.
+- Prefer focused `clang-tidy -p build-debug --warnings-as-errors='*' <touched-files>` when lint is warranted; whole-tree `just lint` is an explicit-request/CI operation.
+- Before a targeted Meson test, use `meson test -C build-debug --list` once if the exact test name is unknown, then run `meson test -C build-debug <test-name> --print-errorlogs`. Add a focused isolated regression test when protecting a deterministic contract not already covered; do not invent arbitrary tests merely to tick a box.
+- **Review before finishing:** Run `git diff --check`, review the changed-file list and focused diff, check affected architectural invariants, and report actual checks run, scope, and unresolved items. Never cite unverified claims or inferred test passes.
+
+### Authorisation and Git safety
+
+- Do not modify live user configuration (`~/.config/nythera`, `~/.local/state/nythera`), install host packages, modify global system configuration, restart running applications/services, commit, or push without explicit authorisation.
+- Protect uncommitted work: do not reset, overwrite, stash, rebase, force-push, or merge into `main` without explicit approval and an accounted-for state.
+- Use `dev` for ordinary development; create a temporary task branch or worktree only for substantial or risky changes.
+- When authorised to commit or push "your changes", identify and stage the complete relevant session change set across implementation, tests, assets, and docs (never blindly staging the entire working tree; ask if ownership is uncertain). Verify the remote branch after pushing and report what was committed, what was pushed, and any relevant uncommitted files.
+
+### Baseline test isolation and data safety
+
+- All tests involving filesystem mutations or user/system services must operate exclusively on isolated, disposable fixtures—never touching live user config, home directory contents, or the live session bus.
+- Any test constructing `ConfigService` or application services must isolate `HOME`, `NYTHERA_{CONFIG,STATE,DATA}_HOME`, `XDG_{CONFIG,STATE,DATA,CACHE}_HOME`, set `GIO_USE_VFS=local`, and disable or privately isolate `DBUS_SESSION_BUS_ADDRESS` before instantiation; never fall back silently to the live session bus.
+- Create fixture roots exclusively (`mkdtemp` or exclusive `create_directory`) and clean up by exact owned path only—never via prefix or wildcard sweeps.
+- Drain asynchronous workers and helper sessions cleanly before teardown; avoid `std::exit()` or unguarded paths that skip fixture disposal. Immediately stop and report any unintended user-data modification or isolation gap.
+
+---
+
+## Nythera Files context and invariants
+
+- **Nythera Files** is a standalone C++23 native Wayland file manager (`nythera-file-manager`) with Polkit helpers (`nythera-properties-helper`, `nythera-admin-helper`) and its own application asset bundle (`files-assets/`), built with **Meson/Ninja** and orchestrated by `just`.
 - Development primarily targets **Umbriel**. Preserve dark sci-fi/fantasy aesthetics and configurable styling rendered through **NytheraLib**.
-- Maintain strict independence from **Nythera Shell**: do not introduce build-time or mandatory runtime dependencies on `nythera-shell` sources, IPC, or shell-owned assets (`FileManager` reads shared Shell config read-only and falls back to built-in palettes).
-- Preserve Polkit action IDs (`data/polkit/dev.nythera.Files.*.policy.in`), helper IPC contracts, and root-ownership security checks. Do not run privileged installs (`sudo just install`, `makepkg -si`) or mix `/usr/local/libexec/` and `/usr/lib/` helper prefixes without explicit authorisation.
-- Follow relevant project documentation listed below. Surface conflicts with documented technical invariants rather than silently bypassing them.
+- Maintain strict independence from **Nythera Shell**: do not introduce build-time or mandatory runtime dependencies on `nythera-shell` sources, IPC, or Shell-owned assets (`FileManager` reads shared Shell config read-only and falls back to built-in palettes).
+- **Asset ownership and GVfs:** `files-assets/` owns Files-specific templates, dialogue artwork, and icons; shared fonts, Tabler glyph metadata, and library translations come from **NytheraLib**. Keep GVfs optional with graceful local-filesystem fallback when GVfs or individual backends are unavailable.
+- Preserve Polkit action IDs (`data/polkit/dev.nythera.Files.*.policy.in`), helper IPC contracts, and root-ownership security checks. Do not run privileged installs (`sudo just install`, `makepkg -si`), modify host Polkit files, or mix `/usr/local/libexec/` and `/usr/lib/` helper prefixes without explicit authorisation.
+- Launch or restart `nythera-file-manager` only after successful build/applicable tests, when necessary and explicitly authorised.
 
 ## Cross-repository dependencies (NytheraLib)
 
 - `nythera-files` dynamically links `nythera-lib` (`>=0.1.0, <0.2.0`) via `pkg-config`.
 - `justfile` automatically discovers `$HOME/.local/opt/nythera-lib/lib/pkgconfig` when `nythera-lib` is not already found by system `pkg-config` or an explicit `PKG_CONFIG_PATH`, without permanently modifying the shell environment.
-- Follow the coordinated `0.1.x` rebuild discipline in `../nythera-lib/README.md`:
-  - Build and install `nythera-lib` before building or testing `nythera-files` against library changes.
-  - Rebuild `nythera-files` whenever `nythera-lib` public headers, inline/template implementations, or ABI-affecting build options (`debug`/`debugoptimized` vs `release`, sanitizers, toolchain/stdlib) change.
-  - `.cpp`-only `nythera-lib` updates require reinstalling `nythera-lib` and restarting running `nythera-file-manager` processes (only when authorised), without needing to relink `nythera-files`.
-
-## Repository workflow
-
-1. **Orient and inspect.** Check `git status --short` before edits. Identify the owning subsystem using `rg --files`, focused `rg -n` searches and bounded `sed -n` reads. Exclude `third_party/`, build trees, generated output and caches unless relevant.
-2. **Implement coherently.** Keep related edits together and avoid touching unrelated code or mass reformatting. For research-only requests, inspect and explain without editing.
-3. **Validate proportionately.** Use the change-type matrix below, generally one incremental build and focused tests rather than whole-tree checks.
-4. **Verify live UI when appropriate.** Launch or restart `nythera-file-manager` only after successful build/applicable tests, when necessary and explicitly authorised. Never perform privileged helper installs or modify host Polkit files without explicit authorisation.
-5. **Review before finishing.** Use `git diff --check`, review the changed-file list and focused diff, and check affected architectural invariants. Recheck after subsequent edits when necessary.
-
-## Nythera Files tool practices
-
-- Prefer repository source to external browsing; consult external docs for unresolved API, compatibility or upstream-change questions.
-- Prefer direct Git, `rg`/`sed` and focused patches for ordinary operations. Use Python or shell scripts for structured processing or reproducible diagnostics—not to wrap a single trivial command.
-- Keep compiler/test output in local logs and inspect error excerpts rather than dumping full logs. Await process completion without repeated polling; check exit codes.
-- Use existing captures for unchanged visual states. Capture new or cropped views when rendered behaviour changes or evidence is insufficient.
-- Do not use subagents for routine work; delegate only independent bounded work where coordination costs are justified.
-- Do not modify live user configuration (`~/.config/nythera`, `~/.local/state/nythera`), install packages, clean builds, or modify global system configuration without explicit authorisation.
+- Follow the coordinated `0.1.x` rebuild discipline in `../nythera-lib/README.md`: build and install `nythera-lib` before building or testing `nythera-files` against library changes; rebuild `nythera-files` whenever `nythera-lib` public headers, inline/template implementations, or ABI-affecting build options (`debug`/`debugoptimized` vs `release`, sanitizers, toolchain/stdlib) change; restart running `nythera-file-manager` processes (only when authorised) to load reinstalled `.cpp`-only library updates.
 
 ## Choose validation by change type
 
@@ -46,41 +61,17 @@ Repository-specific guidance supplementing the global Codex `AGENTS.md`. Follow 
 | File operations, Wastebin, Polkit protocols, configuration, persistence or state transitions | Incremental `just build` and directly relevant tests; add a focused isolated regression test when protecting a deterministic contract not already covered.                      |
 | Internal shared headers, event loop, or `meson.build` changes                               | Incremental `just build` plus a reasoned selection of affected tests; expand to full suite only when impact cannot be bounded.                                                  |
 
-- Use the existing `build-debug/` directory (`debugoptimized` default) and incremental builds when available and correctly configured. `just build` configures if necessary; do not run `just configure` before every build.
-- Do not run `just rebuild`, `just clean`, ASan, release builds, full `just lint`, or full `just test` by default.
-- Prefer focused clang-tidy for touched `.cpp` files if lint is warranted: `clang-tidy -p build-debug --warnings-as-errors='*' <touched-files>`. Whole-tree `just lint` is an explicit-request/CI operation.
-- Prefer formatting **only touched C++ files** under `src/` and `tests/` with the project's configured clang-format version (22+). Do not run repo-wide `just format-code` for narrow changes.
-- Before a targeted Meson test, use `meson test -C build-debug --list` once if the exact test name is unknown. If no matching test exists, don't invent an arbitrary test merely to tick a box.
+## Files-specific test isolation and data safety
+
+- Never use the user's actual Wastebin, home directory contents, existing files, or mounted data as destructive test targets.
+- Wastebin tests must use an injected isolated `WastebinBackend` or fully isolated Trash environment with fail-closed production Wastebin guards enabled; changing `XDG_DATA_HOME` alone must not be assumed to isolate mounted filesystem Wastebins, and automated tests must never inspect or delete entries under a live mount's `.Trash-*` directory.
+- Tests involving GIO, GVfs, D-Bus, or other system services must isolate or mock any backend capable of modifying live user data.
+- Any test constructing `FileManager` or `FileOperationManager` must enforce full `HOME`, `NYTHERA_*`, `XDG_*`, `GIO_USE_VFS=local`, and `DBUS_SESSION_BUS_ADDRESS` isolation before instantiation.
+- Real filesystem and network mount acceptance tests are permitted only using uniquely named disposable fixtures (`mkdtemp` / exclusive `create_directory`); clean up only artefacts created by the test.
+- Before running unfamiliar tests that perform destructive operations, verify that their targets and backends are safely isolated; if isolation cannot be guaranteed, do not run the test and report the limitation instead.
 
 ## Working with project documentation
 
-- `README.md`: standalone architecture, build/test workflow, and NytheraLib relationship.
+- `README.md`: standalone architecture, build/test workflow, optional GVfs behaviour, and NytheraLib relationship.
 - `docs/FILE-MANAGER-CONFLICTS.md`, `docs/FILE-MANAGER-PLACES.md`, `docs/FILE-PROPERTIES.md`: subsystem design and behavioural invariants.
 - `../nythera-lib/README.md`: user-local NytheraLib installation and coordinated `0.1.x` rebuild discipline.
-
-## Git safety
-
-- Protect uncommitted work: do not reset, overwrite, stash, rebase, force-push or merge into `main` without explicit approval and an accounted-for state.
-- Use `dev` for ordinary development. Create a temporary task branch (or worktree) only for substantial or risky changes.
-- Do not commit or push until explicitly authorised.
-
-### Committing and pushing session work
-
-- When asked to commit or push "your changes", identify the complete relevant change set from the current task or session across implementation, tests, assets, documentation, additions and deletions.
-- Review the files to be staged and commit the full relevant change set; do not blindly stage the entire working tree. If ownership or inclusion is genuinely uncertain, ask before including those files.
-- After pushing, verify the remote branch contains the intended commit and report what was committed, what was pushed and any relevant changes left uncommitted.
-
-## Test Isolation and Data Safety
-
-- All tests involving filesystem mutations must operate exclusively on isolated, disposable test fixtures.
-- Never use the user's actual Wastebin, home directory contents, existing files or mounted data as destructive test targets.
-- Wastebin tests must use an injected test backend or fully isolated Trash environment. Changing `XDG_DATA_HOME` alone must not be assumed to isolate mounted filesystem Wastebins.
-- Tests involving GIO, GVfs, D-Bus or other system services must isolate or mock any backend capable of modifying live user data.
-- Real filesystem and network mount acceptance tests are permitted using uniquely named disposable fixtures. Clean up only artefacts created by the test.
-- Before running unfamiliar tests that perform destructive operations, verify that their targets and backends are safely isolated.
-- If isolation cannot be guaranteed, do not run the affected test. Report the limitation instead.
-- Immediately stop and report any unintended modification or deletion of user data.
-- Any test constructing `FileManager`, `ConfigService`, or `FileOperationManager` must isolate `HOME`, `NYTHERA_{CONFIG,STATE,DATA}_HOME`, `XDG_{CONFIG,STATE,DATA,CACHE}_HOME`, set `GIO_USE_VFS=local`, and disable or privately isolate `DBUS_SESSION_BUS_ADDRESS` before instantiation; never fall back silently to the live session bus.
-- Destructive Wastebin tests must inject an isolated `WastebinBackend` and run with fail-closed production Wastebin guards enabled; automated tests must never inspect or delete entries under a live mount's `.Trash-*` directory.
-- Fixture roots must be created exclusively (e.g. `mkdtemp` or exclusive `create_directory`) and cleaned up by exact owned path only—never via prefix or wildcard sweeps over shared or mount parent directories.
-- Ensure asynchronous workers and helper sessions drain cleanly before teardown, and avoid `std::exit()` or unguarded cleanup paths that skip fixture disposal or leave workers racing shutdown.

@@ -61,7 +61,7 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 - Personal Places and bookmarked directories.
 - Local devices, mounted volumes and network locations.
 - Mount management and filesystem capacity information.
-- GIO/GVfs-based filesystem integration.
+- Optional GIO/GVfs integration: `gvfs` provides `trash://` Wastebin browsing, GVfs volume/remote mounting, and FUSE mount paths, while protocol backends (such as `gvfs-smb`, `gvfs-mtp`, and `gvfs-nfs`) extend remote location support. When GVfs or individual backends are unavailable, local browsing, file operations, and UDisks2/systemd mount tracking continue working gracefully.
 
 ### Tools & Integration
 
@@ -119,7 +119,7 @@ just build
 just test
 ```
 
-The default `debug` mode uses `build-debug/` configured with Meson's `debugoptimized` build type. When `nythera-lib` is not already resolvable via system `pkg-config` or an explicit `PKG_CONFIG_PATH`, `just` automatically falls back to `$HOME/.local/opt/nythera-lib/lib/pkgconfig` while keeping explicit paths and system installs prioritized.
+The default `debug` mode uses `build-debug/` configured with Meson's `debugoptimized` build type. When `nythera-lib` is not already resolvable via system `pkg-config` or an explicit `PKG_CONFIG_PATH`, `just` automatically falls back to `$HOME/.local/opt/nythera-lib/lib/pkgconfig` while keeping explicit paths and system installs prioritized. Shared Nythera fonts, Tabler glyph metadata, and library component translations are supplied by NytheraLib (`share/nythera-lib/assets/`), while `files-assets/` provides Files-specific templates, dialogue artwork, and icons.
 
 During coordinated `0.1.x` development, always build and install `nythera-lib` before building `nythera-files`. Rebuild `nythera-files` whenever `nythera-lib` public headers, inline/template implementations, or ABI-affecting build options change, and restart running `nythera-file-manager` processes to load reinstalled `.cpp`-only library updates (see NytheraLib's `README.md`).
 
