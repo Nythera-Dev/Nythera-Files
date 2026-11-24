@@ -6,7 +6,7 @@ Nythera Files started because I couldn't quite find a file manager that combined
 
 Dolphin has fantastic functionality, COSMIC Files has a lovely interface, and Thunar has plenty of practical touches. But none of them were quite what I wanted.
 
-So naturally, instead of settling for one, I decided to build my own. 🤣
+So naturally, instead of settling for one, I decided to build my own 🤣
 
 Originally developed as part of [Nythera Shell](https://github.com/Nythera-Dev/Nythera), Files has since grown into a standalone application using the shared [NytheraLib](https://github.com/Nythera-Dev/NytheraLib) rendering and UI infrastructure.
 
