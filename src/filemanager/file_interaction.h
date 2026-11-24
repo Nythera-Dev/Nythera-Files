@@ -1,0 +1,91 @@
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
+
+namespace filemanager {
+  inline bool userCanReadPath(const std::filesystem::path& path, bool directory = false) {
+    return ::access(path.c_str(), directory ? R_OK | X_OK : R_OK) == 0;
+  }
+
+  inline std::string expandHomePath(std::string_view path, std::string_view home) {
+    if (path == "~" || path == "~/")
+      return std::string(home);
+    if (!path.starts_with("~/"))
+      return std::string(path);
+    std::string expanded(home);
+    expanded.append(path.substr(home.ends_with('/') ? 2 : 1));
+    return expanded;
+  }
+
+  inline constexpr bool locationEditCancelIsCurrent(bool editing, std::uint64_t current, std::uint64_t captured) {
+    return editing && current == captured;
+  }
+
+  inline constexpr bool pointerOutsideRect(float x, float y, float left, float top, float width, float height) {
+    return x < left || y < top || x >= left + width || y >= top + height;
+  }
+
+  inline constexpr std::string_view invalidFileNameReason(std::string_view name) {
+    if (name.empty())
+      return "A filename cannot be empty.";
+    if (name == "." || name == "..")
+      return "A filename cannot be . or ..";
+    if (name.find('/') != std::string_view::npos)
+      return "File and folder names cannot contain /.";
+    if (name.find('\0') != std::string_view::npos)
+      return "A filename cannot contain a NUL character.";
+    return {};
+  }
+
+  inline constexpr bool validFileName(std::string_view name) { return invalidFileNameReason(name).empty(); }
+
+  // Resolve only explicitly selected paths and the chosen drop target. Discovery
+  // and recursive copy retain their existing no-follow policies.
+  inline std::optional<std::filesystem::path>
+  checkedDropTarget(const std::vector<std::string>& sources, const std::filesystem::path& destination) {
+    std::error_code error;
+    auto target = std::filesystem::canonical(destination, error);
+    if (sources.empty() || error || !std::filesystem::is_directory(target, error))
+      return std::nullopt;
+    for (const auto& source : sources) {
+      // Transfers operate on the directory entry, including dangling links.
+      // Resolve its parent for same-folder checks, and follow only real folders
+      // when guarding against recursive copies into their descendants.
+      const auto sourcePath = std::filesystem::path(source).lexically_normal();
+      const auto status = std::filesystem::symlink_status(sourcePath, error);
+      if (error || !std::filesystem::exists(status))
+        return std::nullopt;
+      const auto parent = std::filesystem::canonical(sourcePath.parent_path(), error);
+      if (error || parent == target)
+        return std::nullopt;
+      if (std::filesystem::is_directory(status)) {
+        const auto path = std::filesystem::canonical(sourcePath, error);
+        if (error)
+          return std::nullopt;
+        const auto relative = target.lexically_relative(path);
+        if (target == path || (!relative.empty() && *relative.begin() != ".."))
+          return std::nullopt;
+      }
+    }
+    return target;
+  }
+
+  inline bool copyDropByDefault(const std::vector<std::string>& sources, const std::filesystem::path& destination) {
+    struct stat target{};
+    if (stat(destination.c_str(), &target) != 0)
+      return true;
+    for (const auto& source : sources) {
+      struct stat item{};
+      if (lstat(source.c_str(), &item) != 0 || item.st_dev != target.st_dev)
+        return true;
+    }
+    return false;
+  }
+} // namespace filemanager
