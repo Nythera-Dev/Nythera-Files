@@ -1,0 +1,23 @@
+# Build from a Nythera Files checkout: cd packaging/arch && makepkg -s
+pkgname=nythera-files
+pkgver=$(cat ../../VERSION)
+pkgrel=1
+pkgdesc='Nythera Files native Wayland file manager'
+arch=(x86_64 aarch64)
+url='https://github.com/Nythera-Dev/Nythera-Files'
+license=(MIT)
+depends=('nythera-lib>=0.1.0' 'nythera-lib<0.2.0' libnythera_lib.so
+         cairo curl fontconfig freetype2 glib2 harfbuzz jemalloc libgcc libglvnd
+         libjxl librsvg libstdc++ libwebp libxkbcommon md4c nlohmann-json pango
+         polkit tomlplusplus wayland)
+makedepends=(git meson ninja pkgconf)
+
+build() {
+  arch-meson "$startdir/../.." "$srcdir/build" -Dtests=disabled
+  meson compile -C "$srcdir/build"
+}
+
+package() {
+  meson install -C "$srcdir/build" --no-rebuild --destdir "$pkgdir"
+  install -Dm644 "$startdir/../../LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

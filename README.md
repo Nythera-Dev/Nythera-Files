@@ -1,93 +1,140 @@
 # Nythera Files
 
+A native Wayland file manager written in C++, built around the Nythera design philosophy.
 
+Nythera Files started because I couldn't quite find a file manager that combined everything I liked about the existing options.
 
-## Getting started
+Dolphin has fantastic functionality, COSMIC Files has a lovely interface, and Thunar has plenty of practical touches. But none of them were quite what I wanted.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+So naturally, instead of settling for one, I decided to build my own 🤣
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Originally developed as part of [Nythera Shell](https://github.com/Nythera-Dev/Nythera), Files has since grown into a standalone application using the shared [NytheraLib](https://github.com/Nythera-Dev/NytheraLib) rendering and UI infrastructure.
 
-## Add your files
+**Nythera Shell is not required to run it.**
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## A Note on Development
 
-```
-cd existing_repo
-git remote add origin https://gitgud.io/nythera-dev/nythera-files.git
-git branch -M master
-git push -uf origin master
-```
+Like Nythera Shell, **Nythera Files is largely vibe coded.**
 
-## Integrate with your tools
+I'm learning to code, but C++ isn't something I can write confidently myself. The ideas, design direction and decisions are mine, while much of the implementation is AI-assisted.
 
-* [Set up project integrations](https://gitgud.io/nythera-dev/nythera-files/-/settings/integrations)
+I'm not claiming to be an experienced developer, or that the code is perfect. I'm building something I want to use, learning along the way and trying to keep it maintainable.
 
-## Collaborate with your team
+And yes, it's already grown considerably beyond what I originally planned 😂
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Screenshots
 
-## Test and Deploy
+### List View
 
-Use the built-in continuous integration in GitLab.
+<img width="1513" height="853" alt="image" src="https://github.com/user-attachments/assets/b37a000b-7735-404b-b8f7-17e0714f8be4" />
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+### Grid View
 
-***
+<img width="1516" height="855" alt="image" src="https://github.com/user-attachments/assets/e5c72c5f-fc90-4136-8858-a29d879289ce" />
 
-# Editing this README
+## What Can It Do?
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Nythera Files is already a usable file manager, rather than just a visual experiment.
 
-## Suggestions for a good README
+### Browsing & Navigation
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- List and grid views with adjustable scaling.
+- Multiple tabs, including tab reordering and reopening closed tabs.
+- Breadcrumb navigation and directory history.
+- Sorting, file selection and drag-and-drop.
+- Configurable details-view columns.
+- File and folder properties.
 
-## Name
-Choose a self-explaining name for your project.
+### File Operations
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+- Copy, move, rename, duplicate and delete.
+- File and folder creation, including templates.
+- Symlink creation and management.
+- Conflict resolution and directory merging.
+- Undo and redo for supported operations.
+- Background transfers with progress reporting.
+- Wastebin browsing and file restoration.
+- Administrator Mode for supported privileged operations.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+### Places & Devices
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+- Personal Places and bookmarked directories.
+- Local devices, mounted volumes and network locations.
+- Mount management and filesystem capacity information.
+- GIO/GVfs-based filesystem integration.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+### Tools & Integration
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+- File, Edit, View, Tools and Help menus.
+- Context-sensitive file and folder actions.
+- Open With and terminal integration.
+- Disk-usage and file-comparison integrations where suitable applications are available.
+- MIME-aware icons and file-type handling.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## Appearance & Theming
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Nythera Files shares the same general design language as Nythera Shell: dark surfaces, crimson accents, subtle effects and custom branding.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+The interface uses native rendering through NytheraLib rather than depending on GTK or Qt for its application UI.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+The aim is to make something visually distinctive without sacrificing the functionality expected from a file manager.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+**Independent theming is still in development.** Eventually, Files should support its own themes while optionally following Nythera Shell's appearance settings.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+My colour scheme shouldn't have to be everyone else's 😁
+
+## How It Fits Together
+
+Nythera is split into three related projects:
+
+- [Nythera Shell](https://github.com/Nythera-Dev/Nythera) — The desktop shell.
+- [NytheraLib](https://github.com/Nythera-Dev/NytheraLib) — Shared rendering, Wayland and UI infrastructure.
+- **Nythera Files** — The standalone file manager.
+
+Files links dynamically against the independently installed NytheraLib library.
+
+The applications are developed together, but Files does not need the Shell to be running.
+
+## What's Next?
+
+There's still quite a bit on the to-do list.
+
+Some areas I'm working towards include improved search, independent theming, further sidebar refinements, additional filesystem integrations and continued UI polish.
+
+The priority is making Files a reliable everyday application, not adding features simply for the sake of it.
+
+You can follow development and report issues through the [GitHub issue tracker](https://github.com/Nythera-Dev/Nythera-Files/issues).
+
+## Building & Installation
+
+Nythera Files is currently experimental and primarily developed on **Arch Linux with Umbriel**.
+
+It uses Meson and C++23, and requires a compatible installed version of NytheraLib.
+
+An Arch `PKGBUILD` is provided in [`packaging/arch/`](packaging/arch/).
+
+For development builds, use the repository's Meson configuration. Other environments have not been extensively tested.
+
+There is no stable packaged release yet.
+
+## Credits
+
+Nythera Files grew out of Nythera Shell, itself a fork of [Noctalia](https://github.com/noctalia-dev/noctalia).
+
+The underlying rendering and UI foundations owe a great deal to the original Noctalia developers and contributors.
+
+Dolphin, Thunar, COSMIC Files and other Linux file managers have also provided plenty of inspiration.
+
+Nythera Files is an independent project and is not affiliated with those applications or their developers.
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Nythera Files is licensed under the [MIT License](LICENSE).
+
+---
+
+I started this because I wanted a file manager that looked and behaved the way I imagined.
+
+Somewhere along the way, that turned into building an entire application, a shared library and a small collection of repositories.
+
+Apparently I have a problem with keeping projects small. 🤣
