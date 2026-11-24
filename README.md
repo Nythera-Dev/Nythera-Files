@@ -20,7 +20,7 @@ I'm learning to code, but C++ isn't something I can write confidently myself. Th
 
 I'm not claiming to be an experienced developer, or that the code is perfect. I'm building something I want to use, learning along the way and trying to keep it maintainable.
 
-And yes, it's already grown considerably beyond what I originally planned. 😂
+And yes, it's already grown considerably beyond what I originally planned 😂
 
 ## Screenshots
 
@@ -81,7 +81,7 @@ The aim is to make something visually distinctive without sacrificing the functi
 
 **Independent theming is still in development.** Eventually, Files should support its own themes while optionally following Nythera Shell's appearance settings.
 
-My colour scheme shouldn't have to be everyone else's. 😁
+My colour scheme shouldn't have to be everyone else's 😁
 
 ## How It Fits Together
 
