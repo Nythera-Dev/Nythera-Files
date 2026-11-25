@@ -18,7 +18,6 @@
 #include <vector>
 
 class Button;
-class ConfigService;
 class DialogBackgroundArtwork;
 class FileManagerTestAccess;
 class Flex;
@@ -91,8 +90,7 @@ namespace filemanager {
     };
 
     ModalDialogHost(
-        WaylandConnection& wayland, RenderContext& renderContext, ConfigService& configService,
-        FileManagerSettings& settings, Callbacks callbacks
+        WaylandConnection& wayland, RenderContext& renderContext, FileManagerSettings& settings, Callbacks callbacks
     );
     ~ModalDialogHost();
 
@@ -110,8 +108,11 @@ namespace filemanager {
       SymlinkField field = SymlinkField::None;
     };
     void showSymlinkDialog(
-        std::function<std::optional<SymlinkError>(const std::string& name, const std::string& target)> onSubmit
+        std::function<std::optional<SymlinkError>(const std::string& name, const std::string& target)> onSubmit,
+        std::function<void(const std::string& currentTarget)> onBrowseTarget = {}, std::function<void()> onDismiss = {}
     );
+    void setSymlinkTargetPath(std::string_view path);
+    void showSymlinkTargetError(std::string_view message);
     void closeDialog(int response);
     void forceCloseImmediate();
     void updateTheme();
@@ -143,7 +144,6 @@ namespace filemanager {
 
     WaylandConnection& m_wayland;
     RenderContext& m_renderContext;
-    ConfigService& m_configService;
     FileManagerSettings& m_settings;
     Callbacks m_callbacks;
 
@@ -187,8 +187,11 @@ namespace filemanager {
     bool m_backgroundConflictPending = false;
     bool m_symlinkDialogActive = false;
     std::function<std::optional<SymlinkError>(const std::string&, const std::string&)> m_symlinkSubmitCallback;
+    std::function<void(const std::string&)> m_symlinkBrowseCallback;
+    std::function<void()> m_symlinkDismissCallback;
     Input* m_symlinkName = nullptr;
     Input* m_symlinkTarget = nullptr;
+    Button* m_symlinkBrowseButton = nullptr;
     Label* m_symlinkError = nullptr;
     std::optional<CustomContent> m_customContent;
     int m_resultPending = -1;

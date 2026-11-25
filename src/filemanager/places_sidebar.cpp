@@ -144,6 +144,11 @@ namespace filemanager {
     detachUi();
   }
 
+  void PlacesSidebarController::reloadPreferences() {
+    m_savedPlacesLoaded = false;
+    markDirty(true);
+  }
+
   void PlacesSidebarController::markDirty(bool refreshCapacity) {
     m_dirty = true;
     if (refreshCapacity)
@@ -516,11 +521,10 @@ namespace filemanager {
           added = true;
         }
         if (added) {
-          if (!m_settings.savePlaceOrder(order) && m_callbacks.onStatus)
-            m_callbacks.onStatus("Unable to save Places order");
-          persistSavedPlaces();
+          const bool saved = m_settings.saveSavedPlaces(m_savedPlaces, &order);
+          markDirty(true);
           if (m_callbacks.onStatus)
-            m_callbacks.onStatus("Folders pinned to Places");
+            m_callbacks.onStatus(saved ? "Folders pinned to Places" : "Unable to save Places");
         } else if (m_callbacks.onStatus) {
           m_callbacks.onStatus("No new folders to pin");
         }

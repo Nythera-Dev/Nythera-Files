@@ -44,6 +44,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <gio/gio.h>
 #include <memory>
 #include <mutex>
@@ -259,6 +260,13 @@ private:
   [[nodiscard]] std::optional<std::pair<std::filesystem::path, bool>> symlinkSelection() const {
     return activeTab().symlinkSelection();
   }
+  struct SymlinkDialogHandlers {
+    std::function<std::optional<filemanager::ModalDialogHost::SymlinkError>(const std::string&, const std::string&)>
+        onSubmit;
+    std::function<void(const std::string&)> onBrowseTarget;
+    std::function<void()> onDismiss;
+  };
+  [[nodiscard]] SymlinkDialogHandlers makeSymlinkDialogHandlers();
   void duplicateSelection();
   void createSelectionSymlink();
   void showSymlinkDialog();
@@ -276,8 +284,9 @@ private:
   void beginRenamePath(const std::filesystem::path& path);
   void cancelRename();
   void syncSortControls();
+  void applyFilesPreferences(const toml::table& previous);
 
-  ConfigService m_configService{ConfigService::SettingsAccess::ReadOnly};
+  ConfigService m_configService{ConfigService::SettingsAccess::InheritanceOnly};
   filemanager::FileManagerSettings m_settings{m_configService};
   HttpClient m_httpClient;
   nythera::theme::ThemeService m_themeService{m_configService, m_httpClient};
@@ -303,7 +312,6 @@ private:
   filemanager::ModalDialogHost m_modalDialog{
       m_wayland,
       m_renderContext,
-      m_configService,
       m_settings,
       {
           .defaultParent = [this] { return m_surface ? m_surface.get() : m_progressWindow.surface(); },

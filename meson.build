@@ -106,6 +106,7 @@ endif
 _nythera_files_sources = files(
   'src/filemanager/file_manager.cpp',
   'src/filemanager/file_manager_settings.cpp',
+  'src/filemanager/configuration_notice.cpp',
   'src/filemanager/file_list_header.cpp',
   'src/filemanager/directory_session.cpp',
   'src/filemanager/browser_tab.cpp',
@@ -340,6 +341,24 @@ if build_tests
   )
   test('file_interaction', file_interaction_test_exe, timeout: 10)
 
+  if dbus_run_session.found()
+    configuration_notice_test_exe = executable('configuration_notice_test',
+      sources: files('tests/configuration_notice_test.cpp'), dependencies: nythera_files_test_dep,
+      override_options: ['b_ndebug=false'],
+    )
+    test('configuration_notice', dbus_run_session,
+      args: ['--', configuration_notice_test_exe],
+      env: {'NYTHERA_TEST_PRIVATE_DBUS': '1'},
+      timeout: 15,
+    )
+  endif
+
+  file_manager_settings_test_exe = executable('file_manager_settings_test',
+    sources: files('tests/file_manager_settings_test.cpp'), dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('file_manager_settings', file_manager_settings_test_exe, timeout: 10)
+
   file_manager_sort_test_exe = executable('file_manager_sort_test',
     sources: files('tests/file_manager_sort_test.cpp'), dependencies: nythera_files_test_dep,
     override_options: ['b_ndebug=false'])
@@ -486,6 +505,13 @@ if build_tests
   )
   test('file_manager_paste_selection', file_manager_paste_selection_test_exe, timeout: 15)
 
+  file_manager_drag_scroll_test_exe = executable('file_manager_drag_scroll_test',
+    sources: files('tests/file_manager_drag_scroll_test.cpp'),
+    dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('file_manager_drag_scroll', file_manager_drag_scroll_test_exe, timeout: 15)
+
   file_manager_async_fs_test_exe = executable('file_manager_async_fs_test',
     sources: files('tests/file_manager_async_fs_test.cpp'),
     dependencies: nythera_files_test_dep,
@@ -499,6 +525,13 @@ if build_tests
     override_options: ['b_ndebug=false'],
   )
   test('file_manager_conflict_dialog', file_manager_conflict_dialog_test_exe, timeout: 15)
+
+  symlink_target_picker_test_exe = executable('symlink_target_picker_test',
+    sources: files('tests/symlink_target_picker_test.cpp'),
+    dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('symlink_target_picker', symlink_target_picker_test_exe, timeout: 15)
 
   file_manager_help_menu_test_exe = executable('file_manager_help_menu_test',
     sources: files('tests/file_manager_help_menu_test.cpp'),

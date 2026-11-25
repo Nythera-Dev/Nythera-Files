@@ -25,7 +25,6 @@
 #include "render/core/renderer.h"
 #include "render/render_target.h"
 #include "render/scene/input_area.h"
-#include "ui/tooltip/tooltip_manager.h"
 #include "ui/builders.h"
 #include "ui/controls/box.h"
 #include "ui/controls/button.h"
@@ -46,6 +45,7 @@
 #include "ui/palette.h"
 #include "ui/scroll_into_view.h"
 #include "ui/style.h"
+#include "ui/tooltip/tooltip_manager.h"
 #include "util/string_utils.h"
 #include "wayland/key_repeat_poll_source.h"
 #include "wayland/wayland_connection.h"
@@ -1006,20 +1006,16 @@ void FileManager::createSelectionSymlink() {
     m_transfers.registerPasteRequest(id, PasteRequest{tab.id, tab.session.path(), tab.session.navigationGeneration()});
 }
 
-void FileManager::showSymlinkDialog() {
+FileManager::SymlinkDialogHandlers FileManager::makeSymlinkDialogHandlers() {
   const auto& tab = activeTab();
-  if (!tab.capabilities().canCreate
-      || m_modalDialog.isOpen()
-      || tab.session.browsingTrash()
-      || !currentDirectoryWritable())
-    return;
   const PasteRequest request{tab.id, tab.session.path(), tab.session.navigationGeneration()};
   const bool admin = tab.administratorBrowsing;
   const auto generation = tab.adminSession.sessionGeneration();
-  m_modalDialog.showSymlinkDialog(
-      [this, request, admin, generation](
-          const std::string& name, const std::string& target
-      ) -> std::optional<filemanager::ModalDialogHost::SymlinkError> {
+  const auto dialogAlive = std::make_shared<bool>(true);
+  const auto pickerOwned = std::make_shared<bool>(false);
+  return {
+      .onSubmit = [this, request, admin, generation](const std::string& name, const std::string& target)
+          -> std::optional<filemanager::ModalDialogHost::SymlinkError> {
         using Field = filemanager::ModalDialogHost::SymlinkField;
         using Err = filemanager::ModalDialogHost::SymlinkError;
         if (m_places.hasActiveDeviceOperations() || m_operations.replaying())
@@ -1058,7 +1054,57 @@ void FileManager::showSymlinkDialog() {
           return Err{"The symlink operation could not be started.", Field::None};
         m_transfers.registerPasteRequest(id, request);
         return std::nullopt;
-      }
+      },
+      .onBrowseTarget =
+          [this, alive = std::weak_ptr<bool>(m_alive), dialogAlive, pickerOwned,
+           baseDirectory = request.destination](const std::string& currentTarget) {
+            if (!*dialogAlive || m_modalDialog.closeQueued())
+              return;
+            FileDialogOptions options{
+                .mode = FileDialogMode::SelectFileOrFolder,
+                .startDirectory = filemanager::resolveSymlinkTargetPickerStartDirectory(
+                    currentTarget, baseDirectory, g_get_home_dir()
+                ),
+                .title = "Choose Symlink Target",
+            };
+            *pickerOwned = true;
+            if (!FileDialog::open(
+                    std::move(options),
+                    [this, alive, dialogAlive, pickerOwned](std::optional<std::filesystem::path> path) {
+                      *pickerOwned = false;
+                      const auto locked = alive.lock();
+                      if (!locked || !*locked || !*dialogAlive || m_modalDialog.closeQueued() || !path)
+                        return;
+                      m_modalDialog.setSymlinkTargetPath(path->string());
+                    }
+                )) {
+              *pickerOwned = false;
+              m_modalDialog.showSymlinkTargetError("Could not open the target picker.");
+            }
+          },
+      .onDismiss =
+          [this, dialogAlive, pickerOwned] {
+            *dialogAlive = false;
+            if (*pickerOwned) {
+              *pickerOwned = false;
+              if (m_destinationPicker && m_destinationPicker->isOpen())
+                m_destinationPicker->closeFileDialogWithoutResult();
+              FileDialog::cancelIfPending();
+            }
+          },
+  };
+}
+
+void FileManager::showSymlinkDialog() {
+  const auto& tab = activeTab();
+  if (!tab.capabilities().canCreate
+      || m_modalDialog.isOpen()
+      || tab.session.browsingTrash()
+      || !currentDirectoryWritable())
+    return;
+  auto handlers = makeSymlinkDialogHandlers();
+  m_modalDialog.showSymlinkDialog(
+      std::move(handlers.onSubmit), std::move(handlers.onBrowseTarget), std::move(handlers.onDismiss)
   );
 }
 
@@ -1256,7 +1302,7 @@ void FileManager::installInputHooks() {
     return mods == 0U && (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter);
   });
   Input::setTextClipboard(m_textClipboard.get());
-  Input::setReadlineShortcutsEnabled(m_configService.config().shell.readlineShortcuts);
+  Input::setReadlineShortcutsEnabled(m_settings.readlineShortcuts());
 }
 
 void FileManager::uninstallInputHooks() {
@@ -1306,7 +1352,7 @@ int FileManager::run() {
   Style::setRtl(i18n::Service::instance().rtl());
   m_configService.addReloadCallback(
       [this] {
-        Input::setReadlineShortcutsEnabled(m_configService.config().shell.readlineShortcuts);
+        Input::setReadlineShortcutsEnabled(m_settings.readlineShortcuts());
         m_themeService.apply();
         IconResolver::invalidateThemeContent();
         if (m_grid)
@@ -1322,6 +1368,7 @@ int FileManager::run() {
       },
       "file-manager-theme"
   );
+  m_settings.setReloadCallback([this](const toml::table& previous) { applyFilesPreferences(previous); });
   m_themeService.apply();
   m_wayland.setNativeDataTransfer(&m_transfer);
   m_wayland.setTextInputService(&m_textInputService);
@@ -1462,13 +1509,14 @@ int FileManager::run() {
   m_pickerHosts.registerHost(
       [this](wl_surface* surface) -> std::optional<LayerPopupParentContext> {
         auto* parent = m_surface.get();
-        if (m_checksumDialog.isOpen() && m_modalDialog.ownsSurface(surface))
+        if (m_modalDialog.isOpen() && m_modalDialog.ownsSurface(surface))
           parent = m_modalDialog.surface();
         if (!parent || surface != parent->wlSurface())
           return std::nullopt;
         return LayerPopupParentContext{
             .surface = surface,
             .xdgSurface = parent->xdgSurface(),
+            .xdgToplevel = parent->xdgToplevel(),
             .output = m_wayland.outputForSurface(surface),
             .width = parent->width(),
             .height = parent->height()
@@ -1476,6 +1524,8 @@ int FileManager::run() {
       },
       {}, {},
       [this]() -> std::optional<LayerPopupParentContext> {
+        if (m_modalDialog.isOpen())
+          return m_pickerHosts.contextForSurface(m_modalDialog.wlSurface());
         return m_surface ? m_pickerHosts.contextForSurface(m_surface->wlSurface()) : std::nullopt;
       }
   );
@@ -1504,7 +1554,7 @@ int FileManager::run() {
       m_lastInputSerial = m_wayland.lastInputSerial();
     if (m_menus.isApplicationPickerOpen() && m_menus.handleKeyboard(event))
       return;
-    else if (m_destinationPicker && m_destinationPicker->isOpen())
+    else if (m_destinationPicker && m_destinationPicker->handlesKeyboardForSurface(m_wayland.lastKeyboardSurface()))
       m_destinationPicker->onKeyboardEvent(event);
     else if (m_menus.isContextMenuOpen() && m_menus.handleKeyboard(event))
       return;
@@ -1530,12 +1580,14 @@ int FileManager::run() {
       m_surface->requestUpdate();
   });
   navigate(activeSession().path(), false);
+  m_settings.setProblemCallback(filemanager::notifyInvalidConfiguration);
+  m_settings.setManualReloadCallback(filemanager::notifyConfigurationReloaded);
   TimerPollSource timers;
   KeyRepeatPollSource keyRepeat(m_wayland);
   MainLoop loop(
       m_wayland,
       [this, &timers, &keyRepeat] {
-        return std::vector<PollSource*>{&m_gioPollSource, &m_configPollSource, &m_pickerThumbnails,
+        return std::vector<PollSource*>{&m_gioPollSource, &m_configPollSource, &m_settings, &m_pickerThumbnails,
                                         &timers,          &keyRepeat,          &m_transfer};
       },
       [this] { return !m_running && !m_transfer.ownsSelection() && !m_transfer.busy(); },
@@ -1956,7 +2008,7 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     } else {
       if (!m_propertiesWindow)
         m_propertiesWindow = std::make_unique<PropertiesWindow>(
-            m_wayland, m_renderContext, m_configService, m_operations,
+            m_wayland, m_renderContext, m_settings, m_operations,
             [this](std::string text) { writeDesktopClipboard(std::move(text), "text/plain;charset=utf-8"); }
         );
       if (!m_propertiesWindow->openVolume(place, m_surface.get()))
@@ -2179,7 +2231,7 @@ void FileManager::openProperties(const std::filesystem::path& path) {
   }
   if (!m_propertiesWindow)
     m_propertiesWindow = std::make_unique<PropertiesWindow>(
-        m_wayland, m_renderContext, m_configService, m_operations,
+        m_wayland, m_renderContext, m_settings, m_operations,
         [this](std::string text) { writeDesktopClipboard(std::move(text), "text/plain;charset=utf-8"); }
     );
   PropertiesWindow::AdministratorTab administrator;
@@ -2197,23 +2249,101 @@ void FileManager::openProperties(const std::filesystem::path& path) {
     setStatus("Could not open Properties window");
 }
 
+void FileManager::applyFilesPreferences(const toml::table& previous) {
+  const auto& current = m_settings.preferences();
+  const auto changed = [&](std::string_view key) { return previous["files"][key] != current["files"][key]; };
+  if (changed("readline_shortcuts"))
+    Input::setReadlineShortcutsEnabled(m_settings.readlineShortcuts());
+  if (previous["theme"]["transparency_mode"] != current["theme"]["transparency_mode"])
+    m_modalDialog.updateTheme();
+  if (changed("show_menu_bar")) {
+    m_menus.loadInitialPreference();
+    m_menus.syncResponsiveMenuBar(m_surface ? m_surface->width() : m_lastHeaderWidth);
+  }
+  if (changed("open_tabs_in_background"))
+    m_openTabsInBackground = m_settings.openTabsInBackground();
+  if (changed("always_show_tab_bar")) {
+    m_alwaysShowTabBar = m_settings.alwaysShowTabBar();
+    m_tabBar.markDirty();
+    if (m_surface)
+      m_surface->requestLayout();
+  }
+  if (changed("saved_places") || changed("place_order") || changed("hidden_mounts"))
+    m_places.reloadPreferences();
+  if (changed("list_column_widths") || changed("list_column_layout"))
+    m_listHeader.reloadColumnPreferences();
+
+  const bool grid = changed("grid_view");
+  const bool scale = changed("view_scale");
+  const bool hidden = changed("show_hidden");
+  const bool foldersFirst = changed("folders_first");
+  const bool hiddenLast = changed("hidden_last");
+  const bool sortField = changed("sort_field");
+  const bool sortOrder = changed("sort_descending");
+  if (!(grid || scale || hidden || foldersFirst || hiddenLast || sortField || sortOrder))
+    return;
+  const auto view = loadInitialTabViewState(m_settings);
+  for (const auto& tab : m_tabs.tabs()) {
+    auto& state = tab->viewState;
+    if (grid) {
+      state.gridMode = view.gridMode;
+      if (view.gridMode)
+        tab->session.clearFolderCounts();
+    }
+    if (scale)
+      state.viewScale = view.viewScale;
+    if (hidden) {
+      state.showHidden = view.showHidden;
+      tab->session.setShowHidden(view.showHidden);
+    }
+    if (foldersFirst) {
+      state.foldersFirst = view.foldersFirst;
+      tab->session.setFoldersFirst(view.foldersFirst);
+    }
+    if (hiddenLast) {
+      state.hiddenLast = view.hiddenLast;
+      tab->session.setHiddenLast(view.hiddenLast);
+    }
+    if (sortField)
+      state.sortField = view.sortField;
+    if (sortOrder)
+      state.sortOrder = view.sortOrder;
+    if (tab.get() != &activeTab() && (hidden || foldersFirst || hiddenLast || sortField || sortOrder))
+      tab->needsRefresh = true;
+  }
+  m_listHeader.applyTabViewState(activeTab().viewState);
+  if (grid || scale)
+    applyViewScale();
+  if (hidden) {
+    activeSession().refreshPreservingSelection();
+  } else if (foldersFirst || hiddenLast || sortField || sortOrder) {
+    sortEntries();
+    if (m_grid) {
+      m_grid->notifyDataChanged();
+      restoreSelection(false);
+    }
+  }
+  updateNavigationControls();
+}
+
 void FileManager::persistFileViewState() {
   auto& tab = activeTab();
-  tab.viewState.gridMode = m_listHeader.gridMode();
-  tab.viewState.showHidden = tab.session.showHidden();
-  tab.viewState.foldersFirst = tab.session.foldersFirst();
-  tab.viewState.hiddenLast = tab.session.hiddenLast();
-  tab.viewState.sortField = m_listHeader.sortField();
-  tab.viewState.sortOrder = m_listHeader.sortOrder();
+  const filemanager::FileViewSettings previous{
+      tab.viewState.gridMode,   tab.viewState.showHidden, tab.viewState.foldersFirst,
+      tab.viewState.hiddenLast, tab.viewState.sortField,  tab.viewState.sortOrder,
+  };
+  const filemanager::FileViewSettings next{
+      m_listHeader.gridMode(),  tab.session.showHidden(), tab.session.foldersFirst(),
+      tab.session.hiddenLast(), m_listHeader.sortField(), m_listHeader.sortOrder(),
+  };
+  tab.viewState.gridMode = next.gridMode;
+  tab.viewState.showHidden = next.showHidden;
+  tab.viewState.foldersFirst = next.foldersFirst;
+  tab.viewState.hiddenLast = next.hiddenLast;
+  tab.viewState.sortField = next.sortField;
+  tab.viewState.sortOrder = next.sortOrder;
   tab.viewState.viewScale = m_listHeader.viewScale();
-  if (!m_settings.saveFileView({
-          .gridMode = tab.viewState.gridMode,
-          .showHidden = tab.viewState.showHidden,
-          .foldersFirst = tab.viewState.foldersFirst,
-          .hiddenLast = tab.viewState.hiddenLast,
-          .sortField = tab.viewState.sortField,
-          .sortOrder = tab.viewState.sortOrder,
-      }))
+  if (!m_settings.saveFileView(next, previous))
     setStatus("Unable to save file view preferences");
 }
 
@@ -3550,6 +3680,8 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
   updateAdminHeaderUi(m_surface->width());
   if (m_tabBar.rebuildIfDirty())
     needsLayout = true;
+  if (m_transfers.applyDragScroll())
+    needsLayout = true;
   if (m_transfers.isDraggingFiles() || m_transfers.hasDragPreview()) {
     UiPhaseScope layoutPhase(UiPhase::Layout);
     m_transfers.updateDragPreview(renderer);
@@ -3580,6 +3712,10 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     finishPendingTransferReveal(renderer);
     m_listHeader.layoutVisibleMarkers(renderer);
     syncTooltipHover();
+  }
+  if (m_transfers.refreshDropTargetAfterScroll() && (m_transfers.isDraggingFiles() || m_transfers.hasDragPreview())) {
+    UiPhaseScope layoutPhase(UiPhase::Layout);
+    m_transfers.updateDragPreview(renderer);
   }
   if (m_pendingInlineRenamePath && !activeSession().loading()) {
     const auto pending = *m_pendingInlineRenamePath;
@@ -3824,14 +3960,20 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
   }
   if (event.type == PointerEvent::Type::Enter && event.serial)
     m_pointerSerial = event.serial;
-  if (m_transfer.dragging() && !m_transfer.dragDropped()) {
+  if ((m_transfer.dragging() && !m_transfer.dragDropped()) || m_transfers.isProtocolDragInside()) {
     if (event.type == PointerEvent::Type::Axis)
       m_transfers.handleAxisDuringProtocolDrag(event);
     return;
   }
   if (m_transfer.dragDropped() && (m_transfers.isDragPending() || m_transfers.isDraggingFiles()))
     cancelFileGesture();
-  if (event.type == PointerEvent::Type::Axis && (m_keyboardModifiers & KeyMod::Ctrl) && m_grid && !m_renamePath) {
+  if (event.type == PointerEvent::Type::Axis
+      && (m_keyboardModifiers & KeyMod::Ctrl)
+      && !m_transfers.isDragPending()
+      && !m_transfers.isDraggingFiles()
+      && !m_reordering
+      && m_grid
+      && !m_renamePath) {
     float gx = 0, gy = 0;
     Node::absolutePosition(m_grid, gx, gy);
     if (x >= gx && x < gx + m_grid->width() && y >= gy && y < gy + m_grid->height()) {
@@ -3851,6 +3993,25 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
     const auto& placeRows = m_places.placeRows();
     const auto source =
         std::ranges::find_if(placeRows, [this](const auto& pair) { return pair.second.identity == *m_reorderId; });
+    if (event.type == PointerEvent::Type::Axis && m_reordering) {
+      m_dispatcher.pointerAxis(
+          x, y, event.axis, event.axisSource, event.axisValue, event.axisDiscrete, event.axisValue120, event.axisLines,
+          event.axisGestureSerial
+      );
+      if (source != placeRows.end()) {
+        const auto& place = source->second;
+        m_reorderBefore = m_places.placeInsertionAt(
+            x, y,
+            place.personal      ? "Personal"
+                : place.network ? "Network"
+                                : "Devices",
+            false
+        );
+        m_places.showPlaceInsertion(m_reorderBefore);
+        m_surface->requestRedraw();
+      }
+      return;
+    }
     if (event.type == PointerEvent::Type::Motion) {
       if (std::hypot(x - m_dragStartX, y - m_dragStartY) > 5.0F)
         m_reordering = true;

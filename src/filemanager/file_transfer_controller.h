@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/timer_manager.h"
 #include "filemanager/browser_tab.h"
 #include "filemanager/file_operation_manager.h"
 #include "filemanager/places_sidebar.h"
@@ -123,9 +124,14 @@ namespace filemanager {
     void handlePointerLeaveDuringDrag();
     void handleAxisDuringProtocolDrag(const PointerEvent& event);
     void cancelLocalDragState();
+    bool applyDragScroll();
+    bool refreshDropTargetAfterScroll();
+    void stopDragScroll();
 
     [[nodiscard]] bool isDraggingFiles() const noexcept { return m_draggingFiles; }
     [[nodiscard]] bool isDragPending() const noexcept { return m_dragPending; }
+    [[nodiscard]] bool isProtocolDragInside() const noexcept { return m_protocolDragInside; }
+    [[nodiscard]] bool isDragScrollActive() const noexcept { return m_dragScroll.active(); }
     [[nodiscard]] bool hasDragPreview() const noexcept { return m_dragPreview != nullptr; }
     [[nodiscard]] std::size_t pendingClipboardReads() const noexcept { return m_pendingClipboardReads; }
     [[nodiscard]] const std::optional<std::size_t>& dropIndex() const noexcept { return m_dropIndex; }
@@ -139,6 +145,12 @@ namespace filemanager {
 
   private:
     friend class ::FileManagerTestAccess;
+
+    [[nodiscard]] bool canDragScroll() const;
+    [[nodiscard]] float dragScrollSpeed(bool& inPlaces) const;
+    void updateDragScroll();
+    void recordDragScrollOffsets();
+    void updateLocalDragTarget(float x, float y);
 
     WaylandConnection& m_wayland;
     RenderContext& m_renderContext;
@@ -186,6 +198,13 @@ namespace filemanager {
     bool m_dragTargetValid = false;
     Button* m_dropPlace = nullptr;
     std::optional<std::size_t> m_dropIndex;
+
+    Timer m_dragScroll;
+    float m_dragScrollDelta = 0.0F;
+    bool m_dragScrollInPlaces = false;
+    bool m_refreshDropAfterLayout = false;
+    std::optional<float> m_lastDragGridScrollOffset;
+    std::optional<float> m_lastDragPlacesScrollOffset;
 
     std::optional<DropValidation> m_dropValidation;
     std::optional<std::pair<std::vector<std::string>, std::filesystem::path>> m_dropValidationPending;

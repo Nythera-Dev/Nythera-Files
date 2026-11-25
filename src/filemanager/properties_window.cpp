@@ -6,12 +6,12 @@
 #include "cursor-shape-v1-client-protocol.h"
 #include "filemanager/browser_tab.h"
 #include "filemanager/file_interaction.h"
+#include "filemanager/file_manager_settings.h"
 #include "filemanager/file_operation_manager.h"
 #include "filemanager/places_model.h"
 #include "filemanager/property_metadata.h"
 #include "filemanager/property_scan_presentation.h"
 #include "render/scene/input_area.h"
-#include "ui/tooltip/tooltip_manager.h"
 #include "ui/controls/box.h"
 #include "ui/controls/button.h"
 #include "ui/controls/checkbox.h"
@@ -29,12 +29,12 @@
 #include "ui/dialogs/file_icon.h"
 #include "ui/scroll_into_view.h"
 #include "ui/style.h"
+#include "ui/tooltip/tooltip_manager.h"
 #include "wayland/wayland_connection.h"
 #include "xdg-shell-client-protocol.h"
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <cmath>
 #include <ctime>
 #include <gio/gunixmounts.h>
@@ -153,10 +153,10 @@ namespace {
 } // namespace
 
 PropertiesWindow::PropertiesWindow(
-    WaylandConnection& wayland, RenderContext& renderer, ConfigService& config, FileOperationManager& operations,
-    std::function<void(std::string)> copyText
+    WaylandConnection& wayland, RenderContext& renderer, filemanager::FileManagerSettings& settings,
+    FileOperationManager& operations, std::function<void(std::string)> copyText
 )
-    : m_wayland(wayland), m_renderer(renderer), m_config(config), m_operations(operations),
+    : m_wayland(wayland), m_renderer(renderer), m_settings(settings), m_operations(operations),
       m_copyText(std::move(copyText)) {}
 
 PropertiesWindow::~PropertiesWindow() {
@@ -283,22 +283,9 @@ bool PropertiesWindow::openTarget(
   m_displayName = m_multipleSelection ? std::to_string(m_selectionPaths.size()) + " items selected"
       : path.filename().empty()       ? path.string()
                                       : path.filename().string();
-  if (const auto saved = m_config.stateString("files", "properties_window_size")) {
-    const auto separator = saved->find('x');
-    if (separator != std::string::npos) {
-      std::uint32_t width = 0, height = 0;
-      const auto w = std::from_chars(saved->data(), saved->data() + separator, width);
-      const auto h = std::from_chars(saved->data() + separator + 1, saved->data() + saved->size(), height);
-      if (w.ec == std::errc{}
-          && h.ec == std::errc{}
-          && w.ptr == saved->data() + separator
-          && h.ptr == saved->data() + saved->size()
-          && width >= 440
-          && height >= 400) {
-        m_preferredWidth = width;
-        m_preferredHeight = height;
-      }
-    }
+  if (const auto saved = m_settings.loadPropertiesSize()) {
+    m_preferredWidth = saved->first;
+    m_preferredHeight = saved->second;
   }
   if (volume) {
     m_loading = false;
@@ -1308,7 +1295,8 @@ void PropertiesWindow::queryReady(GFileInfo* info, const std::string& error) {
       && m_refreshing
       && (g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_UNIX_INODE) != m_inode
           || g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_DEVICE) != m_device);
-  m_refreshing = false;
+  if (std::exchange(m_refreshing, false))
+    m_applying = false;
   m_itemAvailable = info && !replaced;
   if (!info || replaced) {
     cancelFolderSize();
@@ -1624,19 +1612,13 @@ void PropertiesWindow::updateFooter() {
   );
   const bool dirty = step != filemanager::PropertyApplyStep::None;
   const bool busy = m_applying || m_continueAfterRename;
-  m_closeButton->setText(dirty ? (m_discardRequested ? "Discard & Close" : "Cancel") : "Close");
+  const bool showApply = dirty || (m_applying && m_refreshing);
+  m_closeButton->setText(showApply ? (m_discardRequested && !busy ? "Discard & Close" : "Cancel") : "Close");
   if (m_footerStatus)
-    m_footerStatus->setText(
-        busy                     ? "Working…"
-            : m_discardRequested ? "Discard changes?"
-            : dirty              ? "Unapplied changes"
-                                 : ""
-    );
+    m_footerStatus->setText(busy ? "" : m_discardRequested ? "Discard changes?" : dirty ? "Unapplied changes" : "");
   m_closeButton->setTooltip("");
-  m_closeButton->setEnabled(!m_applying || m_operation != 0 || m_continueAfterRename);
-  if (busy)
-    m_closeButton->setText(m_operation || m_continueAfterRename ? "Cancel operation" : "Saving…");
-  m_applyButton->setVisible(dirty);
+  m_closeButton->setEnabled(!busy);
+  m_applyButton->setVisible(showApply);
   m_applyButton->setTooltip(
       permissionsPending() && step == filemanager::PropertyApplyStep::Rename
           ? "Apply rename and all other pending changes"
@@ -1649,7 +1631,6 @@ void PropertiesWindow::updateFooter() {
       && !busy
       && !m_refreshing
   );
-  m_applyButton->setText(m_applying ? "Applying…" : "Apply");
 }
 
 void PropertiesWindow::updatePermissionControls() {
@@ -1724,7 +1705,6 @@ void PropertiesWindow::applyPermissions() {
   m_applying = true;
   m_contentDirty = true;
   m_discardRequested = false;
-  updatePermissionControls();
   const auto alive = std::weak_ptr<bool>(m_alive);
   const auto generation = m_generation;
   m_operation = m_operations.modifyProperties(
@@ -1748,28 +1728,33 @@ void PropertiesWindow::applyPermissions() {
     m_applying = false;
     m_permissionError = "An operation on this item is already active.";
     m_contentDirty = true;
-    updatePermissionControls();
-  } else
-    updatePermissionControls();
+  }
+  updatePermissionControls();
 }
 
 void PropertiesWindow::finishChanges(bool retainPending) {
   if (m_multipleSelection) {
     m_retainPending = false;
     m_applying = false;
-    m_recursive = false;
-    m_selectionTouchedMode = 0;
-    m_originalMode = m_editedMode = 0;
-    for (const auto& item : m_selectionPermissionItems)
+    if (!retainPending) {
+      m_recursive = false;
+      m_selectionTouchedMode = 0;
+    }
+    m_originalMode = 0;
+    for (auto& item : m_selectionPermissionItems) {
       m_originalMode |= item.mode;
-    m_editedMode = m_originalMode;
+      if (!retainPending)
+        item.applied = false;
+    }
+    m_editedMode = (m_originalMode & ~m_selectionTouchedMode) | (m_editedMode & m_selectionTouchedMode);
     m_contentDirty = true;
     updatePermissionControls();
     return;
   }
   m_contentDirty = true;
   m_retainPending = retainPending;
-  m_applying = false;
+  // Keep the footer busy until the refreshed metadata resolves which edits remain staged.
+  m_applying = true;
   m_applySummary.clear();
   m_recursive = false;
   m_refreshing = true;
@@ -1781,6 +1766,11 @@ void PropertiesWindow::finishChanges(bool retainPending) {
 void PropertiesWindow::applyNextSelectionPermission() {
   if (!m_multipleSelection || !m_applying)
     return;
+  while (m_selectionPermissionIndex < m_selectionPermissionItems.size()
+         && m_selectionPermissionItems[m_selectionPermissionIndex].applied) {
+    ++m_selectionPermissionSucceeded;
+    ++m_selectionPermissionIndex;
+  }
   if (m_selectionPermissionIndex >= m_selectionPermissionItems.size()) {
     const auto firstError = m_permissionError;
     m_permissionError = m_selectionPermissionFailed ? "Updated "
@@ -1820,6 +1810,7 @@ void PropertiesWindow::applyNextSelectionPermission() {
         auto& completed = m_selectionPermissionItems[m_selectionPermissionIndex];
         if (result.ok()) {
           completed.mode = (completed.mode & ~m_selectionTouchedMode) | (m_editedMode & m_selectionTouchedMode);
+          completed.applied = true;
           ++m_selectionPermissionSucceeded;
         } else {
           ++m_selectionPermissionFailed;
@@ -1918,9 +1909,7 @@ void PropertiesWindow::close() {
   if (!m_multipleSelection && m_surface && m_surface->width() >= 440 && m_surface->height() >= 400) {
     m_preferredWidth = m_surface->width();
     m_preferredHeight = m_surface->height();
-    m_config.setStateString(
-        "files", "properties_window_size", std::to_string(m_preferredWidth) + "x" + std::to_string(m_preferredHeight)
-    );
+    (void)m_settings.savePropertiesSize(m_preferredWidth, m_preferredHeight);
   }
   ++m_generation;
   m_input.setSceneRoot(nullptr);
@@ -1961,9 +1950,9 @@ void PropertiesWindow::deferClose(bool discard) {
     updatePermissionControls();
     return;
   }
-  // Only the explicit footer discard action drops staged edits. An active Apply must finish.
+  // Permission changes can be cancelled through the persistent operation notification.
   if (m_applying) {
-    if (!m_operation)
+    if (!m_renaming || !m_operation)
       return;
     m_continueAfterRename = false;
     m_operations.cancel(m_operation);
@@ -2588,8 +2577,11 @@ void PropertiesWindow::rebuildTab() {
             const auto mask = (4U >> bit) << ((2 - rowIndex) * 3);
             check->setOnChange([this, mask](bool checked) {
               m_editedMode = checked ? m_editedMode | mask : m_editedMode & ~mask;
-              if (m_multipleSelection)
+              if (m_multipleSelection) {
                 m_selectionTouchedMode |= mask;
+                for (auto& item : m_selectionPermissionItems)
+                  item.applied = false;
+              }
               m_discardRequested = false;
               updatePermissionControls();
             });
@@ -2618,6 +2610,9 @@ void PropertiesWindow::rebuildTab() {
         m_recursiveCheck = recursive.get();
         recursive->setOnChange([this](bool checked) {
           m_recursive = checked;
+          for (auto& item : m_selectionPermissionItems)
+            if (item.directory)
+              item.applied = false;
           m_discardRequested = false;
           updatePermissionControls();
         });

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "config/config_service.h"
 #include "filemanager/folder_size.h"
 #include "filemanager/property_operations.h"
 #include "render/animation/animation_manager.h"
@@ -40,6 +39,7 @@ class WaylandConnection;
 class PropertiesSurface;
 class FileManagerTestAccess;
 namespace filemanager {
+  class FileManagerSettings;
   struct BrowserTab;
   struct Place;
 } // namespace filemanager
@@ -48,8 +48,8 @@ class InputArea;
 class PropertiesWindow {
 public:
   PropertiesWindow(
-      WaylandConnection& wayland, RenderContext& renderer, ConfigService& config, FileOperationManager& operations,
-      std::function<void(std::string)> copyText
+      WaylandConnection& wayland, RenderContext& renderer, filemanager::FileManagerSettings& settings,
+      FileOperationManager& operations, std::function<void(std::string)> copyText
   );
   ~PropertiesWindow();
   using AdministratorTab = std::function<filemanager::BrowserTab*()>;
@@ -83,6 +83,7 @@ private:
     bool supported = false;
     std::uint32_t owner = 0;
     std::uint32_t group = 0;
+    bool applied = false;
   };
   bool openTarget(
       const std::filesystem::path& path, ToplevelSurface* parent, const filemanager::Place* volume,
@@ -122,7 +123,7 @@ private:
   void updateFooter();
   WaylandConnection& m_wayland;
   RenderContext& m_renderer;
-  ConfigService& m_config;
+  filemanager::FileManagerSettings& m_settings;
   FileOperationManager& m_operations;
   std::function<void(std::string)> m_copyText;
   Input* m_nameInput = nullptr;

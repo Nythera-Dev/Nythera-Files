@@ -68,6 +68,7 @@ namespace filemanager {
     void detachUi();
     void shutdown();
 
+    void reloadPreferences();
     void markDirty(bool refreshCapacity = false);
     [[nodiscard]] bool isDirty() const noexcept { return m_dirty; }
     void rebuild();

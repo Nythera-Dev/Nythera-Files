@@ -79,6 +79,10 @@ int main() {
         filemanager::FileMenuContext::File, {10, 60, 2, 1, 3, 59, 110, 4, 5, 6, 20, 31, 100, 22}
     );
     verifyMenuGroups(
+        {{.id = 22}, {.id = 30152}, {.id = 100}, {.id = 30104}, {.id = 30105}}, filemanager::FileMenuContext::File,
+        {100, 30152, 30104, 30105, 22}
+    );
+    verifyMenuGroups(
         {{.id = 21}, {.id = 100}, {.id = 50}, {.id = 110}, {.id = 14}, {.id = 3}}, filemanager::FileMenuContext::Empty,
         {3, 110, 14, 50, 100, 21}
     );

@@ -1,6 +1,7 @@
 #include "filemanager/property_operations.h"
 #include "test_isolation.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
 #include <fstream>
@@ -107,15 +108,21 @@ int main() {
 
     // Group changes preserve the owner; the kernel's special-bit effects are reported.
     auto groupEdit = request(file, mode(file));
-    for (const auto& group : accounts.groups)
-      if (group.id == getegid())
-        groupEdit.group = group.name;
+    struct stat state{};
+    TEST_CHECK(lstat(file.c_str(), &state) == 0);
+    const auto alternateGroup = std::ranges::find_if(accounts.groups, [&](const auto& group) {
+      return group.eligible && group.id != state.st_gid;
+    });
+    const auto group = alternateGroup != accounts.groups.end()
+        ? alternateGroup
+        : std::ranges::find(accounts.groups, getegid(), &SystemIdentity::id);
+    TEST_CHECK(group != accounts.groups.end());
+    groupEdit.group = group->name;
     const auto before = mode(file);
     auto groupResult = executePropertyRequest(groupEdit);
     TEST_CHECK(groupResult.ok());
-    struct stat state{};
     TEST_CHECK(lstat(file.c_str(), &state) == 0);
-    TEST_CHECK(state.st_uid == geteuid() && state.st_gid == getegid());
+    TEST_CHECK(state.st_uid == geteuid() && state.st_gid == group->id);
     TEST_CHECK(groupResult.ownershipEffects == (((before & 06000) & ~mode(file)) != 0));
 
     // Denial/cancellation are injected; no helper, pkexec or authentication prompt is invoked.

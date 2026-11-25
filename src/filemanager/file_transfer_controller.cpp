@@ -8,7 +8,6 @@
 #include "filemanager/file_interaction.h"
 #include "filemanager/file_transfer_payload.h"
 #include "render/core/renderer.h"
-#include "ui/tooltip/tooltip_manager.h"
 #include "ui/controls/button.h"
 #include "ui/controls/flex.h"
 #include "ui/controls/label.h"
@@ -16,8 +15,10 @@
 #include "ui/controls/virtual_grid_view.h"
 #include "ui/dialogs/file_icon.h"
 #include "ui/palette.h"
+#include "ui/tooltip/tooltip_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <linux/input-event-codes.h>
 #include <ranges>
@@ -71,6 +72,36 @@ namespace filemanager {
       );
     }
 
+    // Drag-and-drop edge autoscroll adapted from Luciole (src/app/page/drag_drop_controller.cpp).
+    // MIT License — Copyright (c) 2026 noctalia-dev
+    // Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+    // and associated documentation files (the "Software"), to deal in the Software without restriction,
+    // including without limitation the rights to use, copy, modify, merge, publish, distribute,
+    // sublicense, and/or sell copies of the Software, subject to the MIT License conditions.
+    constexpr float kDragScrollEdgeZonePx = 32.0F;
+    constexpr float kDragScrollStepPx = 6.0F;
+    constexpr float kDragScrollMaxDeltaPx = 18.0F;
+    constexpr auto kDragScrollInterval = std::chrono::milliseconds(16);
+
+    bool isNodeEffectivelyVisible(const Node* node) {
+      for (const Node* current = node; current != nullptr; current = current->parent()) {
+        if (!current->visible())
+          return false;
+      }
+      return node != nullptr;
+    }
+
+    float edgeScrollSpeed(const ScrollView& scroll, float pointerY, float scrollY) {
+      if (scroll.height() <= 0.0F || scroll.maxScrollOffset() <= 0.0F)
+        return 0.0F;
+      const float zone = std::min(kDragScrollEdgeZonePx, scroll.height() * 0.5F);
+      if (pointerY < scrollY + zone && scroll.scrollOffset() > 0.0F)
+        return -kDragScrollStepPx;
+      if (pointerY > scrollY + scroll.height() - zone && scroll.scrollOffset() < scroll.maxScrollOffset())
+        return kDragScrollStepPx;
+      return 0.0F;
+    }
+
   } // namespace
 
   FileTransferController::FileTransferController(
@@ -97,6 +128,7 @@ namespace filemanager {
           m_pinBefore.reset();
           m_places.showPlaceInsertion(std::nullopt);
           m_dragTargetValid = false;
+          stopDragScroll();
           if (m_dragPreview)
             m_dragPreview->setVisible(false);
           if (auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr)
@@ -121,12 +153,14 @@ namespace filemanager {
   void FileTransferController::shutdown() {
     if (m_alive)
       *m_alive = false;
+    stopDragScroll();
     cancelDropValidation();
     m_transfer.cancelDrag();
     clearNativeDragPreview();
   }
 
   void FileTransferController::detachUi() {
+    stopDragScroll();
     m_dragPreview = nullptr;
     m_dragPreviewIcon = nullptr;
     m_dragPreviewLabel = nullptr;
@@ -152,7 +186,8 @@ namespace filemanager {
       m_cutOperations.erase(cut);
 
       if (cutGeneration == m_transfer.selectionGeneration()) {
-        if (operation.succeeded && (!operation.adminOrigin || operation.movedSources.size() == originalSources.size())) {
+        if (operation.succeeded
+            && (!operation.adminOrigin || operation.movedSources.size() == originalSources.size())) {
           m_transfer.consumeSelection(cutGeneration);
           m_consumedCutSelection = cutGeneration;
           const bool hadActiveCut = !m_activeCutPaths.empty();
@@ -236,6 +271,16 @@ namespace filemanager {
     tab.pendingPasteRevealPath.reset();
     tab.pendingDropScrollGeneration.reset();
     tab.pendingRevealOnActivate = false;
+    if (tab.id == m_tabs.activeTabId()) {
+      stopDragScroll();
+      if (m_draggingFiles || m_protocolDragInside) {
+        clearDragFeedback();
+        m_pinBefore.reset();
+        m_places.showPlaceInsertion(std::nullopt);
+        m_protocolDropDestination.reset();
+        m_dragTargetValid = false;
+      }
+    }
   }
 
   void FileTransferController::onEnumerateStarted(BrowserTab& tab) { tab.identityCheckedPaths.clear(); }
@@ -387,9 +432,11 @@ namespace filemanager {
       const auto samePending = targetTab.pendingPasteSelection
           && (targetTab.administratorBrowsing
                   ? targetTab.pendingPasteSelection->request.destination == matchedRequest.destination
-                  : m_places.sameDirectoryPathCached(
-                        targetTab.pendingPasteSelection->request.destination, matchedRequest.destination
-                    ).value_or(false));
+                  : m_places
+                        .sameDirectoryPathCached(
+                            targetTab.pendingPasteSelection->request.destination, matchedRequest.destination
+                        )
+                        .value_or(false));
       if (!targetTab.pendingPasteSelection
           || targetTab.pendingPasteSelection->request.tabId != matchedRequest.tabId
           || targetTab.pendingPasteSelection->request.navigation != matchedRequest.navigation
@@ -454,8 +501,9 @@ namespace filemanager {
         || pending.request.navigation != tab.session.navigationGeneration())
       return;
     const bool admin = tab.administratorBrowsing;
-    if (const auto sameDest = admin ? std::optional(pending.request.destination == tab.session.path())
-                                    : m_places.sameDirectoryPathCached(pending.request.destination, tab.session.path())) {
+    if (const auto sameDest = admin
+            ? std::optional(pending.request.destination == tab.session.path())
+            : m_places.sameDirectoryPathCached(pending.request.destination, tab.session.path())) {
       if (!*sameDest)
         return;
     } else {
@@ -603,7 +651,8 @@ namespace filemanager {
               return false;
             const std::filesystem::path reported(entry.path);
             return reported == path
-                || (!admin && reported.filename() == path.filename()
+                || (!admin
+                    && reported.filename() == path.filename()
                     && m_places.sameDirectoryPathCached(reported.parent_path(), path.parent_path()).value_or(false));
           }))
         continue;
@@ -881,8 +930,8 @@ namespace filemanager {
           || tab == nullptr
           || tabId != m_tabs.activeTabId()
           || tab->administratorBrowsing != administrator
-          || (administrator && (!tab->hasActiveAdminSession()
-                                || tab->adminSession.sessionGeneration() != adminGeneration))
+          || (administrator
+              && (!tab->hasActiveAdminSession() || tab->adminSession.sessionGeneration() != adminGeneration))
           || tab->session.navigationGeneration() != navigation
           || m_dragSessionGeneration != dragSession) {
         return;
@@ -922,7 +971,8 @@ namespace filemanager {
       state->valid = !state->validation.sources.empty();
       const auto check = [&](const std::filesystem::path& path, bool target) {
         (void)activeTab->adminSession.statInfoAsync(
-            path, false, [state, target](bool ok, const AdminStatRecord& stat, auto, const std::string&) {
+            path, false,
+            [state, target](bool ok, const AdminStatRecord& stat, auto, const std::string&) {
               if (!ok || !stat.exists || stat.resolvedPath.empty()) {
                 state->valid = false;
               } else if (target) {
@@ -947,7 +997,8 @@ namespace filemanager {
                 }
                 state->deliver(std::move(state->validation));
               }
-            }, target ? AdminStatDetail::DropTarget : AdminStatDetail::DropSource
+            },
+            target ? AdminStatDetail::DropTarget : AdminStatDetail::DropSource
         );
       };
       for (const auto& path : state->validation.sources)
@@ -1031,11 +1082,23 @@ namespace filemanager {
           if (m_draggingFiles || (m_protocolDragInside && m_transfer.dragging() && !m_transfer.dragDropped())) {
             const auto currentDest = dropDestination(m_dragPointerX, m_dragPointerY);
             if (currentDest && *currentDest == result.rawDestination && m_dragSources == result.sources) {
+              clearDragFeedback();
               m_dragTargetValid = m_pinBefore.has_value() || result.target.has_value();
               const auto modifiers = m_callbacks.keyboardModifiers ? m_callbacks.keyboardModifiers() : 0U;
               if (result.target) {
                 m_protocolDropDestination = result.target;
                 m_protocolDropSources = m_dragSources;
+                if (auto row = m_places.rowIndexAt(m_dragPointerX, m_dragPointerY)) {
+                  m_dropPlace = m_places.placeRows()[*row].first;
+                  m_dropPlace->setSelected(true);
+                } else if (auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr) {
+                  const auto& entries = tab->session.entries();
+                  if (auto index = grid->indexAtSurface(m_dragPointerX, m_dragPointerY);
+                      index && *index < entries.size() && entries[*index].isDir) {
+                    m_dropIndex = index;
+                    grid->notifyItemChanged(*index);
+                  }
+                }
                 const bool copy = (modifiers & KeyMod::Ctrl) || (!(modifiers & KeyMod::Shift) && result.copyByDefault);
                 if (m_callbacks.onStatus)
                   m_callbacks.onStatus(
@@ -1060,6 +1123,23 @@ namespace filemanager {
               if (auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr)
                 surface->requestUpdate();
               scheduleNativeDragPreview();
+              if (m_protocolDragInside && m_transfer.dragging() && !m_transfer.dragDropped()) {
+                DeferredCall::callLater([this, alive, tabId, navigation, dragSession] {
+                  const auto stillAlive = alive.lock();
+                  const auto* currentTab = m_tabs.findTab(tabId);
+                  if (!stillAlive
+                      || !*stillAlive
+                      || currentTab == nullptr
+                      || tabId != m_tabs.activeTabId()
+                      || currentTab->session.navigationGeneration() != navigation
+                      || m_dragSessionGeneration != dragSession
+                      || !m_protocolDragInside
+                      || !m_transfer.dragging()
+                      || m_transfer.dragDropped())
+                    return;
+                  m_transfer.updateDragTarget();
+                });
+              }
             }
           }
         }
@@ -1080,6 +1160,7 @@ namespace filemanager {
     m_dragTargetValid = false;
     m_protocolDropDestination.reset();
     m_protocolDropSources.clear();
+    const bool wasProtocolDragInside = m_protocolDragInside;
     m_protocolDragInside = mainSurface && surface == mainSurface->wlSurface();
     const auto& activeTab = m_tabs.activeTab();
     const auto& activeSession = activeTab.session;
@@ -1093,12 +1174,18 @@ namespace filemanager {
         || m_operations.replaying()
         || renaming
         || activeSession.loading()) {
+      stopDragScroll();
       if (mainSurface)
         mainSurface->requestUpdate();
       return 0;
     }
+    const bool pointerMoved = !wasProtocolDragInside || x != m_dragPointerX || y != m_dragPointerY;
     m_dragPointerX = x;
     m_dragPointerY = y;
+    if (pointerMoved)
+      m_dispatcher.cancelPointerCapture();
+    recordDragScrollOffsets();
+    updateDragScroll();
     const bool own = m_transfer.dragging() && !m_transfer.dragDropped() && !m_dragSources.empty();
     const bool folders = own && dragSourcesAreFolders();
     m_pinBefore = folders ? m_places.placeInsertionAt(x, y, "Personal", true) : std::nullopt;
@@ -1107,6 +1194,11 @@ namespace filemanager {
     std::optional<std::filesystem::path> destination = rawDestination;
     bool copyDefault = true;
     if (own && rawDestination) {
+      if (!(m_dropValidation
+            && m_dropValidation->sources == m_dragSources
+            && m_dropValidation->rawDestination == *rawDestination)) {
+        requestHoverDropValidation(m_dragSources, *rawDestination);
+      }
       if (m_dropValidation
           && m_dropValidation->sources == m_dragSources
           && m_dropValidation->rawDestination == *rawDestination) {
@@ -1114,7 +1206,6 @@ namespace filemanager {
         copyDefault = m_dropValidation->copyByDefault;
       } else {
         // Fail closed while asynchronous drop validation is in flight.
-        requestHoverDropValidation(m_dragSources, *rawDestination);
         if (m_callbacks.onStatus)
           m_callbacks.onStatus("Checking drop target… · Escape cancels");
         mainSurface->requestUpdate();
@@ -1152,14 +1243,9 @@ namespace filemanager {
       grid->notifyItemChanged(*index);
     }
     if (destination) {
-      for (const auto& [row, place] : m_places.placeRows()) {
-        float rx = 0, ry = 0;
-        Node::absolutePosition(row, rx, ry);
-        if (x >= rx && x < rx + row->width() && y >= ry && y < ry + row->height()) {
-          m_dropPlace = row;
-          row->setSelected(true);
-          break;
-        }
+      if (auto row = m_places.rowIndexAt(x, y)) {
+        m_dropPlace = m_places.placeRows()[*row].first;
+        m_dropPlace->setSelected(true);
       }
     }
     if (m_callbacks.onStatus)
@@ -1174,6 +1260,7 @@ namespace filemanager {
 
   NativeDataTransfer::DropReceiver FileTransferController::receiveProtocolDrop(std::uint32_t action) {
     m_protocolDragInside = false;
+    stopDragScroll();
     if (auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr)
       surface->requestUpdate();
     const auto pin = m_pinBefore;
@@ -1189,8 +1276,8 @@ namespace filemanager {
     auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr;
     const auto scrollGeneration = grid ? grid->scrollView().userScrollGeneration() : 0;
     return [this, alive = std::weak_ptr<bool>(m_alive), tabId, pin, destination, ownPaths, navigation, scrollGeneration,
-            administrator, adminGeneration, action](std::optional<NativeDataTransfer::Payload> payload,
-                                                     NativeDataTransfer::FinishDrop finish) {
+            administrator, adminGeneration,
+            action](std::optional<NativeDataTransfer::Payload> payload, NativeDataTransfer::FinishDrop finish) {
       const auto locked = alive.lock();
       const bool windowOpen = m_callbacks.isWindowOpen && m_callbacks.isWindowOpen();
       const bool quitting = m_callbacks.isQuitting && m_callbacks.isQuitting();
@@ -1202,8 +1289,9 @@ namespace filemanager {
           || currentTab == nullptr
           || tabId != m_tabs.activeTabId()
           || currentTab->administratorBrowsing != administrator
-          || (administrator && (currentTab->adminSession.sessionGeneration() != adminGeneration
-                                || currentTab->session.navigationGeneration() != navigation))
+          || (administrator
+              && (currentTab->adminSession.sessionGeneration() != adminGeneration
+                  || currentTab->session.navigationGeneration() != navigation))
           || !payload
           || !payload->contains("text/uri-list")
           || m_places.hasActiveDeviceOperations()
@@ -1241,40 +1329,40 @@ namespace filemanager {
           check->remaining = paths.size();
           check->finish = std::move(finish);
           for (const auto& source : paths) {
-            auto onResolved =
-                [this, alive, tabId, navigation, administrator, adminGeneration, check](bool isDirectory) {
-                  const auto stillAlive = alive.lock();
-                  if (!stillAlive || !*stillAlive || !check->finish)
-                    return;
-                  const bool stillQuitting = m_callbacks.isQuitting && m_callbacks.isQuitting();
-                  const bool stillOpen = m_callbacks.isWindowOpen && m_callbacks.isWindowOpen();
-                  const auto* tab = m_tabs.findTab(tabId);
-                  if (stillQuitting
-                      || !stillOpen
-                      || tab == nullptr
-                      || tabId != m_tabs.activeTabId()
-                      || tab->administratorBrowsing != administrator
-                      || (administrator && tab->adminSession.sessionGeneration() != adminGeneration)
-                      || tab->session.navigationGeneration() != navigation) {
-                    if (check->finish) {
-                      std::exchange(check->finish, {})(false);
-                    }
-                    return;
-                  }
-                  if (!isDirectory)
-                    check->allFolders = false;
-                  if (--check->remaining > 0)
-                    return;
-                  auto done = std::exchange(check->finish, {});
-                  if (!check->allFolders) {
-                    if (done)
-                      done(false);
-                    return;
-                  }
-                  m_places.pinFolders(check->paths, check->before, administrator);
-                  if (done)
-                    done(true);
-                };
+            auto onResolved = [this, alive, tabId, navigation, administrator, adminGeneration,
+                               check](bool isDirectory) {
+              const auto stillAlive = alive.lock();
+              if (!stillAlive || !*stillAlive || !check->finish)
+                return;
+              const bool stillQuitting = m_callbacks.isQuitting && m_callbacks.isQuitting();
+              const bool stillOpen = m_callbacks.isWindowOpen && m_callbacks.isWindowOpen();
+              const auto* tab = m_tabs.findTab(tabId);
+              if (stillQuitting
+                  || !stillOpen
+                  || tab == nullptr
+                  || tabId != m_tabs.activeTabId()
+                  || tab->administratorBrowsing != administrator
+                  || (administrator && tab->adminSession.sessionGeneration() != adminGeneration)
+                  || tab->session.navigationGeneration() != navigation) {
+                if (check->finish) {
+                  std::exchange(check->finish, {})(false);
+                }
+                return;
+              }
+              if (!isDirectory)
+                check->allFolders = false;
+              if (--check->remaining > 0)
+                return;
+              auto done = std::exchange(check->finish, {});
+              if (!check->allFolders) {
+                if (done)
+                  done(false);
+                return;
+              }
+              m_places.pinFolders(check->paths, check->before, administrator);
+              if (done)
+                done(true);
+            };
             if (administrator) {
               if (!currentTab->adminSession.statInfoAsync(
                       source, false, [onResolved](bool ok, const auto& stat, auto, const std::string&) {
@@ -1286,9 +1374,7 @@ namespace filemanager {
                 return;
               }
             } else {
-              m_places.resolvePathAsync(source, [onResolved](const auto& result) {
-                onResolved(result.isDirectory);
-              });
+              m_places.resolvePathAsync(source, [onResolved](const auto& result) { onResolved(result.isDirectory); });
             }
           }
         } else {
@@ -1377,6 +1463,7 @@ namespace filemanager {
       m_dragPreview->setVisible(false);
     m_places.showPlaceInsertion(std::nullopt);
     clearDragFeedback();
+    stopDragScroll();
     m_dispatcher.cancelPointerCapture();
   }
 
@@ -1560,6 +1647,7 @@ namespace filemanager {
   }
 
   void FileTransferController::handlePointerLeaveDuringDrag() {
+    stopDragScroll();
     if (!m_transfer.dragging())
       cancelFileGesture();
     else {
@@ -1575,10 +1663,16 @@ namespace filemanager {
         m_dragPointerX, m_dragPointerY, event.axis, event.axisSource, event.axisValue, event.axisDiscrete,
         event.axisValue120, event.axisLines, event.axisGestureSerial
     );
+    m_refreshDropAfterLayout = true;
     m_transfer.updateDragTarget();
+    recordDragScrollOffsets();
+    updateDragScroll();
+    if (auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr)
+      surface->requestUpdate();
   }
 
   void FileTransferController::cancelLocalDragState() {
+    stopDragScroll();
     m_dragPending = false;
     m_draggingFiles = false;
     m_dragIndex.reset();
@@ -1589,6 +1683,232 @@ namespace filemanager {
     clearDragFeedback();
   }
 
+  bool FileTransferController::canDragScroll() const {
+    if (!m_protocolDragInside && !(m_draggingFiles && !m_transfer.dragging()))
+      return false;
+    const bool windowOpen = m_callbacks.isWindowOpen && m_callbacks.isWindowOpen();
+    const bool quitting = m_callbacks.isQuitting && m_callbacks.isQuitting();
+    const bool renaming = m_callbacks.isRenaming && m_callbacks.isRenaming();
+    const auto& activeTab = m_tabs.activeTab();
+    const auto& activeSession = activeTab.session;
+    return windowOpen
+        && !quitting
+        && !renaming
+        && !m_places.hasActiveDeviceOperations()
+        && !m_operations.replaying()
+        && !activeSession.browsingTrash()
+        && activeTab.capabilities().canAcceptDrop
+        && !activeSession.loading();
+  }
+
+  float FileTransferController::dragScrollSpeed(bool& inPlaces) const {
+    inPlaces = false;
+    if (!canDragScroll())
+      return 0.0F;
+    if (auto* placesScroll = m_places.scrollView(); isNodeEffectivelyVisible(placesScroll)) {
+      float px = 0.0F;
+      float py = 0.0F;
+      Node::absolutePosition(placesScroll, px, py);
+      if (m_dragPointerX >= px
+          && m_dragPointerX < px + placesScroll->width()
+          && m_dragPointerY >= py
+          && m_dragPointerY < py + placesScroll->height()) {
+        inPlaces = true;
+        return edgeScrollSpeed(*placesScroll, m_dragPointerY, py);
+      }
+    }
+    if (auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr; isNodeEffectivelyVisible(grid)) {
+      auto& scroll = grid->scrollView();
+      float gx = 0.0F;
+      float gy = 0.0F;
+      Node::absolutePosition(&scroll, gx, gy);
+      if (m_dragPointerX >= gx
+          && m_dragPointerX < gx + scroll.width()
+          && m_dragPointerY >= gy
+          && m_dragPointerY < gy + scroll.height()) {
+        return edgeScrollSpeed(scroll, m_dragPointerY, gy);
+      }
+    }
+    return 0.0F;
+  }
+
+  void FileTransferController::recordDragScrollOffsets() {
+    if (auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr)
+      m_lastDragGridScrollOffset = grid->scrollView().scrollOffset();
+    else
+      m_lastDragGridScrollOffset.reset();
+    if (auto* placesScroll = m_places.scrollView())
+      m_lastDragPlacesScrollOffset = placesScroll->scrollOffset();
+    else
+      m_lastDragPlacesScrollOffset.reset();
+  }
+
+  void FileTransferController::stopDragScroll() {
+    m_dragScroll.stop();
+    m_dragScrollDelta = 0.0F;
+    m_dragScrollInPlaces = false;
+    m_refreshDropAfterLayout = false;
+    m_lastDragGridScrollOffset.reset();
+    m_lastDragPlacesScrollOffset.reset();
+  }
+
+  void FileTransferController::updateDragScroll() {
+    bool places = false;
+    const float speed = dragScrollSpeed(places);
+    if (places != m_dragScrollInPlaces) {
+      m_dragScrollDelta = 0.0F;
+      m_dragScrollInPlaces = places;
+    }
+    if (speed == 0.0F) {
+      m_dragScroll.stop();
+      m_dragScrollDelta = 0.0F;
+      return;
+    }
+    if (!m_dragScroll.active()) {
+      std::weak_ptr<bool> alive = m_alive;
+      m_dragScroll.startRepeating(kDragScrollInterval, [this, alive] {
+        const auto locked = alive.lock();
+        if (!locked || !*locked)
+          return;
+        bool tickPlaces = false;
+        const float tickSpeed = dragScrollSpeed(tickPlaces);
+        if (tickPlaces != m_dragScrollInPlaces) {
+          m_dragScrollDelta = 0.0F;
+          m_dragScrollInPlaces = tickPlaces;
+        }
+        if (tickSpeed == 0.0F) {
+          m_dragScroll.stop();
+          m_dragScrollDelta = 0.0F;
+          return;
+        }
+        m_dragScrollDelta = std::clamp(m_dragScrollDelta + tickSpeed, -kDragScrollMaxDeltaPx, kDragScrollMaxDeltaPx);
+        if (auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr)
+          surface->requestLayout();
+      });
+    }
+  }
+
+  bool FileTransferController::applyDragScroll() {
+    if (m_dragScrollDelta == 0.0F)
+      return false;
+    const float delta = std::exchange(m_dragScrollDelta, 0.0F);
+    if (!canDragScroll()) {
+      stopDragScroll();
+      return false;
+    }
+    ScrollView* scroll = m_dragScrollInPlaces ? m_places.scrollView() : nullptr;
+    if (!m_dragScrollInPlaces) {
+      if (auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr; isNodeEffectivelyVisible(grid))
+        scroll = &grid->scrollView();
+    }
+    if (scroll == nullptr || !isNodeEffectivelyVisible(scroll))
+      return false;
+    scroll->requestScrollToOffset(scroll->scrollOffset() + delta);
+    m_refreshDropAfterLayout = true;
+    return true;
+  }
+
+  bool FileTransferController::refreshDropTargetAfterScroll() {
+    const bool activeDrag = m_protocolDragInside || (m_draggingFiles && !m_transfer.dragging());
+    if (!activeDrag) {
+      m_refreshDropAfterLayout = false;
+      return false;
+    }
+    bool scrollChanged = m_refreshDropAfterLayout;
+    if (auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr) {
+      const float current = grid->scrollView().scrollOffset();
+      if (!m_lastDragGridScrollOffset || std::abs(current - *m_lastDragGridScrollOffset) >= 0.001F)
+        scrollChanged = true;
+    }
+    if (auto* placesScroll = m_places.scrollView()) {
+      const float current = placesScroll->scrollOffset();
+      if (!m_lastDragPlacesScrollOffset || std::abs(current - *m_lastDragPlacesScrollOffset) >= 0.001F)
+        scrollChanged = true;
+    }
+    m_refreshDropAfterLayout = false;
+    recordDragScrollOffsets();
+    if (!scrollChanged)
+      return false;
+    if (m_protocolDragInside) {
+      m_transfer.updateDragTarget();
+      updateDragScroll();
+    } else {
+      updateLocalDragTarget(m_dragPointerX, m_dragPointerY);
+    }
+    return true;
+  }
+
+  void FileTransferController::updateLocalDragTarget(float x, float y) {
+    auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr;
+    auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr;
+    clearDragFeedback();
+    const bool pointerMoved = x != m_dragPointerX || y != m_dragPointerY;
+    m_dragPointerX = x;
+    m_dragPointerY = y;
+    if (pointerMoved)
+      m_dispatcher.cancelPointerCapture();
+    const bool folders = dragSourcesAreFolders();
+    m_pinBefore = folders ? m_places.placeInsertionAt(x, y, "Personal", true) : std::nullopt;
+    m_places.showPlaceInsertion(m_pinBefore);
+    const auto rawDestination = m_pinBefore ? std::nullopt : dropDestination(x, y);
+    std::optional<std::filesystem::path> destination;
+    bool checking = false;
+    bool copyDefault = true;
+    if (rawDestination) {
+      if (!(m_dropValidation
+            && m_dropValidation->sources == m_dragSources
+            && m_dropValidation->rawDestination == *rawDestination)) {
+        requestHoverDropValidation(m_dragSources, *rawDestination);
+      }
+      if (m_dropValidation
+          && m_dropValidation->sources == m_dragSources
+          && m_dropValidation->rawDestination == *rawDestination) {
+        destination = m_dropValidation->target;
+        copyDefault = m_dropValidation->copyByDefault;
+      } else {
+        checking = true;
+      }
+    }
+    if (destination) {
+      if (auto row = m_places.rowIndexAt(x, y)) {
+        m_dropPlace = m_places.placeRows()[*row].first;
+        m_dropPlace->setSelected(true);
+      } else if (grid) {
+        if (auto index = grid->indexAtSurface(x, y)) {
+          m_dropIndex = index;
+          grid->notifyItemChanged(*index);
+        }
+      }
+    }
+    m_dragTargetValid = m_pinBefore.has_value() || destination.has_value();
+    const auto modifiers = m_callbacks.keyboardModifiers ? m_callbacks.keyboardModifiers() : 0U;
+    if (m_callbacks.onStatus)
+      m_callbacks.onStatus(
+          m_pinBefore ? "Pin folders in Places · Escape cancels"
+              : checking
+              ? "Checking drop target… · Escape cancels"
+              : std::string(
+                    ((modifiers & KeyMod::Ctrl) || (destination && !(modifiers & KeyMod::Shift) && copyDefault))
+                        ? "Copy "
+                        : "Move "
+                )
+                  + std::to_string(m_dragSources.size())
+                  + " items"
+                  + (destination ? " to " + destination->string() : " — no drop target")
+                  + " · Escape cancels"
+      );
+    const auto serial = m_callbacks.pointerSerial ? m_callbacks.pointerSerial() : 0U;
+    if (serial)
+      m_wayland.setCursorShape(
+          serial,
+          m_dragTargetValid ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED
+      );
+    recordDragScrollOffsets();
+    updateDragScroll();
+    if (surface)
+      surface->requestUpdate();
+  }
+
   bool FileTransferController::handleFileDragPointer(const PointerEvent& event, float x, float y) {
     if (!m_dragPending && !m_draggingFiles)
       return false;
@@ -1597,16 +1917,23 @@ namespace filemanager {
       return false;
     }
     auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr;
-    auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr;
     if (event.type == PointerEvent::Type::Axis) {
+      if (m_draggingFiles && (x != m_dragPointerX || y != m_dragPointerY))
+        m_dispatcher.cancelPointerCapture();
       m_dispatcher.pointerAxis(
           x, y, event.axis, event.axisSource, event.axisValue, event.axisDiscrete, event.axisValue120, event.axisLines,
           event.axisGestureSerial
       );
-      auto motion = event;
-      motion.type = PointerEvent::Type::Motion;
-      if (m_callbacks.onSynthesizeMotion)
+      if (m_draggingFiles) {
+        m_dragPointerX = x;
+        m_dragPointerY = y;
+        m_refreshDropAfterLayout = true;
+        updateLocalDragTarget(x, y);
+      } else if (m_callbacks.onSynthesizeMotion) {
+        auto motion = event;
+        motion.type = PointerEvent::Type::Motion;
         m_callbacks.onSynthesizeMotion(motion);
+      }
       return true;
     }
     if (event.type == PointerEvent::Type::Motion) {
@@ -1630,7 +1957,8 @@ namespace filemanager {
           m_dragPointerX = x;
           m_dragPointerY = y;
           clearNativeDragPreview();
-          m_nativePreviewSurface = wl_compositor_create_surface(m_wayland.compositor());
+          m_nativePreviewSurface =
+              m_wayland.compositor() ? wl_compositor_create_surface(m_wayland.compositor()) : nullptr;
           if (surface
               && m_transfer.startDrag(
                   std::move(payload), surface->wlSurface(), m_dragPressSerial, nullptr, m_nativePreviewSurface
@@ -1646,65 +1974,8 @@ namespace filemanager {
           return true;
         }
       }
-      if (m_draggingFiles) {
-        clearDragFeedback();
-        m_dragPointerX = x;
-        m_dragPointerY = y;
-        const bool folders = dragSourcesAreFolders();
-        m_pinBefore = folders ? m_places.placeInsertionAt(x, y, "Personal", true) : std::nullopt;
-        m_places.showPlaceInsertion(m_pinBefore);
-        const auto rawDestination = m_pinBefore ? std::nullopt : dropDestination(x, y);
-        std::optional<std::filesystem::path> destination;
-        bool checking = false;
-        bool copyDefault = true;
-        if (rawDestination) {
-          if (m_dropValidation
-              && m_dropValidation->sources == m_dragSources
-              && m_dropValidation->rawDestination == *rawDestination) {
-            destination = m_dropValidation->target;
-            copyDefault = m_dropValidation->copyByDefault;
-          } else {
-            checking = true;
-            requestHoverDropValidation(m_dragSources, *rawDestination);
-          }
-        }
-        if (destination) {
-          if (auto row = m_places.rowIndexAt(x, y)) {
-            m_dropPlace = m_places.placeRows()[*row].first;
-            m_dropPlace->setSelected(true);
-          } else if (grid) {
-            if (auto index = grid->indexAtSurface(x, y)) {
-              m_dropIndex = index;
-              grid->notifyItemChanged(*index);
-            }
-          }
-        }
-        m_dragTargetValid = m_pinBefore.has_value() || destination.has_value();
-        const auto modifiers = m_callbacks.keyboardModifiers ? m_callbacks.keyboardModifiers() : 0U;
-        if (m_callbacks.onStatus)
-          m_callbacks.onStatus(
-              m_pinBefore ? "Pin folders in Places · Escape cancels"
-                  : checking
-                  ? "Checking drop target… · Escape cancels"
-                  : std::string(
-                        ((modifiers & KeyMod::Ctrl) || (destination && !(modifiers & KeyMod::Shift) && copyDefault))
-                            ? "Copy "
-                            : "Move "
-                    )
-                      + std::to_string(m_dragSources.size())
-                      + " items"
-                      + (destination ? " to " + destination->string() : " — no drop target")
-                      + " · Escape cancels"
-          );
-        const auto serial = m_callbacks.pointerSerial ? m_callbacks.pointerSerial() : 0U;
-        if (serial)
-          m_wayland.setCursorShape(
-              serial,
-              m_dragTargetValid ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED
-          );
-        if (surface)
-          surface->requestUpdate();
-      }
+      if (m_draggingFiles)
+        updateLocalDragTarget(x, y);
       return true;
     }
     if (event.type == PointerEvent::Type::Button && event.button == BTN_LEFT && !event.pressed) {
@@ -1769,6 +2040,7 @@ namespace filemanager {
       if (m_dragPreview)
         m_dragPreview->setVisible(false);
       clearDragFeedback();
+      stopDragScroll();
       m_dispatcher.cancelPointerCapture();
       const auto serial = m_callbacks.pointerSerial ? m_callbacks.pointerSerial() : 0U;
       if (serial)
