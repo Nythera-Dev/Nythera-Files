@@ -49,6 +49,9 @@ namespace filemanager {
   std::unique_ptr<Flex> FileListHeaderController::buildHeader() {
     auto fileHeader = std::make_unique<Flex>();
     m_header = fileHeader.get();
+    fileHeader->setVisible(!m_gridMode);
+    fileHeader->setParticipatesInLayout(!m_gridMode);
+    fileHeader->setExcludeSubtreeFromTabOrder(m_gridMode);
     fileHeader->setAlign(FlexAlign::Center);
     fileHeader->setGap(Style::spaceSm);
     fileHeader->setPadding(5.0F, Style::spaceSm);
@@ -132,6 +135,14 @@ namespace filemanager {
     }
   }
 
+  void FileListHeaderController::reloadColumnPreferences() {
+    m_preferredColumns = FileColumns{};
+    m_columnLayout = FileColumnLayout{};
+    m_settings.loadListColumnWidths(m_preferredColumns);
+    m_settings.loadListColumnLayout(m_columnLayout);
+    updateColumnHeaders();
+  }
+
   void FileListHeaderController::applyTabViewState(const TabViewState& state) {
     cancelGesture();
     m_gridMode = state.gridMode;
@@ -209,22 +220,26 @@ namespace filemanager {
     if (!m_header)
       return;
     cancelGesture();
-    m_visibleColumns = m_gridMode
-        ? std::vector<FileColumn>(kDefaultFileColumns.begin(), kDefaultFileColumns.end())
-        : m_columnLayout.displayed();
+    const bool showHeader = !m_gridMode;
+    m_header->setVisible(showHeader);
+    m_header->setParticipatesInLayout(showHeader);
+    m_header->setExcludeSubtreeFromTabOrder(!showHeader);
+    m_visibleColumns = m_gridMode ? std::vector<FileColumn>(kDefaultFileColumns.begin(), kDefaultFileColumns.end())
+                                  : m_columnLayout.displayed();
     for (auto column : kFileColumns) {
       const auto index = columnIndex(column);
-      const bool visible = std::ranges::contains(m_visibleColumns, column);
+      const bool visible = showHeader && std::ranges::contains(m_visibleColumns, column);
       m_headers[index]->setVisible(visible);
       m_headers[index]->setParticipatesInLayout(visible);
       m_markers[index]->setVisible(visible);
     }
-    for (auto column : m_visibleColumns)
-      m_header->addChild(m_header->removeChild(m_headers[columnIndex(column)]));
-
-    applyColumnWidths();
-    if (!m_gridMode && m_grid)
-      m_grid->notifyDataChanged();
+    if (showHeader) {
+      for (auto column : m_visibleColumns)
+        m_header->addChild(m_header->removeChild(m_headers[columnIndex(column)]));
+      applyColumnWidths();
+      if (m_grid)
+        m_grid->notifyDataChanged();
+    }
     if (m_callbacks.onRequestLayout)
       m_callbacks.onRequestLayout();
   }
@@ -235,7 +250,7 @@ namespace filemanager {
   }
 
   bool FileListHeaderController::applyColumnWidths() {
-    if (!m_header || m_visibleColumns.empty())
+    if (!m_header || m_gridMode || m_visibleColumns.empty())
       return false;
     float leftGutter = 0.0F;
     float rightGutter = 0.0F;
@@ -280,7 +295,7 @@ namespace filemanager {
   }
 
   void FileListHeaderController::arrangeAfterWidthChange(Renderer& renderer) {
-    if (!m_header)
+    if (!m_header || m_gridMode)
       return;
     m_header->arrange(
         renderer,
@@ -291,7 +306,7 @@ namespace filemanager {
   }
 
   void FileListHeaderController::positionColumnMarkers() {
-    if (!m_header)
+    if (!m_header || m_gridMode)
       return;
     const bool rtl = Style::rtl();
     for (auto column : m_visibleColumns) {
@@ -304,6 +319,8 @@ namespace filemanager {
   }
 
   void FileListHeaderController::layoutVisibleMarkers(Renderer& renderer) {
+    if (!m_header || m_gridMode)
+      return;
     // Markers are positioned overlays: keep them out of Flex sizing, but still
     // lay out each Separator's internal gradient rectangles explicitly.
     for (auto* marker : m_markers)

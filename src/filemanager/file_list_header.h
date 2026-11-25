@@ -56,6 +56,7 @@ namespace filemanager {
     void setGridMode(bool gridMode);
     void adjustViewScale(float value);
     void ensureViewScaleLoaded();
+    void reloadColumnPreferences();
     void applyTabViewState(const TabViewState& state);
 
     void updateColumnHeaders();

@@ -1327,6 +1327,73 @@ public:
     TEST_CHECK(alwaysShowView != viewBefore.end() && alwaysShowView->checkmark && alwaysShowView->toggleState == 0);
     TEST_CHECK(bgViewBefore != viewBefore.end() && bgViewBefore->checkmark && bgViewBefore->toggleState == 0);
 
+    // Show Columns appears in details/list view and is hidden entirely in grid view,
+    // and the column header bar hides in grid view and restores in details/column view.
+    {
+      const bool initialGridMode = manager.m_listHeader.gridMode();
+      auto headerBar = manager.m_listHeader.buildHeader();
+      const auto restoreAndDetach = nythera::test::makeScopeExit([&] {
+        manager.setGridMode(initialGridMode);
+        manager.m_listHeader.detachUi();
+      });
+      manager.m_listHeader.updateColumnHeaders();
+      TEST_CHECK(headerBar->visible() == !initialGridMode);
+      TEST_CHECK(headerBar->participatesInLayout() == !initialGridMode);
+      TEST_CHECK(headerBar->excludeSubtreeFromTabOrder() == initialGridMode);
+      TEST_CHECK(
+          (findMenuEntry(viewBefore, filemanager::menu_id::kShowColumns) != viewBefore.end()) == !initialGridMode
+      );
+
+      manager.setGridMode(false);
+      TEST_CHECK(!manager.m_listHeader.gridMode());
+      TEST_CHECK(headerBar->visible());
+      TEST_CHECK(headerBar->participatesInLayout());
+      TEST_CHECK(!headerBar->excludeSubtreeFromTabOrder());
+      const auto viewDetails = manager.viewMenuEntries();
+      const auto showColsDetails = findMenuEntry(viewDetails, filemanager::menu_id::kShowColumns);
+      TEST_CHECK(
+          showColsDetails != viewDetails.end()
+          && showColsDetails->hasSubmenu
+          && showColsDetails->submenuEntries.size() == filemanager::kFileColumns.size()
+      );
+      manager.setGridMode(true);
+      TEST_CHECK(!headerBar->visible());
+      TEST_CHECK(!headerBar->participatesInLayout());
+      TEST_CHECK(headerBar->excludeSubtreeFromTabOrder());
+      const auto viewGrid = manager.viewMenuEntries();
+      TEST_CHECK(findMenuEntry(viewGrid, filemanager::menu_id::kShowColumns) == viewGrid.end());
+      manager.setGridMode(false);
+      TEST_CHECK(headerBar->visible());
+      TEST_CHECK(headerBar->participatesInLayout());
+      TEST_CHECK(!headerBar->excludeSubtreeFromTabOrder());
+      const auto viewRestoredDetails = manager.viewMenuEntries();
+      const auto showColsRestored = findMenuEntry(viewRestoredDetails, filemanager::menu_id::kShowColumns);
+      TEST_CHECK(
+          showColsRestored != viewRestoredDetails.end()
+          && showColsRestored->hasSubmenu
+          && showColsRestored->submenuEntries.size() == filemanager::kFileColumns.size()
+      );
+
+      // Tab switching updates header bar visibility to match each tab's view mode.
+      const auto gridTab = manager.m_tabs.openTab(
+          subFolder, filemanager::TabViewState{.gridMode = true, .viewScale = manager.m_listHeader.viewScale()}, false
+      );
+      TEST_CHECK(gridTab != filemanager::kInvalidTabId);
+      const filemanager::TabId baseTabId = manager.activeTab().id;
+      TEST_CHECK(manager.activateTab(gridTab));
+      pumpUntil([&] { return !manager.activeSession().m_loading; });
+      TEST_CHECK(!headerBar->visible());
+      TEST_CHECK(!headerBar->participatesInLayout());
+      TEST_CHECK(headerBar->excludeSubtreeFromTabOrder());
+      const auto gridTabViewMenu = manager.viewMenuEntries();
+      TEST_CHECK(findMenuEntry(gridTabViewMenu, filemanager::menu_id::kShowColumns) == gridTabViewMenu.end());
+      TEST_CHECK(manager.activateTab(baseTabId));
+      TEST_CHECK(headerBar->visible());
+      TEST_CHECK(headerBar->participatesInLayout());
+      TEST_CHECK(!headerBar->excludeSubtreeFromTabOrder());
+      TEST_CHECK(manager.m_tabs.closeTab(gridTab));
+    }
+
     // Folder menu group order puts kOpenFolderInNewTab directly after Open (10) and before Open in New Window (60).
     std::vector<ContextMenuControlEntry> folderEntries{
         {.id = 10, .label = "Open"},

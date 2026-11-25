@@ -368,7 +368,7 @@ public:
 
   static void testProperties(FileManager& manager, const std::filesystem::path& file) {
     PropertiesWindow properties(
-        manager.m_wayland, manager.m_renderContext, manager.m_configService, manager.m_operations, [](std::string) {}
+        manager.m_wayland, manager.m_renderContext, manager.m_settings, manager.m_operations, [](std::string) {}
     );
     const auto key = [&](std::uint32_t sym, std::uint32_t mods = 0, bool repeat = false) {
       properties.handleKeyForRoot({.sym = sym, .modifiers = mods, .pressed = true, .repeat = repeat});

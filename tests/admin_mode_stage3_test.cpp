@@ -480,9 +480,89 @@ public:
     testAdministratorCopyLifecycle();
     testLocationClipboardPaste();
     testAdministratorPropertiesDropAndUserWastebin();
+    testPropertiesApplyFooter();
   }
 
 private:
+  static void testPropertiesApplyFooter() {
+    TempDir tmp("nythera-properties-footer");
+    const auto target = tmp.path / "permissions.txt";
+    writeFile(target, "Properties footer test");
+    TEST_CHECK(::chmod(target.c_str(), 0600) == 0);
+    struct stat state{};
+    TEST_CHECK(::stat(target.c_str(), &state) == 0);
+
+    FileManager manager(tmp.path.string());
+    Button close, apply;
+    Label status;
+    apply.setText("Apply");
+    PropertiesWindow window(manager.m_wayland, manager.m_renderContext, manager.m_settings, manager.m_operations, {});
+    window.m_closeButton = &close;
+    window.m_applyButton = &apply;
+    window.m_footerStatus = &status;
+    window.m_path = target;
+    window.m_nameDraft = target.filename().string();
+    window.m_permissionEditable = true;
+    window.m_device = state.st_dev;
+    window.m_inode = state.st_ino;
+    window.m_uid = state.st_uid;
+    window.m_originalMode = 0600;
+    window.m_editedMode = 0640;
+    window.updateFooter();
+    TEST_CHECK(apply.enabled() && close.label()->text() == "Cancel");
+
+    window.applyPendingChanges();
+    const auto operation = window.m_operation;
+    TEST_CHECK(operation != 0 && !apply.enabled() && apply.label()->text() == "Apply");
+    TEST_CHECK(status.text().empty() && close.label()->text() == "Cancel" && !close.enabled());
+    window.deferClose();
+    window.applyPendingChanges();
+    TEST_CHECK(window.m_permissionError.empty() && window.m_operation == operation);
+    TEST_CHECK(manager.m_operations.operations().size() == 1);
+
+    pumpUntil([&] { return !window.m_applying && !window.m_refreshing && !window.m_choicesLoading; });
+    window.updateFooter();
+    TEST_CHECK(!apply.visible() && close.enabled() && close.label()->text() == "Close");
+    TEST_CHECK(status.text().empty() && !window.permissionsPending() && (window.m_originalMode & 0777) == 0640);
+    TEST_CHECK(::stat(target.c_str(), &state) == 0 && (state.st_mode & 0777) == 0640);
+
+    window.m_pendingGroup = "__nythera_missing_group_987654__";
+    window.m_editedMode = 0600;
+    window.applyPendingChanges();
+    TEST_CHECK(window.m_operation != 0 && !apply.enabled());
+    pumpUntil([&] { return !window.m_applying && !window.m_refreshing && !window.m_choicesLoading; });
+    window.updateFooter();
+    TEST_CHECK(apply.visible() && apply.enabled() && close.label()->text() == "Cancel");
+    TEST_CHECK(window.permissionsPending() && (window.m_editedMode & 0777) == 0600 && !window.m_pendingGroup.empty());
+    TEST_CHECK(window.m_permissionError.find("selected account no longer exists") != std::string::npos);
+    TEST_CHECK(::stat(target.c_str(), &state) == 0 && (state.st_mode & 0777) == 0640);
+
+    const auto second = tmp.path / "second.txt";
+    writeFile(second, "Second selection item");
+    TEST_CHECK(::chmod(second.c_str(), 0640) == 0);
+    struct stat secondState{};
+    TEST_CHECK(::stat(second.c_str(), &secondState) == 0);
+    window.m_multipleSelection = true;
+    window.m_selectionPermissionItems = {
+        {.path = target, .device = state.st_dev, .inode = state.st_ino, .mode = 0640},
+        {.path = second, .device = secondState.st_dev, .inode = secondState.st_ino + 1, .mode = 0640},
+    };
+    window.m_pendingGroup.clear();
+    window.m_selectionTouchedMode = 0040;
+    window.applyPendingChanges();
+    pumpUntil([&] { return !window.m_applying; });
+    TEST_CHECK(apply.enabled() && window.permissionsPending() && window.m_editedMode == 0600);
+    TEST_CHECK(window.m_permissionError.find("Updated 1 of 2 selected items") != std::string::npos);
+
+    window.m_selectionPermissionItems[1].inode = secondState.st_ino;
+    const auto previousOperations = manager.m_operations.operations().size();
+    window.applyPendingChanges();
+    pumpUntil([&] { return !window.m_applying; });
+    TEST_CHECK(manager.m_operations.operations().size() == previousOperations + 1);
+    TEST_CHECK(window.m_permissionError.empty() && !apply.visible() && close.label()->text() == "Close");
+    TEST_CHECK(::stat(second.c_str(), &secondState) == 0 && (secondState.st_mode & 0777) == 0600);
+  }
+
   static void testAdministratorPropertiesDropAndUserWastebin() {
     TempDir tmp("nythera-admin-properties");
     const auto directory = tmp.path / "administrator";

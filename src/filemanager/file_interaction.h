@@ -24,6 +24,28 @@ namespace filemanager {
     return expanded;
   }
 
+  /// Resolve the initial directory for the symlink target picker from the current target field text.
+  inline std::filesystem::path resolveSymlinkTargetPickerStartDirectory(
+      std::string_view currentTarget, const std::filesystem::path& baseDirectory, const char* homeDir
+  ) {
+    if (currentTarget.empty() || currentTarget.find('\0') != std::string_view::npos)
+      return baseDirectory;
+    const std::string_view home = homeDir != nullptr ? std::string_view(homeDir) : std::string_view{};
+    const std::string expanded = expandHomePath(currentTarget, home);
+    if (expanded.empty())
+      return baseDirectory;
+    std::filesystem::path candidate(expanded);
+    if (candidate.is_relative())
+      candidate = baseDirectory / candidate;
+    std::error_code ec;
+    if (std::filesystem::is_directory(candidate, ec) && !ec)
+      return candidate;
+    ec.clear();
+    if (candidate.has_parent_path() && std::filesystem::is_directory(candidate.parent_path(), ec) && !ec)
+      return candidate.parent_path();
+    return baseDirectory;
+  }
+
   inline constexpr bool locationEditCancelIsCurrent(bool editing, std::uint64_t current, std::uint64_t captured) {
     return editing && current == captured;
   }

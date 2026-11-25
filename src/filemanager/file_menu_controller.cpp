@@ -648,73 +648,84 @@ namespace filemanager {
   std::vector<ContextMenuControlEntry> FileMenuController::viewMenuEntries() const {
     const auto& session = m_tabs.activeTab().session;
     const bool renaming = m_callbacks.isRenaming && m_callbacks.isRenaming();
-    std::vector<ContextMenuControlEntry> columns;
-    for (auto column : filemanager::kFileColumns) {
-      const auto index = columnIndex(column);
-      columns.push_back(
-          {.id = menu_id::kFirstColumnAction + static_cast<int>(index),
-           .label = std::string(filemanager::kFileColumnLabels[index]),
-           .enabled = column != FileColumn::Name,
-           .checkmark = true,
-           .toggleState = m_listHeader.columnLayout().visible[index] ? 1 : 0}
-      );
-    }
-    return {
+    const bool gridMode = m_listHeader.gridMode();
+    std::vector<ContextMenuControlEntry> entries{
         {.id = menu_id::kListView,
          .label = "List View",
          .radio = true,
-         .toggleState = m_listHeader.gridMode() ? 0 : 1,
+         .toggleState = gridMode ? 0 : 1,
          .actionGlyph = "layout-list"},
         {.id = menu_id::kGridView,
          .label = "Grid View",
          .radio = true,
-         .toggleState = m_listHeader.gridMode() ? 1 : 0,
+         .toggleState = gridMode ? 1 : 0,
          .actionGlyph = "layout-grid"},
-        {.id = menu_id::kShowColumns,
-         .label = "Show Columns",
-         .hasSubmenu = true,
-         .submenuEntries = std::move(columns),
-         .actionGlyph = "columns-3"},
-        {.separator = true},
-        filemanager::fileSortByMenuEntry(
-            m_listHeader.sortField(), m_listHeader.sortOrder(), session.foldersFirst(), session.hiddenLast()
-        ),
-        {.id = 50,
-         .label = "Show Hidden Files",
-         .checkmark = true,
-         .toggleState = session.showHidden() ? 1 : 0,
-         .shortcut = "Ctrl+H"},
-        {.separator = true},
-        {.id = menu_id::kZoomIn,
-         .label = "Zoom In",
-         .enabled = !renaming && m_listHeader.viewScale() < filemanager::kFileViewMaxScale,
-         .shortcut = "Ctrl++",
-         .actionGlyph = "zoom-in"},
-        {.id = menu_id::kZoomOut,
-         .label = "Zoom Out",
-         .enabled = !renaming && m_listHeader.viewScale() > filemanager::kFileViewMinScale,
-         .shortcut = "Ctrl+-",
-         .actionGlyph = "zoom-out"},
-        {.id = menu_id::kResetZoom,
-         .label = "Reset Zoom",
-         .enabled = !renaming && m_listHeader.viewScale() != filemanager::kFileViewDefaultScale,
-         .shortcut = "Ctrl+0",
-         .actionGlyph = "zoom-reset"},
-        {.separator = true},
-        {.id = 13, .label = "Refresh", .shortcut = "Ctrl+R", .actionGlyph = "refresh"},
-        {.id = menu_id::kAlwaysShowTabBar,
-         .label = "Always Show Tab Bar",
-         .checkmark = true,
-         .toggleState = (m_callbacks.alwaysShowTabBar && m_callbacks.alwaysShowTabBar()) ? 1 : 0},
-        {.id = menu_id::kOpenTabsInBackground,
-         .label = "Open New Tabs in Background",
-         .checkmark = true,
-         .toggleState = (m_callbacks.openTabsInBackground && m_callbacks.openTabsInBackground()) ? 1 : 0},
-        {.id = menu_id::kShowMenuBar,
-         .label = "Show Menu Bar",
-         .checkmark = true,
-         .toggleState = m_showApplicationMenuBar ? 1 : 0},
     };
+    if (!gridMode) {
+      std::vector<ContextMenuControlEntry> columns;
+      for (auto column : filemanager::kFileColumns) {
+        const auto index = columnIndex(column);
+        columns.push_back(
+            {.id = menu_id::kFirstColumnAction + static_cast<int>(index),
+             .label = std::string(filemanager::kFileColumnLabels[index]),
+             .enabled = column != FileColumn::Name,
+             .checkmark = true,
+             .toggleState = m_listHeader.columnLayout().visible[index] ? 1 : 0}
+        );
+      }
+      entries.push_back(
+          {.id = menu_id::kShowColumns,
+           .label = "Show Columns",
+           .hasSubmenu = true,
+           .submenuEntries = std::move(columns),
+           .actionGlyph = "columns-3"}
+      );
+    }
+    entries.insert(
+        entries.end(),
+        {
+            {.separator = true},
+            filemanager::fileSortByMenuEntry(
+                m_listHeader.sortField(), m_listHeader.sortOrder(), session.foldersFirst(), session.hiddenLast()
+            ),
+            {.id = 50,
+             .label = "Show Hidden Files",
+             .checkmark = true,
+             .toggleState = session.showHidden() ? 1 : 0,
+             .shortcut = "Ctrl+H"},
+            {.separator = true},
+            {.id = menu_id::kZoomIn,
+             .label = "Zoom In",
+             .enabled = !renaming && m_listHeader.viewScale() < filemanager::kFileViewMaxScale,
+             .shortcut = "Ctrl++",
+             .actionGlyph = "zoom-in"},
+            {.id = menu_id::kZoomOut,
+             .label = "Zoom Out",
+             .enabled = !renaming && m_listHeader.viewScale() > filemanager::kFileViewMinScale,
+             .shortcut = "Ctrl+-",
+             .actionGlyph = "zoom-out"},
+            {.id = menu_id::kResetZoom,
+             .label = "Reset Zoom",
+             .enabled = !renaming && m_listHeader.viewScale() != filemanager::kFileViewDefaultScale,
+             .shortcut = "Ctrl+0",
+             .actionGlyph = "zoom-reset"},
+            {.separator = true},
+            {.id = 13, .label = "Refresh", .shortcut = "Ctrl+R", .actionGlyph = "refresh"},
+            {.id = menu_id::kAlwaysShowTabBar,
+             .label = "Always Show Tab Bar",
+             .checkmark = true,
+             .toggleState = (m_callbacks.alwaysShowTabBar && m_callbacks.alwaysShowTabBar()) ? 1 : 0},
+            {.id = menu_id::kOpenTabsInBackground,
+             .label = "Open New Tabs in Background",
+             .checkmark = true,
+             .toggleState = (m_callbacks.openTabsInBackground && m_callbacks.openTabsInBackground()) ? 1 : 0},
+            {.id = menu_id::kShowMenuBar,
+             .label = "Show Menu Bar",
+             .checkmark = true,
+             .toggleState = m_showApplicationMenuBar ? 1 : 0},
+        }
+    );
+    return entries;
   }
 
   std::vector<std::string> FileMenuController::externalToolTargets(external_tools::Tool tool) const {
@@ -1108,6 +1119,11 @@ namespace filemanager {
         m_listHeader.gridMode(), session.showHidden(), m_listHeader.sortField(), m_listHeader.sortOrder(),
         session.foldersFirst(), session.hiddenLast()
     );
+    if (!session.browsingTrash() && !targetIsDir) {
+      const auto checksums = m_callbacks.checksumMenuEntries ? m_callbacks.checksumMenuEntries()
+                                                             : ChecksumDialogController::menuEntries(false);
+      entries.insert(entries.end(), checksums.begin(), checksums.end());
+    }
     filemanager::groupFileMenuEntries(
         entries,
         session.browsingTrash()              ? filemanager::FileMenuContext::Trash
@@ -1123,12 +1139,6 @@ namespace filemanager {
                canCreate && !session.loading() && !m_places.hasActiveDeviceOperations() && !m_operations.replaying(),
            .actionGlyph = "copy"}
       );
-    }
-    if (!session.browsingTrash() && !session.entries()[index].isDir) {
-      const auto checksums = m_callbacks.checksumMenuEntries ? m_callbacks.checksumMenuEntries()
-                                                             : ChecksumDialogController::menuEntries(false);
-      entries.push_back({.separator = true});
-      entries.insert(entries.end(), checksums.begin(), checksums.end());
     }
     auto* output = m_wayland.lastPointerOutput();
     if (!output)

@@ -114,8 +114,8 @@ public:
         && m.m_listHeader.m_sortOrder == FileDialogSortOrder::Ascending
     );
     TEST_CHECK(m.m_grid->selectedIndex() && session.m_entries[*m.m_grid->selectedIndex()].absPath == a.absPath);
-    TEST_CHECK(m.m_configService.stateString("files", "sort_field") == "1");
-    TEST_CHECK(m.m_configService.stateBool("files", "sort_descending") == false);
+    TEST_CHECK(m.m_settings.loadFileView().sortField == FileDialogSortField::Size);
+    TEST_CHECK(m.m_settings.loadFileView().sortOrder == FileDialogSortOrder::Ascending);
   }
   template <class Predicate> static void waitFor(Predicate predicate) {
     bool timeout = false;
@@ -132,6 +132,16 @@ public:
     if (!timeout)
       g_source_remove(timer);
     TEST_CHECK(!timeout && predicate());
+  }
+  static void verifyManualPreferences(FileManager& manager, const std::filesystem::path& configFile) {
+    manager.m_settings.setReloadCallback([&](const toml::table& previous) { manager.applyFilesPreferences(previous); });
+    std::ofstream(configFile) << "[files]\nsort_field = 2\nsort_descending = true\n"
+                                 "always_show_tab_bar = true\nopen_tabs_in_background = true\n";
+    TEST_CHECK(manager.m_settings.reload());
+    TEST_CHECK(manager.m_listHeader.sortField() == static_cast<FileDialogSortField>(2));
+    TEST_CHECK(manager.m_listHeader.sortOrder() == FileDialogSortOrder::Descending);
+    TEST_CHECK(manager.activeTab().viewState.sortField == static_cast<FileDialogSortField>(2));
+    TEST_CHECK(manager.m_alwaysShowTabBar && manager.m_openTabsInBackground);
   }
   static void verifyRestored(const FileManager& m) {
     TEST_CHECK(
@@ -156,6 +166,7 @@ int main() {
     {
       FileManager restored(filesDir.string());
       FileManagerTestAccess::verifyRestored(restored);
+      FileManagerTestAccess::verifyManualPreferences(restored, env.config() / "nythera/files/config.toml");
     }
   });
 }

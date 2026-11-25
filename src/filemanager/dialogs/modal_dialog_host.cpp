@@ -1,6 +1,6 @@
 #include "filemanager/dialogs/modal_dialog_host.h"
 
-#include "config/config_service.h"
+#include "config/config_types.h"
 #include "core/files/display_text.h"
 #include "core/ui_phase.h"
 #include "cursor-shape-v1-client-protocol.h"
@@ -30,6 +30,7 @@
 #include <future>
 #include <gio/gio.h>
 #include <linux/input-event-codes.h>
+#include <utility>
 #include <xdg-shell-client-protocol.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -60,14 +61,9 @@ namespace filemanager {
   } // namespace
 
   ModalDialogHost::ModalDialogHost(
-      WaylandConnection& wayland, RenderContext& renderContext, ConfigService& configService,
-      FileManagerSettings& settings, Callbacks callbacks
+      WaylandConnection& wayland, RenderContext& renderContext, FileManagerSettings& settings, Callbacks callbacks
   )
-      : m_wayland(wayland),
-        m_renderContext(renderContext),
-        m_configService(configService),
-        m_settings(settings),
-        m_callbacks(std::move(callbacks)) {
+      : m_wayland(wayland), m_renderContext(renderContext), m_settings(settings), m_callbacks(std::move(callbacks)) {
     m_dispatcher.setFocusChangeCallback([](InputArea*, InputArea* next) {
       if (next == nullptr)
         return;
@@ -90,6 +86,8 @@ namespace filemanager {
     m_dispatcher.setTextInputContext(nullptr, nullptr);
     if (m_customContent && m_customContent->onDismiss)
       m_customContent->onDismiss();
+    if (auto dismiss = std::exchange(m_symlinkDismissCallback, nullptr))
+      dismiss();
     m_customContent.reset();
     m_dispatcher.setSceneRoot(nullptr);
     if (m_surface)
@@ -104,6 +102,13 @@ namespace filemanager {
     m_surface.reset();
     m_alternativeNameInput = nullptr;
     m_alternativeNameError = nullptr;
+    m_symlinkDialogActive = false;
+    m_symlinkSubmitCallback = nullptr;
+    m_symlinkBrowseCallback = nullptr;
+    m_symlinkName = nullptr;
+    m_symlinkTarget = nullptr;
+    m_symlinkBrowseButton = nullptr;
+    m_symlinkError = nullptr;
     m_closeQueued = false;
   }
 
@@ -147,23 +152,47 @@ namespace filemanager {
   }
 
   void ModalDialogHost::showSymlinkDialog(
-      std::function<std::optional<SymlinkError>(const std::string&, const std::string&)> onSubmit
+      std::function<std::optional<SymlinkError>(const std::string&, const std::string&)> onSubmit,
+      std::function<void(const std::string& currentTarget)> onBrowseTarget, std::function<void()> onDismiss
   ) {
     if (m_surface)
       return;
     m_symlinkDialogActive = true;
     m_symlinkSubmitCallback = std::move(onSubmit);
+    m_symlinkBrowseCallback = std::move(onBrowseTarget);
+    m_symlinkDismissCallback = std::move(onDismiss);
     showDialog(
         "Create Symlink", "Enter a name and target path. Relative targets are resolved from this folder.",
-        {{"Cancel", 0}, {"Create Symlink", 1}},
-        [this](int) {
+        {{"Cancel", 0}, {"Create Symlink", 1}}, [this](int) {
+          if (auto dismiss = std::exchange(m_symlinkDismissCallback, nullptr))
+            dismiss();
           m_symlinkDialogActive = false;
           m_symlinkSubmitCallback = nullptr;
+          m_symlinkBrowseCallback = nullptr;
           m_symlinkName = nullptr;
           m_symlinkTarget = nullptr;
+          m_symlinkBrowseButton = nullptr;
           m_symlinkError = nullptr;
         }
     );
+  }
+
+  void ModalDialogHost::setSymlinkTargetPath(std::string_view path) {
+    if (!m_symlinkDialogActive || m_closeQueued || m_symlinkTarget == nullptr)
+      return;
+    m_symlinkTarget->setValue(path);
+    m_symlinkTarget->setInvalid(false);
+    if (m_symlinkError != nullptr)
+      m_symlinkError->setText(" ");
+    m_dispatcher.setFocus(m_symlinkTarget->inputArea());
+    requestLayout();
+  }
+
+  void ModalDialogHost::showSymlinkTargetError(std::string_view message) {
+    if (!m_symlinkDialogActive || m_closeQueued || m_symlinkError == nullptr)
+      return;
+    m_symlinkError->setText(message);
+    requestLayout();
   }
 
   bool ModalDialogHost::submitSymlinkDialog() {
@@ -633,9 +662,11 @@ namespace filemanager {
                 && self->m_callbacks.setStatus)
               self->m_callbacks.setStatus("Unable to save conflict dialog size");
           }
-          // The manifest picker can be an xdg_popup child of this dialogue.
+          // The manifest picker and symlink target picker can be xdg_popup children of this dialogue.
           if (self->m_customContent && self->m_customContent->onDismiss)
             self->m_customContent->onDismiss();
+          if (auto dismiss = std::exchange(self->m_symlinkDismissCallback, nullptr))
+            dismiss();
           self->m_customContent.reset();
           self->m_dispatcher.setSceneRoot(nullptr);
           if (self->m_surface)
@@ -649,6 +680,13 @@ namespace filemanager {
           self->m_surface.reset();
           self->m_alternativeNameInput = nullptr;
           self->m_alternativeNameError = nullptr;
+          self->m_symlinkDialogActive = false;
+          self->m_symlinkSubmitCallback = nullptr;
+          self->m_symlinkBrowseCallback = nullptr;
+          self->m_symlinkName = nullptr;
+          self->m_symlinkTarget = nullptr;
+          self->m_symlinkBrowseButton = nullptr;
+          self->m_symlinkError = nullptr;
           self->m_closeQueued = false;
           if (callback)
             callback(result);
@@ -996,7 +1034,17 @@ namespace filemanager {
       }
     }
     if (m_symlinkDialogActive) {
-      const auto addField = [this](const char* text) {
+      const auto wireInput = [this](Input& control) {
+        control.setControlHeight(34.0F);
+        control.setMinLayoutWidth(0.0F);
+        control.setOnChange([this, &control](const std::string&) {
+          control.setInvalid(false);
+          if (m_symlinkError != nullptr)
+            m_symlinkError->setText(" ");
+          requestLayout();
+        });
+      };
+      const auto makeFieldContainer = [](const char* text) {
         auto field = std::make_unique<Flex>();
         field->setDirection(FlexDirection::Vertical);
         field->setAlign(FlexAlign::Stretch);
@@ -1005,21 +1053,39 @@ namespace filemanager {
         label->setText(text);
         label->setFontWeight(FontWeight::SemiBold);
         field->addChild(std::move(label));
-        auto input = std::make_unique<Input>();
-        input->setControlHeight(34.0F);
-        auto* control = input.get();
-        field->addChild(std::move(input));
-        control->setOnChange([this, control](const std::string&) {
-          control->setInvalid(false);
-          m_symlinkError->setText(" ");
-          if (m_surface)
-            m_surface->requestLayout();
-        });
-        m_root->addChild(std::move(field));
-        return control;
+        return field;
       };
-      m_symlinkName = addField("Symlink name");
-      m_symlinkTarget = addField("Target path");
+
+      auto nameField = makeFieldContainer("Symlink name");
+      auto nameInput = std::make_unique<Input>();
+      m_symlinkName = nameInput.get();
+      wireInput(*m_symlinkName);
+      nameField->addChild(std::move(nameInput));
+      m_root->addChild(std::move(nameField));
+
+      auto targetField = makeFieldContainer("Target path");
+      auto targetRow = std::make_unique<Flex>();
+      targetRow->setDirection(FlexDirection::Horizontal);
+      targetRow->setAlign(FlexAlign::Center);
+      targetRow->setGap(8.0F);
+      auto targetInput = std::make_unique<Input>();
+      m_symlinkTarget = targetInput.get();
+      wireInput(*m_symlinkTarget);
+      m_symlinkTarget->setFlexGrow(1.0F);
+      targetRow->addChild(std::move(targetInput));
+      auto browse = std::make_unique<Button>();
+      browse->setText("Browse…");
+      browse->setVariant(ButtonVariant::Outline);
+      browse->setControlHeight(34.0F);
+      browse->setOnClick([this] {
+        if (m_symlinkBrowseCallback && m_symlinkTarget && !m_closeQueued)
+          m_symlinkBrowseCallback(m_symlinkTarget->value());
+      });
+      m_symlinkBrowseButton = browse.get();
+      targetRow->addChild(std::move(browse));
+      targetField->addChild(std::move(targetRow));
+      m_root->addChild(std::move(targetField));
+
       m_symlinkName->setOnSubmit([this](const std::string&) { m_dispatcher.setFocus(m_symlinkTarget->inputArea()); });
       m_symlinkTarget->setOnSubmit([this](const std::string&) { closeDialog(1); });
       auto error = std::make_unique<Label>();
@@ -1122,7 +1188,7 @@ namespace filemanager {
   void ModalDialogHost::updateTheme() {
     if (!m_root)
       return;
-    const auto mode = m_configService.config().shell.panel.transparencyMode;
+    const auto mode = m_settings.transparencyMode();
     const float background = detachedPanelBackgroundOpacityForTransparencyMode(mode);
     m_root->setFill(colorSpecFromRole(ColorRole::SurfaceContainerLow, background));
     for (auto* card : m_cards)

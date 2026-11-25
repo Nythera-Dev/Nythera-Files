@@ -83,6 +83,30 @@ The aim is to make something visually distinctive without sacrificing the functi
 
 My colour scheme shouldn't have to be everyone else's 😁
 
+## Files preferences and state
+
+Files keeps sparse preferences in `$XDG_CONFIG_HOME/nythera/files/config.toml` and its transparency override in `$XDG_CONFIG_HOME/nythera/files/theme.toml`. Window and pane sizes and sidebar expansion are runtime state in `$XDG_STATE_HOME/nythera/files/state.toml`. The existing `NYTHERA_CONFIG_HOME` and `NYTHERA_STATE_HOME` overrides take precedence over the XDG variables.
+
+In `config.toml`:
+
+```toml
+[files]
+show_hidden = true
+view_scale = 1.2
+
+[files.saved_places."work"]
+path = "/home/me/Work"
+label = "Work"
+```
+
+Set `files.readline_shortcuts` explicitly to override Shell's keyboard preference. In `theme.toml`, set `theme.transparency_mode` to `solid`, `soft`, or `glass` to override Shell's transparency. With these overrides omitted, Files uses the Shell configuration when available and falls back to built-in settings for standalone use.
+
+Files loads TOML files in its config directory in filename order. The `files` array in an `[include]` table names files or directories that load before the including file. Setting `autoload = false` limits discovery to the opting-out roots and their includes. Keep the primary files within that load set if GUI edits should be able to create settings there.
+
+GUI changes edit the winning definition or use the owning table's file for a new setting. New tables use the corresponding primary file. To restore a default manually, remove every definition of the setting. Invalid edits leave the last valid configuration active. Saved Places can use an optional nonnegative `order` value to retain their insertion order when there is no explicit sidebar ordering.
+
+Existing installations need their legacy Files preferences and runtime geometry transferred from the shared state file before switching to this layout. The new runtime leaves the old state file in place.
+
 ## How It Fits Together
 
 Nythera is split into three related projects:
