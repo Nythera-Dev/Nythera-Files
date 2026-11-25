@@ -6,6 +6,7 @@
 #include <fstream>
 #include <gio/gio.h>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <vector>
@@ -35,22 +36,51 @@ namespace {
     TEST_CHECK(ready());
   }
 
-  nlohmann::json receiveOsd(int server) {
-    int connection = -1;
-    waitFor([&] {
-      return connection >= 0 || (connection = ::accept4(server, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK)) >= 0;
-    });
-    const auto releaseConnection = nythera::test::makeScopeExit([&] { ::close(connection); });
+  struct Request {
     std::string command;
+    int fd = -1;
+  };
+
+  Request acceptRequest(int server) {
+    Request request;
+    waitFor([&] {
+      return request.fd >= 0 || (request.fd = ::accept4(server, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK)) >= 0;
+    });
     waitFor([&] {
       char bytes[4096];
-      const auto count = ::read(connection, bytes, sizeof(bytes));
+      const auto count = ::read(request.fd, bytes, sizeof(bytes));
       if (count > 0)
-        command.append(bytes, static_cast<std::size_t>(count));
+        request.command.append(bytes, static_cast<std::size_t>(count));
       return count == 0;
     });
-    TEST_CHECK(command.starts_with("osd-show "));
-    return nlohmann::json::parse(command.substr(9));
+    return request;
+  }
+
+  bool isProbe(const Request& request) { return request.command == "config-monitor-status files"; }
+
+  bool hasPendingConnection(int server) {
+    drainFor(150ms);
+    const int connection = ::accept4(server, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (connection >= 0)
+      ::close(connection);
+    return connection >= 0;
+  }
+
+  // Files asks Shell who owns the alert first. `probeReply` models Shell's answer; nullopt never answers.
+  nlohmann::json receiveOsd(int server, std::optional<std::string_view> probeReply = "unmonitored\n") {
+    auto probe = acceptRequest(server);
+    const auto releaseProbe = nythera::test::makeScopeExit([&] { ::close(probe.fd); });
+    TEST_CHECK(isProbe(probe));
+    if (probeReply && !probeReply->empty())
+      TEST_CHECK(::write(probe.fd, probeReply->data(), probeReply->size()) == static_cast<ssize_t>(probeReply->size()));
+    if (probeReply) {
+      ::close(probe.fd);
+      probe.fd = -1;
+    }
+    auto request = acceptRequest(server);
+    const auto releaseRequest = nythera::test::makeScopeExit([&] { ::close(request.fd); });
+    TEST_CHECK(request.command.starts_with("osd-show "));
+    return nlohmann::json::parse(request.command.substr(9));
   }
 
   struct Notifications {
@@ -181,6 +211,28 @@ namespace {
     TEST_CHECK(recovered.at("icon") == "circle-check");
     TEST_CHECK(recovered.at("hide_delay_ms") == 1000);
     drainFor(50ms);
+    TEST_CHECK(notifications.messages.empty());
+
+    // Shell owns the alert while it monitors Files: Files must stay silent (no OSD, no desktop notice).
+    filemanager::notifyConfigurationReloaded();
+    {
+      auto probe = acceptRequest(server);
+      const auto releaseProbe = nythera::test::makeScopeExit([&] { ::close(probe.fd); });
+      TEST_CHECK(isProbe(probe));
+      TEST_CHECK(::write(probe.fd, "monitored\n", 10) == 10);
+    }
+    TEST_CHECK(!hasPendingConnection(server));
+    TEST_CHECK(notifications.messages.empty());
+
+    // An unresponsive or non-answering Shell must not swallow the alert, and must not duplicate it.
+    filemanager::notifyConfigurationReloaded();
+    TEST_CHECK(receiveOsd(server, std::nullopt).at("hide_delay_ms") == 1000);
+    TEST_CHECK(!hasPendingConnection(server));
+    filemanager::notifyConfigurationReloaded();
+    TEST_CHECK(receiveOsd(server, "").at("value") == "Config reloaded");
+    filemanager::notifyConfigurationReloaded();
+    TEST_CHECK(receiveOsd(server, "error: unknown command\n").at("value") == "Config reloaded");
+    TEST_CHECK(!hasPendingConnection(server));
     TEST_CHECK(notifications.messages.empty());
 
     ::close(server);

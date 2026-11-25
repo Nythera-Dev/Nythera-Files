@@ -1,7 +1,6 @@
 #include "filemanager/configuration_notice.h"
 
 #include "core/log.h"
-#include "util/file_utils.h"
 
 #include <cstdlib>
 #include <gio/gio.h>
@@ -14,77 +13,7 @@ namespace filemanager {
 
   namespace {
     constexpr Logger kLog("files-config");
-
-    struct Notice {
-      const char* title;
-      const char* osdIcon;
-      const char* desktopIcon;
-      int osdHideDelayMs;
-      std::string body;
-    };
-
-    std::string displayDiagnostic(std::string_view message) {
-      constexpr std::string_view prefix = "Error while parsing ";
-      constexpr std::string_view separator = ": ";
-      if (!message.starts_with(prefix))
-        return std::string(message);
-      const auto scopeEnd = message.find(separator, prefix.size());
-      if (scopeEnd == std::string_view::npos || scopeEnd + separator.size() == message.size())
-        return std::string(message);
-      const auto scope = message.substr(prefix.size(), scopeEnd - prefix.size());
-      const auto reason = message.substr(scopeEnd + separator.size());
-
-      constexpr std::string_view expectedPrefix = "expected ";
-      constexpr std::string_view sawSeparator = ", saw ";
-      if (reason.starts_with(expectedPrefix)) {
-        const auto saw = reason.find(sawSeparator, expectedPrefix.size());
-        if (saw != std::string_view::npos && saw + sawSeparator.size() < reason.size()) {
-          auto expected = reason.substr(expectedPrefix.size(), saw - expectedPrefix.size());
-          const auto token = reason.substr(saw + sawSeparator.size());
-          if (expected.starts_with("a "))
-            expected.remove_prefix(2);
-          else if (expected.starts_with("an "))
-            expected.remove_prefix(3);
-          return "Unexpected "
-              + std::string(token == "end-of-file" ? "end of file" : token)
-              + "; expected "
-              + std::string(expected);
-        }
-      }
-      if (reason == "encountered end-of-file") {
-        if (scope == "string" || scope == "literal string")
-          return "Unterminated " + std::string(scope);
-        return "Unexpected end of file in " + std::string(scope);
-      }
-      if (reason.starts_with("exceeds length limit"))
-        return "Value " + std::string(reason) + " for " + std::string(scope);
-
-      std::string concise(reason);
-      if (concise.front() >= 'a' && concise.front() <= 'z')
-        concise.front() = static_cast<char>(concise.front() - 'a' + 'A');
-      return concise;
-    }
-
-    std::string formatBody(const ConfigurationProblem& problem, const std::filesystem::path& configDirectory) {
-      const std::filesystem::path file(problem.origin.file);
-      const auto parent = file.empty() ? configDirectory : file.parent_path();
-      std::string body = FileUtils::xdgPathForDisplay(parent.string());
-      if (!body.empty()) {
-        if (!body.ends_with('/'))
-          body += '/';
-        body += '\n';
-      }
-      if (!file.empty()) {
-        body += file.filename().string();
-        if (problem.origin.line != 0) {
-          body += " · Line " + std::to_string(problem.origin.line);
-          if (problem.origin.column != 0)
-            body += ", column " + std::to_string(problem.origin.column);
-        }
-        body += '\n';
-      }
-      return body + "> " + displayDiagnostic(problem.message);
-    }
+    constexpr std::string_view kMonitorStatusQuery = "config-monitor-status files";
 
     std::string shellSocketPath() {
       const char* runtime = std::getenv("XDG_RUNTIME_DIR");
@@ -98,11 +27,13 @@ namespace filemanager {
     constexpr auto kNotificationService = "org.freedesktop.Notifications";
     constexpr auto kNotificationPath = "/org/freedesktop/Notifications";
 
-    void postDesktopNotification(GDBusConnection* bus, const Notice& notice, const char* body) {
+    void postDesktopNotification(
+        GDBusConnection* bus, const nythera::config::ConfigurationNotice& notice, const char* body
+    ) {
       g_dbus_connection_call(
           bus, kNotificationService, kNotificationPath, kNotificationService, "Notify",
           g_variant_new(
-              "(susss@as@a{sv}i)", "Nythera Files", 0U, notice.desktopIcon, notice.title, body,
+              "(susss@as@a{sv}i)", "Nythera Files", 0U, notice.desktopIcon.c_str(), notice.title.c_str(), body,
               g_variant_new_strv(nullptr, 0), g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), -1
           ),
           G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 2000, nullptr,
@@ -119,11 +50,13 @@ namespace filemanager {
       );
     }
 
-    void sendDesktopNotification(Notice notification) {
+    void sendDesktopNotification(nythera::config::ConfigurationNotice notification) {
       g_bus_get(
           G_BUS_TYPE_SESSION, nullptr,
           +[](GObject*, GAsyncResult* result, gpointer data) {
-            std::unique_ptr<Notice> notice(static_cast<Notice*>(data));
+            std::unique_ptr<nythera::config::ConfigurationNotice> notice(
+                static_cast<nythera::config::ConfigurationNotice*>(data)
+            );
             GError* error = nullptr;
             auto* bus = g_bus_get_finish(result, &error);
             if (bus == nullptr) {
@@ -140,7 +73,9 @@ namespace filemanager {
                 bus, kNotificationService, kNotificationPath, kNotificationService, "GetCapabilities", nullptr,
                 G_VARIANT_TYPE("(as)"), G_DBUS_CALL_FLAGS_NONE, 2000, nullptr,
                 +[](GObject* source, GAsyncResult* reply, gpointer payload) {
-                  const std::unique_ptr<Notice> pending(static_cast<Notice*>(payload));
+                  const std::unique_ptr<nythera::config::ConfigurationNotice> pending(
+                      static_cast<nythera::config::ConfigurationNotice*>(payload)
+                  );
                   auto* connection = G_DBUS_CONNECTION(source);
                   auto* response = g_dbus_connection_call_finish(connection, reply, nullptr);
                   gchar* escaped = nullptr;
@@ -160,16 +95,20 @@ namespace filemanager {
             );
             g_object_unref(bus);
           },
-          new Notice(std::move(notification))
+          new nythera::config::ConfigurationNotice(std::move(notification))
       );
     }
 
-    void sendOsd(GSocketConnection* connection, const Notice& notice) {
+    void sendOsd(GSocketConnection* connection, const nythera::config::ConfigurationNotice& notice) {
       std::string value = notice.title;
-      if (!notice.body.empty())
+      if (!notice.body.empty()) {
         value += '\n' + notice.body;
-      const auto payload =
-          nlohmann::json{{"icon", notice.osdIcon}, {"value", value}, {"hide_delay_ms", notice.osdHideDelayMs}};
+      }
+      const auto payload = nlohmann::json{
+          {"icon", notice.osdIcon},
+          {"value", value},
+          {"hide_delay_ms", notice.osdHideDelayMs},
+      };
       const auto command = "osd-show " + payload.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
       GError* error = nullptr;
       auto* output = g_io_stream_get_output_stream(G_IO_STREAM(connection));
@@ -181,14 +120,16 @@ namespace filemanager {
       g_io_stream_close(G_IO_STREAM(connection), nullptr, nullptr);
     }
 
-    void sendNotice(Notice notification) {
+    void dispatchOsdToShell(nythera::config::ConfigurationNotice notification) {
       auto* client = g_socket_client_new();
       g_socket_client_set_timeout(client, 1);
       auto* address = g_unix_socket_address_new(shellSocketPath().c_str());
       g_socket_client_connect_async(
           client, G_SOCKET_CONNECTABLE(address), nullptr,
           +[](GObject* source, GAsyncResult* result, gpointer data) {
-            const std::unique_ptr<Notice> notice(static_cast<Notice*>(data));
+            const std::unique_ptr<nythera::config::ConfigurationNotice> notice(
+                static_cast<nythera::config::ConfigurationNotice*>(data)
+            );
             GError* error = nullptr;
             auto* connection = g_socket_client_connect_finish(G_SOCKET_CLIENT(source), result, &error);
             if (connection != nullptr) {
@@ -204,7 +145,144 @@ namespace filemanager {
             }
             g_clear_error(&error);
           },
-          new Notice(std::move(notification))
+          new nythera::config::ConfigurationNotice(std::move(notification))
+      );
+      g_object_unref(address);
+      g_object_unref(client);
+    }
+
+    // A hung or half-dead Shell must not swallow the alert, so the probe is bounded.
+    constexpr guint kMonitorStatusTimeoutMs = 1000;
+
+    gboolean cancelProbe(gpointer data) {
+      g_cancellable_cancel(G_CANCELLABLE(data));
+      return G_SOURCE_REMOVE;
+    }
+
+    struct StatusProbeState {
+      nythera::config::ConfigurationNotice notice;
+      GSocketConnection* connection = nullptr;
+      GCancellable* cancellable = nullptr;
+      GSource* timeout = nullptr;
+      char buffer[256]{};
+      std::string reply;
+
+      StatusProbeState() = default;
+      StatusProbeState(const StatusProbeState&) = delete;
+      StatusProbeState& operator=(const StatusProbeState&) = delete;
+
+      void startTimeout() {
+        cancellable = g_cancellable_new();
+        timeout = g_timeout_source_new(kMonitorStatusTimeoutMs);
+        g_source_set_callback(timeout, cancelProbe, g_object_ref(cancellable), g_object_unref);
+        g_source_attach(timeout, nullptr);
+      }
+
+      ~StatusProbeState() {
+        if (timeout != nullptr) {
+          g_source_destroy(timeout);
+          g_source_unref(timeout);
+        }
+        if (cancellable != nullptr)
+          g_object_unref(cancellable);
+        if (connection != nullptr) {
+          g_io_stream_close(G_IO_STREAM(connection), nullptr, nullptr);
+          g_object_unref(connection);
+        }
+      }
+    };
+
+    void readMonitorStatusChunk(std::unique_ptr<StatusProbeState> state) {
+      auto* raw = state.release();
+      auto* input = g_io_stream_get_input_stream(G_IO_STREAM(raw->connection));
+      g_input_stream_read_async(
+          input, raw->buffer, sizeof(raw->buffer), G_PRIORITY_DEFAULT, raw->cancellable,
+          +[](GObject* source, GAsyncResult* result, gpointer data) {
+            std::unique_ptr<StatusProbeState> pending(static_cast<StatusProbeState*>(data));
+            GError* error = nullptr;
+            const gssize n = g_input_stream_read_finish(G_INPUT_STREAM(source), result, &error);
+            if (n > 0) {
+              pending->reply.append(pending->buffer, static_cast<std::size_t>(n));
+              if (pending->reply.size() < 256) {
+                readMonitorStatusChunk(std::move(pending));
+                return;
+              }
+            } else if (n < 0) {
+              kLog.warn("Failed reading Shell config monitor status: {}", error->message);
+              g_clear_error(&error);
+              dispatchOsdToShell(std::move(pending->notice));
+              return;
+            }
+
+            std::string_view reply(pending->reply);
+            while (!reply.empty() && (reply.back() == '\n' || reply.back() == '\r' || reply.back() == ' ')) {
+              reply.remove_suffix(1);
+            }
+            if (reply == "monitored") {
+              // Shell owns configuration alerts while monitoring "files".
+              return;
+            }
+            dispatchOsdToShell(std::move(pending->notice));
+          },
+          raw
+      );
+    }
+
+    void sendNotice(nythera::config::ConfigurationNotice notification) {
+      auto* client = g_socket_client_new();
+      g_socket_client_set_timeout(client, 1);
+      auto* address = g_unix_socket_address_new(shellSocketPath().c_str());
+      g_socket_client_connect_async(
+          client, G_SOCKET_CONNECTABLE(address), nullptr,
+          +[](GObject* source, GAsyncResult* result, gpointer data) {
+            std::unique_ptr<nythera::config::ConfigurationNotice> notice(
+                static_cast<nythera::config::ConfigurationNotice*>(data)
+            );
+            GError* error = nullptr;
+            auto* connection = g_socket_client_connect_finish(G_SOCKET_CLIENT(source), result, &error);
+            if (connection == nullptr) {
+              if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)
+                  || g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CONNECTION_REFUSED)) {
+                sendDesktopNotification(std::move(*notice));
+              } else {
+                kLog.warn("Cannot contact Nythera Shell: {}", error->message);
+              }
+              g_clear_error(&error);
+              return;
+            }
+
+            auto state = std::make_unique<StatusProbeState>();
+            state->notice = std::move(*notice);
+            state->connection = connection;
+            state->startTimeout();
+            auto* raw = state.release();
+            auto* output = g_io_stream_get_output_stream(G_IO_STREAM(raw->connection));
+            g_output_stream_write_all_async(
+                output, kMonitorStatusQuery.data(), kMonitorStatusQuery.size(), G_PRIORITY_DEFAULT, raw->cancellable,
+                +[](GObject* stream, GAsyncResult* writeResult, gpointer payload) {
+                  std::unique_ptr<StatusProbeState> pending(static_cast<StatusProbeState*>(payload));
+                  GError* writeError = nullptr;
+                  gsize written = 0;
+                  if (!g_output_stream_write_all_finish(G_OUTPUT_STREAM(stream), writeResult, &written, &writeError)) {
+                    kLog.warn("Failed querying Shell config monitor status: {}", writeError->message);
+                    g_clear_error(&writeError);
+                    dispatchOsdToShell(std::move(pending->notice));
+                    return;
+                  }
+                  if (!g_socket_shutdown(
+                          g_socket_connection_get_socket(pending->connection), FALSE, TRUE, &writeError
+                      )) {
+                    kLog.warn("Failed shutting down Shell query stream: {}", writeError->message);
+                    g_clear_error(&writeError);
+                    dispatchOsdToShell(std::move(pending->notice));
+                    return;
+                  }
+                  readMonitorStatusChunk(std::move(pending));
+                },
+                raw
+            );
+          },
+          new nythera::config::ConfigurationNotice(std::move(notification))
       );
       g_object_unref(address);
       g_object_unref(client);
@@ -212,14 +290,9 @@ namespace filemanager {
   } // namespace
 
   void notifyInvalidConfiguration(const ConfigurationProblem& problem, const std::filesystem::path& configDirectory) {
-    const auto formatted = formatBody(problem, configDirectory);
-    auto* valid = g_utf8_make_valid(formatted.data(), static_cast<gssize>(formatted.size()));
-    sendNotice({"Invalid configuration", "alert-triangle", "dialog-warning", 5000, valid});
-    g_free(valid);
+    sendNotice(nythera::config::invalidConfigurationNotice(problem, configDirectory));
   }
 
-  void notifyConfigurationReloaded() {
-    sendNotice({"Config reloaded", "circle-check", "dialog-information", 1000, {}});
-  }
+  void notifyConfigurationReloaded() { sendNotice(nythera::config::reloadedConfigurationNotice()); }
 
 } // namespace filemanager
