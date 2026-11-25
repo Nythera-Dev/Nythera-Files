@@ -2,6 +2,7 @@
 
 #include "config/application_paths.h"
 #include "config/config_service.h"
+#include "config/files_config_validator.h"
 #include "config/toml_persistence.h"
 #include "core/log.h"
 
@@ -89,108 +90,6 @@ namespace filemanager {
       for (const auto& option : kPanelTransparencyModes) {
         if (name && *name == option.key)
           return option.value;
-      }
-      return std::nullopt;
-    }
-
-    bool validPreference(std::string_view key, const toml::node& node) {
-      if (key == "grid_view"
-          || key == "show_hidden"
-          || key == "folders_first"
-          || key == "hidden_last"
-          || key == "sort_descending"
-          || key == "show_menu_bar"
-          || key == "always_show_tab_bar"
-          || key == "open_tabs_in_background"
-          || key == "readline_shortcuts")
-        return node.is_boolean();
-      if (key == "sort_field" || key == "admin_inactivity_timeout_seconds") {
-        const auto value = node.value_exact<std::int64_t>();
-        return value && (key == "sort_field" ? *value >= 0 && *value <= 5 : *value >= 60 && *value <= 3600);
-      }
-      if (key == "view_scale") {
-        const auto value = node.value<double>();
-        return value
-            && std::isfinite(*value)
-            && *value >= static_cast<double>(0.8)
-            && *value <= static_cast<double>(1.8);
-      }
-      if (key == "list_column_widths" || key == "list_column_layout") {
-        const auto text = node.value_exact<std::string_view>();
-        FileColumns widths;
-        FileColumnLayout layout;
-        return text
-            && (key == "list_column_widths" ? parseFileColumns(*text, widths) : parseFileColumnLayout(*text, layout));
-      }
-      if (key == "place_order" || key == "hidden_mounts") {
-        const auto* array = node.as_array();
-        return array && (array->empty() || array->is_homogeneous(toml::node_type::string));
-      }
-      return false;
-    }
-
-    std::optional<ConfigKeyPath> invalidSavedPlace(const toml::node& node) {
-      const auto* places = node.as_table();
-      if (!places)
-        return ConfigKeyPath{"files", "saved_places"};
-      for (const auto& [id, entry] : *places) {
-        const ConfigKeyPath record{"files", "saved_places", std::string(id.str())};
-        const auto* place = entry.as_table();
-        if (!place || id.str().empty())
-          return record;
-        for (const auto& [key, value] : *place) {
-          bool valid = false;
-          if (key == "path") {
-            const auto path = value.value_exact<std::string>();
-            valid = path && fs::path(*path).is_absolute();
-          } else if (key == "label") {
-            valid = value.is_string();
-          } else if (key == "order") {
-            valid = value.value_exact<std::int64_t>().value_or(-1) >= 0;
-          }
-          if (!valid) {
-            auto member = record;
-            member.emplace_back(key.str());
-            return member;
-          }
-        }
-        if (!place->contains("path") || !place->contains("label"))
-          return record;
-      }
-      return std::nullopt;
-    }
-
-    std::optional<ConfigurationProblem> validationError(const SourcedMergeResult& loaded) {
-      if (!loaded.config.firstError.empty())
-        return ConfigurationProblem{loaded.config.firstErrorOrigin, loaded.config.firstError};
-      const auto invalid = [&](const ConfigKeyPath& path, std::string message) {
-        if (const auto* source = loaded.sources.winner(path))
-          return ConfigurationProblem{source->origin, std::move(message)};
-        return ConfigurationProblem{{}, std::move(message)};
-      };
-      for (const auto& [section, node] : loaded.config.merged) {
-        const auto* table = node.as_table();
-        if (!table || (section != "files" && section != "theme"))
-          return invalid({std::string(section.str())}, std::format("Invalid Files section '{}'", section.str()));
-        for (const auto& [key, value] : *table) {
-          if (section == "files" && key == "saved_places") {
-            if (const auto path = invalidSavedPlace(value)) {
-              std::string name;
-              for (const auto& segment : *path)
-                name = schema::joinPath(name, segment);
-              return invalid(*path, std::format("Invalid Files setting '{}'", name));
-            }
-            continue;
-          }
-          const bool valid = section == "files"
-              ? validPreference(key.str(), value)
-              : key == "transparency_mode" && transparency(toml::node_view(&value)).has_value();
-          if (!valid)
-            return invalid(
-                {std::string(section.str()), std::string(key.str())},
-                std::format("Invalid Files setting '{}.{}'", section.str(), key.str())
-            );
-        }
       }
       return std::nullopt;
     }
@@ -360,7 +259,7 @@ namespace filemanager {
 
   bool FileManagerSettings::reload() {
     auto loaded = mergeConfigWithSources(m_configDir.string());
-    if (auto error = validationError(loaded)) {
+    if (auto error = validateFilesConfiguration(loaded)) {
       updateWatches(loaded);
       kLog.warn("Retaining the previous Files configuration: {}", error->origin.prefixed(error->message));
       reportProblem(std::move(*error));
@@ -376,7 +275,7 @@ namespace filemanager {
     if (m_configDir.empty())
       return false;
     auto current = mergeConfigWithSources(m_configDir.string());
-    if (auto error = validationError(current)) {
+    if (auto error = validateFilesConfiguration(current)) {
       kLog.warn("Cannot save Files configuration: {}", error->origin.prefixed(error->message));
       reportProblem(std::move(*error));
       return false;
@@ -421,7 +320,7 @@ namespace filemanager {
     const auto result =
         persistTomlEdits(files, [&](std::span<const StagedTomlFile> staged) -> std::optional<std::string> {
           candidate = mergeConfigWithSources(m_configDir.string(), staged);
-          if (auto error = validationError(*candidate))
+          if (auto error = validateFilesConfiguration(*candidate))
             return error->origin.prefixed(error->message);
           for (const auto& [path, value] : changes) {
             const auto* actual = find(candidate->config.merged, path);
@@ -434,11 +333,21 @@ namespace filemanager {
             }
             return std::format("The edit to '{}' would not take effect in the merged configuration", path.back());
           }
-          for (const auto& file : staged)
+          expectedWrites.clear();
+          std::vector<RecordedConfigWrite> recorded;
+          recorded.reserve(staged.size() * 2);
+          for (const auto& file : staged) {
             expectedWrites.emplace(file.path, file.content);
+            recorded.push_back({file.path, file.content});
+            for (const auto& alias : file.aliases) {
+              recorded.push_back({alias, file.content});
+            }
+          }
+          (void)recordApplicationConfigWrites(kOwner, recorded);
           return std::nullopt;
         });
     if (!result.ok()) {
+      clearApplicationConfigWrites(kOwner);
       kLog.warn("Cannot save Files configuration: {}", result.error);
       for (const auto& path : result.rollbackFailures)
         kLog.error("Could not restore '{}'", path.string());

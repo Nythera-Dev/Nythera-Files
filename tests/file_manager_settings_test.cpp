@@ -1,9 +1,19 @@
 #include "config/config_service.h"
+#include "core/deferred_call.h"
+#include "core/timer_manager.h"
 #include "filemanager/file_manager_settings.h"
+#include "net/http_client.h"
 #include "test_isolation.h"
+#include "theme/builtin_palettes.h"
+#include "theme/custom_palettes.h"
+#include "theme/palette.h"
+#include "theme/theme_service.h"
 
+#include <chrono>
 #include <fstream>
 #include <iterator>
+#include <poll.h>
+#include <thread>
 
 namespace {
   namespace fs = std::filesystem;
@@ -73,6 +83,21 @@ namespace {
     TEST_CHECK(read(legacyState) == existingState);
 
     write(shellDir / "shell.toml", "[shell]\nreadline_shortcuts = true\n[shell.panel]\ntransparency_mode = 'glass'\n");
+    shell.forceReload();
+    TEST_CHECK(settings.readlineShortcuts());
+    TEST_CHECK(settings.transparencyMode() == PanelTransparencyMode::Glass);
+    TEST_CHECK(fs::create_directory(shellDir / "shell"));
+    write(
+        shellDir / "shell/shell.toml",
+        "[shell]\nreadline_shortcuts = false\n[shell.panel]\ntransparency_mode = 'soft'\n"
+    );
+    shell.forceReload();
+    TEST_CHECK(!settings.readlineShortcuts());
+    TEST_CHECK(settings.transparencyMode() == PanelTransparencyMode::Soft);
+    write(
+        shellDir / "shell/shell.toml",
+        "[shell]\nreadline_shortcuts = true\n[shell.panel]\ntransparency_mode = 'glass'\n"
+    );
     shell.forceReload();
     TEST_CHECK(settings.readlineShortcuts());
     TEST_CHECK(settings.transparencyMode() == PanelTransparencyMode::Glass);
@@ -207,6 +232,110 @@ namespace {
     TEST_CHECK(!settings.setAlwaysShowTabBar(true));
     TEST_CHECK(!fs::exists(root / "config.toml"));
   }
+
+  void sharedThemeInheritanceAndStandaloneFallback() {
+    const nythera::test::ScopedTestEnv env({.prefix = "files-shared-theme"});
+    const auto nytheraDir = env.config() / "nythera";
+    const auto sharedTheme = nytheraDir / "theme.toml";
+    const auto shellConfig = nytheraDir / "shell" / "config.toml";
+    const auto filesTheme = nytheraDir / "files" / "theme.toml";
+
+    ConfigService shell(ConfigService::SettingsAccess::InheritanceOnly);
+    FileManagerSettings settings(shell);
+    HttpClient http;
+    nythera::theme::ThemeService theme(shell, http);
+
+    std::string resolvedMode;
+    nythera::theme::GeneratedPalette resolvedPalette;
+    theme.setResolvedCallback([&](const nythera::theme::GeneratedPalette& gen, std::string_view mode) {
+      resolvedPalette = gen;
+      resolvedMode = std::string(mode);
+    });
+    theme.apply();
+    for (auto& call : DeferredCall::takePending()) {
+      call();
+    }
+
+    const auto* nytheraDefault = nythera::theme::findBuiltinPalette("Nythera");
+    const auto* ayu = nythera::theme::findBuiltinPalette("Ayu");
+    TEST_CHECK(nytheraDefault != nullptr && ayu != nullptr);
+    const auto nytheraGen = nythera::theme::expandBuiltinPalette(*nytheraDefault);
+    const auto ayuGen = nythera::theme::expandBuiltinPalette(*ayu);
+
+    // Standalone Files falls back to built-in Nythera palette without creating ~/.config/nythera/shell/.
+    TEST_CHECK(!fs::exists(nytheraDir / "shell"));
+    TEST_CHECK(resolvedMode == "dark");
+    TEST_CHECK(resolvedPalette.dark.at("primary") == nytheraGen.dark.at("primary"));
+    TEST_CHECK(settings.transparencyMode() == PanelTransparencyMode::Solid);
+
+    // Creating shared ~/.config/nythera/theme.toml + palettes/ updates standalone Files live via watchFd.
+    shell.addReloadCallback([&] { theme.apply(); }, "files-theme-test");
+    TEST_CHECK(nythera::theme::saveCustomPaletteFromGenerated("files-shared", ayuGen));
+    TEST_CHECK(fs::exists(nytheraDir / "palettes" / "files-shared.json"));
+    TEST_CHECK(fs::create_directories(nytheraDir) || fs::is_directory(nytheraDir));
+    write(sharedTheme, "[theme]\nmode = \"light\"\nsource = \"custom\"\ncustom_palette = \"files-shared\"\n");
+
+    pollfd pfd{.fd = shell.watchFd(), .events = POLLIN, .revents = 0};
+    TEST_CHECK(pfd.fd >= 0 && ::poll(&pfd, 1, 500) == 1 && (pfd.revents & POLLIN) != 0);
+    shell.checkReload();
+    std::this_thread::sleep_for(std::chrono::milliseconds(170));
+    TimerManager::instance().tick();
+    for (auto& call : DeferredCall::takePending()) {
+      call();
+    }
+
+    TEST_CHECK(!fs::exists(nytheraDir / "shell"));
+    TEST_CHECK(shell.config().theme.mode == ThemeMode::Light);
+    TEST_CHECK(shell.config().theme.source == PaletteSource::Custom);
+    TEST_CHECK(resolvedMode == "light");
+    TEST_CHECK(resolvedPalette.dark.at("primary") == ayuGen.dark.at("primary"));
+
+    // Shell override in shell/config.toml wins over shared theme.toml; Files' files/theme.toml
+    // remains independent and does not alter global/Shell theme state.
+    TEST_CHECK(fs::create_directories(shellConfig.parent_path()));
+    TEST_CHECK(fs::create_directories(filesTheme.parent_path()));
+    write(shellConfig, "[theme]\nmode = \"dark\"\n");
+    write(filesTheme, "[theme]\ntransparency_mode = \"soft\"\n");
+    shell.forceReload();
+    drain(settings);
+    for (auto& call : DeferredCall::takePending()) {
+      call();
+    }
+
+    TEST_CHECK(shell.config().theme.mode == ThemeMode::Dark);
+    TEST_CHECK(resolvedMode == "dark");
+    TEST_CHECK(resolvedPalette.dark.at("primary") == ayuGen.dark.at("primary"));
+    TEST_CHECK(settings.transparencyMode() == PanelTransparencyMode::Soft);
+    TEST_CHECK(shell.config().shell.panel.transparencyMode == PanelTransparencyMode::Solid);
+
+    // Independent Files state vs read-only Shell state inheritance:
+    // Writing Files' state preserves Shell's state.toml, and InheritanceOnly reads Shell's
+    // wallpaper state read-only without creating state dirs or tightening loose file modes.
+    TEST_CHECK(settings.saveSidebarWidth(240));
+    const auto filesState = env.state() / "nythera" / "files" / "state.toml";
+    const auto shellStateDir = env.state() / "nythera" / "shell";
+    const auto shellStateFile = shellStateDir / "state.toml";
+    TEST_CHECK(fs::exists(filesState));
+    TEST_CHECK(!fs::exists(shellStateDir));
+
+    TEST_CHECK(fs::create_directories(shellStateDir));
+    write(shellStateFile, "[wallpaper]\ndefault = \"/tmp/state-wall.png\"\nlast = \"/tmp/state-last.png\"\n");
+    const auto looseMode = fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read;
+    fs::permissions(shellStateFile, looseMode);
+    shell.forceReload();
+    TEST_CHECK(shell.getPaletteWallpaperPath() == "/tmp/state-last.png");
+    TEST_CHECK(fs::status(shellStateFile).permissions() == looseMode);
+    TEST_CHECK(!toml::parse_file(filesState.string()).contains("wallpaper"));
+
+    // External update to shell/state.toml reloads via watchFd.
+    write(shellStateFile, "[wallpaper]\ndefault = \"/tmp/state-wall-2.png\"\nlast = \"/tmp/state-last-2.png\"\n");
+    pollfd statePfd{.fd = shell.watchFd(), .events = POLLIN, .revents = 0};
+    TEST_CHECK(statePfd.fd >= 0 && ::poll(&statePfd, 1, 500) == 1 && (statePfd.revents & POLLIN) != 0);
+    shell.checkReload();
+    std::this_thread::sleep_for(std::chrono::milliseconds(170));
+    TimerManager::instance().tick();
+    TEST_CHECK(shell.getPaletteWallpaperPath() == "/tmp/state-last-2.png");
+  }
 } // namespace
 
 int main() {
@@ -214,5 +343,6 @@ int main() {
     separationAndInheritance();
     includesAndLiveUpdates();
     validatesWholeCandidate();
+    sharedThemeInheritanceAndStandaloneFallback();
   });
 }
