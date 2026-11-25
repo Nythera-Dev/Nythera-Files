@@ -119,11 +119,29 @@ just build
 just test
 ```
 
-The default `debug` mode uses `build-debug/` configured with Meson's `debugoptimized` build type. When `nythera-lib` is not already resolvable via system `pkg-config` or an explicit `PKG_CONFIG_PATH`, `just` automatically falls back to `$HOME/.local/opt/nythera-lib/lib/pkgconfig` while keeping explicit paths and system installs prioritized. Shared Nythera fonts, Tabler glyph metadata, and library component translations are supplied by NytheraLib (`share/nythera-lib/assets/`), while `files-assets/` provides Files-specific templates, dialogue artwork, and icons.
+The default `debug` mode uses `build-debug/` configured with Meson's `debugoptimized` build type and `--prefix /usr/local`. NytheraLib is expected in system `pkg-config` or at the user-local development prefix `$HOME/.local/opt/nythera-lib` (`libdir=lib`); when `nythera-lib` is not already resolvable via system `pkg-config` or an explicit `PKG_CONFIG_PATH`, `just` automatically falls back to `$HOME/.local/opt/nythera-lib/lib/pkgconfig` while keeping explicit paths and system installs prioritised. Shared Nythera fonts, Tabler glyph metadata, and library component translations are supplied by NytheraLib (`share/nythera-lib/assets/`), while `files-assets/` provides Files-specific templates, dialogue artwork, and icons.
 
 During coordinated `0.1.x` development, always build and install `nythera-lib` before building `nythera-files`. Rebuild `nythera-files` whenever `nythera-lib` public headers, inline/template implementations, or ABI-affecting build options change, and restart running `nythera-file-manager` processes to load reinstalled `.cpp`-only library updates (see NytheraLib's `README.md`).
 
-An Arch `PKGBUILD` is provided in [`packaging/arch/`](packaging/arch/). Note that `just install debug` installs under `/usr/local` (and `/usr/share/polkit-1/actions/`) and requires elevated privileges, whereas `packaging/arch/PKGBUILD` installs under `/usr`; avoid mixing both helper locations on one host. Other environments have not been extensively tested.
+### Installation conventions (development, packaged, and unprivileged)
+
+- **Development privileged helper installation (`/usr/local`):** The default `just` workflow configures `--prefix /usr/local` (`libexecdir=libexec`). Running `sudo just install debug` (or installing only the helpers and policies with `sudo meson install --no-rebuild -C build-debug --tags admin-helper,properties-helper`) installs `nythera-admin-helper` and `nythera-properties-helper` under `/usr/local/libexec/` and writes `dev.nythera.Files.*.policy` into `/usr/share/polkit-1/actions/` (via `polkit-gobject-1`'s `policydir`).
+- **Package-managed installation (`packaging/arch/PKGBUILD`):** `arch-meson` configures `--prefix=/usr --libexecdir=lib`, installing helpers under `/usr/lib/` while also writing `dev.nythera.Files.*.policy` into `/usr/share/polkit-1/actions/`. Because both mechanisms share `/usr/share/polkit-1/actions/` and embed their configured helper paths into the binary and policy XML, never mix `/usr/local/libexec/` and `/usr/lib/` helper installations on one host; remove obsolete helpers and policy files from the unused prefix before switching.
+- **Unprivileged user-prefix and staged installs:** Because `policydir` always resolves to `/usr/share/polkit-1/actions/`, an unprivileged `meson install` fails unless Polkit targets are excluded or `DESTDIR` is used. To install the unprivileged application and `files-assets/` into a user prefix without root or Polkit files:
+
+```sh
+just configure debug "$HOME/.local"
+just build
+meson install --no-rebuild -C build-debug --tags files,files-assets
+```
+
+To inspect a complete installation tree (including helpers and policy files) without modifying host paths, use `DESTDIR`:
+
+```sh
+DESTDIR=/path/to/stage meson install --no-rebuild -C build-debug
+```
+
+Polkit execution checks require root ownership and non-writable ancestors down to `/`, so elevated Properties and Administrator Mode actions remain disabled in unprivileged or staged installs. Other environments outside Arch Linux have not been extensively tested.
 
 There is no stable packaged release yet.
 
