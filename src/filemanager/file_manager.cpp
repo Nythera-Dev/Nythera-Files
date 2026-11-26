@@ -282,6 +282,9 @@ private:
 
 namespace {
   constexpr float kToolbarHeight = 32.0F;
+  constexpr float kWindowPadding = 8.0F;
+  constexpr float kPaneGap = 2.0F;
+  constexpr float kSidebarDividerWidth = 4.0F;
   constexpr float kSidebarMinWidth = 150.0F;
   constexpr float kSidebarMaxWidth = 360.0F;
   constexpr float kStatusMinHeight = 30.0F;
@@ -426,14 +429,14 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
             updateNavigationControls();
             updateStatusBar();
             updateWindowTitle();
-            updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+            updateAdminHeaderUi();
             m_tabBar.markDirty();
             if (m_surface)
               m_surface->requestLayout();
           },
       .onTabsChanged =
           [this] {
-            updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+            updateAdminHeaderUi();
             m_tabBar.markDirty();
             if (m_surface)
               m_surface->requestLayout();
@@ -443,7 +446,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
             m_tabBar.markDirty();
             if (tabId == m_tabs.activeTabId()) {
               updateWindowTitle();
-              updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+              updateAdminHeaderUi();
             }
             if (m_surface)
               m_surface->requestLayout();
@@ -574,7 +577,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
             m_tabBar.markDirty();
             if (tab.id == m_tabs.activeTabId()) {
               updateWindowTitle();
-              updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+              updateAdminHeaderUi();
             }
             if (m_surface)
               m_surface->requestLayout();
@@ -1390,7 +1393,7 @@ int FileManager::run() {
           m_grid->notifyDataChanged();
         m_places.markDirty(false);
         m_tabBar.updateTheme();
-        updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+        updateAdminHeaderUi();
         m_modalDialog.updateTheme();
         if (m_surface)
           m_surface->requestLayout();
@@ -1516,10 +1519,7 @@ int FileManager::run() {
         new MainCloseRequest{this, m_alive}
     );
   });
-  m_surface->setConfigureCallback([this](std::uint32_t width, std::uint32_t) {
-    updateAdminHeaderUi(static_cast<int>(width));
-    m_surface->requestLayout();
-  });
+  m_surface->setConfigureCallback([this](std::uint32_t, std::uint32_t) { m_surface->requestLayout(); });
   m_surface->setPrepareFrameCallback([this](bool update, bool layout) { prepareFrame(update, layout); });
   m_windowTitle =
       filemanager::windowTitleForPath(activeSession().path(), g_get_home_dir(), activeTab().hasActiveAdminSession());
@@ -2319,7 +2319,7 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
     m_modalDialog.updateTheme();
   if (changed("show_menu_bar")) {
     m_menus.loadInitialPreference();
-    m_menus.syncResponsiveMenuBar(m_surface ? m_surface->width() : m_lastHeaderWidth);
+    m_menus.syncResponsiveMenuBar(m_lastHeaderWidth);
   }
   if (changed("open_tabs_in_background"))
     m_openTabsInBackground = m_settings.openTabsInBackground();
@@ -2974,17 +2974,16 @@ std::unique_ptr<Flex> FileManager::buildHeaderAppBar() {
   appBar->addChild(std::move(appSpacer));
   m_menus.attachMenuBarUi(*appBar, kToolbarHeight);
 
-  updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+  updateAdminHeaderUi();
   return appBar;
 }
 
-void FileManager::updateAdminHeaderUi(int surfaceWidth) {
-  if (surfaceWidth > 0)
-    m_lastHeaderWidth = surfaceWidth;
-  const int effectiveWidth = surfaceWidth > 0 ? surfaceWidth : m_lastHeaderWidth;
+void FileManager::updateAdminHeaderUi(int headerWidth) {
+  if (headerWidth > 0)
+    m_lastHeaderWidth = headerWidth;
   const bool adminActive = activeTab().hasActiveAdminSession();
-  // At narrow window widths, prioritise the administrator status and Finish control over branding.
-  const bool compactNarrowAdmin = adminActive && effectiveWidth > 0 && effectiveWidth < 760;
+  // At narrow header widths, prioritise the administrator status and Finish control over branding.
+  const bool compactNarrowAdmin = adminActive && m_lastHeaderWidth < 760;
 
   if (m_appBrandContainer != nullptr) {
     m_appBrandContainer->setVisible(!compactNarrowAdmin);
@@ -3090,7 +3089,7 @@ bool FileManager::enterAdministratorMode(
               m_locationInput->setValue(currentTab->session.path().string());
             updateNavigationControls();
             updateWindowTitle();
-            updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+            updateAdminHeaderUi();
             updateStatusBar();
             setStatus("Administrator Mode active.");
           } else {
@@ -3224,7 +3223,7 @@ void FileManager::finishAdministratorMode(filemanager::TabId tabId, std::string 
       m_locationInput->setValue(tab->session.path().string());
     updateNavigationControls();
     updateWindowTitle();
-    updateAdminHeaderUi(m_surface ? m_surface->width() : m_lastHeaderWidth);
+    updateAdminHeaderUi();
     updateStatusBar();
     if (!statusMessage.empty())
       setStatus(std::move(statusMessage));
@@ -3453,12 +3452,10 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_grid->notifyDataChanged();
   m_adapter->setRenderer(&renderer);
   if (!m_root) {
-    constexpr float pad = 8.0F;
     m_root = std::make_unique<Flex>();
-    m_root->setDirection(FlexDirection::Vertical);
     m_root->setAlign(FlexAlign::Stretch);
-    m_root->setGap(Style::spaceSm);
-    m_root->setPadding(pad);
+    m_root->setGap(kPaneGap);
+    m_root->setPadding(kWindowPadding);
     m_root->setFill(colorSpecFromRole(ColorRole::SurfaceContainerLow, kFilesWindowOpacity));
     m_root->setBorder(
         colorSpecFromRole(
@@ -3468,13 +3465,6 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
         Style::borderWidth
     );
     applyNytheraBevel(*m_root, Style::scaledRadiusLg(1.0F));
-
-    m_root->addChild(buildHeaderAppBar());
-
-    auto content = std::make_unique<Flex>();
-    content->setAlign(FlexAlign::Stretch);
-    content->setGap(2.0F);
-    content->setFlexGrow(1.0F);
 
     auto sidebar = std::make_unique<Flex>();
     sidebar->setDirection(FlexDirection::Vertical);
@@ -3502,14 +3492,21 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     sidebar->addChild(std::move(placesScroll));
     m_places.attachUi(placesScrollPtr, placesContent);
     m_places.rebuild();
-    m_sidebar = static_cast<Flex*>(content->addChild(std::move(sidebar)));
+    m_sidebar = static_cast<Flex*>(m_root->addChild(std::move(sidebar)));
 
     auto divider = std::make_unique<Flex>();
-    divider->setMinWidth(4.0F);
-    divider->setMaxWidth(4.0F);
+    divider->setMinWidth(kSidebarDividerWidth);
+    divider->setMaxWidth(kSidebarDividerWidth);
     divider->setFill(clearColorSpec());
     divider->setHitTestVisible(true);
-    m_sidebarDivider = static_cast<Flex*>(content->addChild(std::move(divider)));
+    m_sidebarDivider = static_cast<Flex*>(m_root->addChild(std::move(divider)));
+
+    auto mainColumn = std::make_unique<Flex>();
+    mainColumn->setDirection(FlexDirection::Vertical);
+    mainColumn->setAlign(FlexAlign::Stretch);
+    mainColumn->setGap(Style::spaceSm);
+    mainColumn->setFlexGrow(1.0F);
+    mainColumn->addChild(buildHeaderAppBar());
 
     auto mainPane = std::make_unique<Flex>();
     mainPane->setDirection(FlexDirection::Vertical);
@@ -3809,8 +3806,8 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_statusStrip = static_cast<Flex*>(mainPane->addChild(std::move(statusStrip)));
     m_statusStrip->addChild(std::move(statusRow));
     m_statusStrip->setPadding(std::clamp((m_statusHeight - statusFontSize) * 0.5F, 2.0F, 7.0F), 10.0F);
-    content->addChild(std::move(mainPane));
-    m_root->addChild(std::move(content));
+    mainColumn->addChild(std::move(mainPane));
+    m_root->addChild(std::move(mainColumn));
     m_dispatcher.setSceneRoot(m_root.get());
     m_dispatcher.setFocus(m_grid->focusArea());
     m_surface->setSceneRoot(m_root.get());
@@ -3819,8 +3816,6 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     setLocationEditMode(false);
     needsLayout = true;
   }
-  m_menus.syncResponsiveMenuBar(m_surface->width());
-  updateAdminHeaderUi(m_surface->width());
   if (m_tabBar.rebuildIfDirty())
     needsLayout = true;
   if (m_transfers.applyDragScroll())
@@ -3844,6 +3839,11 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_sidebar->setParticipatesInLayout(showSidebar);
     m_sidebarDivider->setVisible(showSidebar);
     m_sidebarDivider->setParticipatesInLayout(showSidebar);
+    const float sidebarSpace = showSidebar ? effectiveSidebar + kSidebarDividerWidth + 2.0F * kPaneGap : 0.0F;
+    const int headerWidth =
+        static_cast<int>(static_cast<float>(m_surface->width()) - 2.0F * kWindowPadding - sidebarSpace);
+    m_menus.syncResponsiveMenuBar(headerWidth);
+    updateAdminHeaderUi(headerWidth);
     m_root->setSize(static_cast<float>(m_surface->width()), static_cast<float>(m_surface->height()));
     m_root->layout(renderer);
     m_tabBar.syncLayout(renderer);
