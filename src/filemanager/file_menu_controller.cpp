@@ -7,6 +7,7 @@
 #include "filemanager/file_sort.h"
 #include "filemanager/file_view_menu.h"
 #include "filemanager/property_operations.h"
+#include "filemanager/search_dropdown.h"
 #include "render/render_context.h"
 #include "ui/controls/box.h"
 #include "ui/controls/button.h"
@@ -664,24 +665,11 @@ namespace filemanager {
          .actionGlyph = "layout-grid"},
     };
     if (!gridMode) {
-      std::vector<ContextMenuControlEntry> columns;
-      for (auto column : m_listHeader.columnLayout().order) {
-        if (m_listHeader.searchView() && column == FileColumn::Accessed)
-          continue;
-        const auto index = columnIndex(column);
-        columns.push_back(
-            {.id = menu_id::kFirstColumnAction + static_cast<int>(index),
-             .label = std::string(m_listHeader.columnLabel(column)),
-             .enabled = column != FileColumn::Name,
-             .checkmark = true,
-             .toggleState = m_listHeader.columnLayout().visible[index] ? 1 : 0}
-        );
-      }
       entries.push_back(
           {.id = menu_id::kShowColumns,
            .label = "Show Columns",
            .hasSubmenu = true,
-           .submenuEntries = std::move(columns),
+           .submenuEntries = columnVisibilityEntries(),
            .actionGlyph = "columns-3"}
       );
     }
@@ -696,7 +684,7 @@ namespace filemanager {
             {.id = 50,
              .label = "Show Hidden Files",
              .checkmark = true,
-             .toggleState = session.showHidden() ? 1 : 0,
+             .toggleState = session.displayedHiddenItems() ? 1 : 0,
              .shortcut = "Ctrl+H"},
             {.separator = true},
             {.id = menu_id::kZoomIn,
@@ -1121,7 +1109,7 @@ namespace filemanager {
         session.browsingTrash()              ? filemanager::FileMenuContext::Trash
             : session.entries()[index].isDir ? filemanager::FileMenuContext::Folder
                                              : filemanager::FileMenuContext::File,
-        m_listHeader.gridMode(), session.showHidden(), m_listHeader.sortField(), m_listHeader.sortOrder(),
+        m_listHeader.gridMode(), session.displayedHiddenItems(), m_listHeader.sortField(), m_listHeader.sortOrder(),
         session.foldersFirst(), session.hiddenLast(), m_listHeader.searchView()
     );
     if (!session.browsingTrash() && !targetIsDir) {
@@ -1203,7 +1191,7 @@ namespace filemanager {
     }
     filemanager::appendFileMenuEntries(
         entries, session.browsingTrash() ? filemanager::FileMenuContext::Trash : filemanager::FileMenuContext::Empty,
-        m_listHeader.gridMode(), session.showHidden(), m_listHeader.sortField(), m_listHeader.sortOrder(),
+        m_listHeader.gridMode(), session.displayedHiddenItems(), m_listHeader.sortField(), m_listHeader.sortOrder(),
         session.foldersFirst(), session.hiddenLast(), m_listHeader.searchView()
     );
     filemanager::groupFileMenuEntries(
@@ -1264,6 +1252,23 @@ namespace filemanager {
     );
   }
 
+  std::vector<ContextMenuControlEntry> FileMenuController::columnVisibilityEntries() const {
+    std::vector<ContextMenuControlEntry> columns;
+    for (auto column : m_listHeader.columnLayout().order) {
+      if (m_listHeader.searchView() && column == FileColumn::Accessed)
+        continue;
+      const auto index = columnIndex(column);
+      columns.push_back(
+          {.id = menu_id::kFirstColumnAction + static_cast<int>(index),
+           .label = std::string(m_listHeader.columnLabel(column)),
+           .enabled = column != FileColumn::Name,
+           .checkmark = true,
+           .toggleState = m_listHeader.columnLayout().visible[index] ? 1 : 0}
+      );
+    }
+    return columns;
+  }
+
   void FileMenuController::openColumnHeaderMenu(
       std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen
   ) {
@@ -1273,27 +1278,37 @@ namespace filemanager {
   void FileMenuController::openTabContextMenu(
       std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen
   ) {
+    openMainContextMenu(
+        {.entries = std::move(entries), .anchor = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 1, 1}},
+        highlightOnOpen, false
+    );
+  }
+
+  void FileMenuController::openSearchDropdown(
+      std::vector<ContextMenuControlEntry> entries, const Node& trigger, bool highlightOnOpen
+  ) {
+    ContextMenuPopupRequest request{.entries = std::move(entries)};
+    anchorSearchDropdown(request, trigger);
+    openMainContextMenu(std::move(request), highlightOnOpen, true);
+  }
+
+  void FileMenuController::openMainContextMenu(
+      ContextMenuPopupRequest request, bool highlightOnOpen, bool preferSurfaceOutput
+  ) {
     auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr;
     if (!m_contextMenuPopup || !surface)
       return;
-    auto* output = m_wayland.lastPointerOutput();
+    auto* output =
+        preferSurfaceOutput ? m_wayland.outputForSurface(surface->wlSurface()) : m_wayland.lastPointerOutput();
     if (!output)
-      output = m_wayland.outputForSurface(surface->wlSurface());
+      output = preferSurfaceOutput ? m_wayland.lastPointerOutput() : m_wayland.outputForSurface(surface->wlSurface());
     m_dispatcher.pointerLeave();
     TooltipManager::instance().forceDestroy();
     m_contextMenuPopup->setOnBoundaryHorizontalMove({});
     m_contextMenuPopup->setHighlightOnOpen(highlightOnOpen);
-    m_contextMenuPopup->open(
-        ContextMenuPopupRequest{
-            .entries = std::move(entries),
-            .anchor = PopupAnchorRect{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 1, 1},
-            .parent =
-                PopupSurfaceParent{
-                    .xdgSurface = surface->xdgSurface(), .output = output, .wlSurface = surface->wlSurface()
-                },
-            .inputSerial = m_callbacks.lastInputSerial ? m_callbacks.lastInputSerial() : 0
-        }
-    );
+    request.parent = {.xdgSurface = surface->xdgSurface(), .output = output, .wlSurface = surface->wlSurface()};
+    request.inputSerial = m_callbacks.lastInputSerial ? m_callbacks.lastInputSerial() : 0;
+    m_contextMenuPopup->open(std::move(request));
   }
 
   void FileMenuController::openApplicationChooser() {

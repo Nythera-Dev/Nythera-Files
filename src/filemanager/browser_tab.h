@@ -91,10 +91,10 @@ namespace filemanager {
     ScrollViewState searchScrollState;
 
     [[nodiscard]] TabViewState& displayedViewState() noexcept {
-      return session.searchOpen() ? searchViewState : viewState;
+      return session.search().active() ? searchViewState : viewState;
     }
     [[nodiscard]] ScrollViewState& displayedScrollState() noexcept {
-      return session.searchOpen() ? searchScrollState : scrollState;
+      return session.search().active() ? searchScrollState : scrollState;
     }
     std::optional<float> pendingScrollOffsetAfterRefresh;
 
@@ -103,6 +103,12 @@ namespace filemanager {
     std::optional<std::filesystem::path> selectionAnchor;
 
     std::optional<PasteSelection> pendingPasteSelection;
+    struct BrowsingSelection {
+      std::optional<std::filesystem::path> path;
+      std::unordered_set<std::string> paths;
+      std::optional<std::filesystem::path> anchor;
+    };
+    std::optional<BrowsingSelection> browsingSelection;
     std::unordered_set<std::string> identityCheckedPaths;
     std::optional<std::filesystem::path> pendingPasteRevealPath;
     std::optional<std::uint64_t> pendingDropScrollGeneration;

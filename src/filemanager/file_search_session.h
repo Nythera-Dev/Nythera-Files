@@ -11,6 +11,7 @@ namespace filemanager {
   class FileSearchSession {
   public:
     enum class Status { Idle, Searching, Finished, Failed };
+    using BuildPlan = std::function<SearchPlan()>;
     using Changed = std::function<void(bool complete)>;
 
     struct Order {
@@ -24,7 +25,7 @@ namespace filemanager {
 
     void edit(
         const std::filesystem::path& root, std::string query, bool showHidden, Order order, Changed changed,
-        std::function<bool()> canReorder, FzfSearch backend = {}
+        std::function<bool()> canReorder, FzfSearch backend = {}, BuildPlan buildPlan = {}
     );
     void submit();
     void setOrder(Order order);
@@ -51,7 +52,7 @@ namespace filemanager {
     RecursiveFileDiscovery m_discovery;
     GSource* m_timeout = nullptr;
     GCancellable* m_sort = nullptr;
-    std::filesystem::path m_root;
+    BuildPlan m_buildPlan;
     std::string m_query;
     std::string m_error;
     std::vector<FileEntry> m_entries;

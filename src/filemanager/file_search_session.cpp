@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <iterator>
+#include <unistd.h>
 #include <utility>
 
 namespace {
@@ -15,30 +16,83 @@ namespace {
 
   using Candidate = filemanager::RecursiveFileDiscovery::Candidate;
 
-  void appendSearchResult(
-      std::vector<FileEntry>& results, const std::filesystem::path& parent, const Candidate& candidate,
-      GCancellable* cancel
-  ) {
-    const auto path = parent / candidate.name;
-    g_autoptr(GFile) file = g_file_new_for_path(path.c_str());
-    g_autoptr(GFileInfo) info = g_file_query_info(file, kResultAttributes, G_FILE_QUERY_INFO_NONE, cancel, nullptr);
-    if (!info)
-      return;
-    auto entry = filemanager::makeFileEntry(info, path, G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE);
-    if (!g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK)
-        && candidate.type == G_FILE_TYPE_SYMBOLIC_LINK) {
-      entry.isSymlink = true;
-      entry.hasIdentity = false;
+  using Source = filemanager::RecursiveFileDiscovery::Source;
+
+  class ResultReader {
+  public:
+    ResultReader(const filemanager::SearchPlan& plan, const Source& source) : m_plan(plan), m_source(source) {}
+    ~ResultReader() {
+      if (m_folder >= 0)
+        close(m_folder);
     }
-    if (entry.type.empty() && entry.isDir)
-      entry.type = "inode/directory";
-    else if (entry.type.empty()) {
-      g_autofree char* guessed = g_content_type_guess(entry.name.c_str(), nullptr, 0, nullptr);
-      if (guessed)
-        entry.type = guessed;
+    ResultReader(const ResultReader&) = delete;
+    ResultReader& operator=(const ResultReader&) = delete;
+
+    void append(
+        std::vector<FileEntry>& results, const std::filesystem::path& parent, const Candidate& candidate,
+        GCancellable* cancel
+    ) {
+      using filemanager::OpenSearchPath;
+      const auto path = parent / candidate.name;
+      g_autoptr(GFileInfo) info = nullptr;
+      if (candidate.type == G_FILE_TYPE_SYMBOLIC_LINK) {
+        const OpenSearchPath target(m_plan, path);
+        if (target.fd() >= 0)
+          info = query(OpenSearchPath::fdPath(target.fd()), G_FILE_QUERY_INFO_NONE, cancel);
+      }
+      if (info) {
+        g_file_info_set_name(info, candidate.name.c_str());
+        g_file_info_set_is_symlink(info, true);
+      } else if (path == m_source.root) {
+        info = query(OpenSearchPath::fdPath(m_source.rootFd), G_FILE_QUERY_INFO_NONE, cancel);
+        if (info) {
+          g_file_info_set_name(info, candidate.name.c_str());
+          g_file_info_set_is_symlink(info, false);
+        }
+      } else {
+        if (m_source.folderFd >= 0) {
+          if (m_pinnedParent.empty())
+            m_pinnedParent = OpenSearchPath::fdPath(m_source.folderFd);
+        } else if (m_parent != parent) {
+          if (m_folder >= 0)
+            close(m_folder);
+          m_parent = parent;
+          m_folder = m_source.openFolder(parent);
+          m_pinnedParent = m_folder >= 0 ? OpenSearchPath::fdPath(m_folder) : std::filesystem::path{};
+        }
+        if (!m_pinnedParent.empty())
+          info = query(m_pinnedParent / candidate.name, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancel);
+      }
+      if (!info)
+        return;
+      auto entry = filemanager::makeFileEntry(info, path, G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE);
+      if (!g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK)
+          && candidate.type == G_FILE_TYPE_SYMBOLIC_LINK) {
+        entry.isSymlink = true;
+        entry.hasIdentity = false;
+      }
+      if (entry.type.empty() && entry.isDir)
+        entry.type = "inode/directory";
+      else if (entry.type.empty()) {
+        g_autofree char* guessed = g_content_type_guess(entry.name.c_str(), nullptr, 0, nullptr);
+        if (guessed)
+          entry.type = guessed;
+      }
+      results.push_back(std::move(entry));
     }
-    results.push_back(std::move(entry));
-  }
+
+  private:
+    static GFileInfo* query(const std::filesystem::path& path, GFileQueryInfoFlags flags, GCancellable* cancel) {
+      g_autoptr(GFile) file = g_file_new_for_path(path.c_str());
+      return g_file_query_info(file, kResultAttributes, flags, cancel, nullptr);
+    }
+
+    const filemanager::SearchPlan& m_plan;
+    const Source& m_source;
+    int m_folder = -1;
+    std::filesystem::path m_parent;
+    std::filesystem::path m_pinnedParent;
+  };
 
   struct FzfBatch {
     struct Item {
@@ -65,8 +119,10 @@ namespace {
           || std::chrono::steady_clock::now() - queuedAt >= std::chrono::milliseconds(35);
     }
 
-    std::optional<std::vector<FileEntry>>
-    match(const filemanager::FzfSearch& options, const std::string& query, GCancellable* cancel) {
+    std::optional<std::vector<FileEntry>> match(
+        const filemanager::FzfSearch& options, const std::string& query, GCancellable* cancel,
+        const filemanager::SearchPlan& plan, const Source& source
+    ) {
       if (items.empty())
         return std::vector<FileEntry>{};
       std::vector<std::string_view> names;
@@ -77,11 +133,12 @@ namespace {
       if (!indices)
         return std::nullopt;
       std::vector<FileEntry> results;
+      ResultReader reader(plan, source);
       for (const auto index : *indices) {
         if (g_cancellable_is_cancelled(cancel))
           break;
         const auto& item = items[index];
-        appendSearchResult(results, item.parent, item.candidate, cancel);
+        reader.append(results, item.parent, item.candidate, cancel);
       }
       items.clear();
       first = false;
@@ -96,13 +153,14 @@ namespace filemanager {
 
   void FileSearchSession::edit(
       const std::filesystem::path& root, std::string query, bool showHidden, Order order, Changed changed,
-      std::function<bool()> canReorder, FzfSearch backend
+      std::function<bool()> canReorder, FzfSearch backend, BuildPlan buildPlan
   ) {
     cancel();
     if (query.empty())
       return;
 
-    m_root = root;
+    m_buildPlan = buildPlan ? std::move(buildPlan)
+                            : [root] { return resolveSearchScope({}, root, {}, nullptr, {}, discoverSearchMounts()); };
     m_query = std::move(query);
     m_showHidden = showHidden;
     m_changed = std::move(changed);
@@ -148,6 +206,7 @@ namespace filemanager {
     m_canReorder = {};
     m_discoveryFinished = false;
     m_skipped = 0;
+    m_buildPlan = {};
     m_fzf = {};
     m_fzfFallback = false;
     m_status = Status::Idle;
@@ -178,50 +237,65 @@ namespace filemanager {
   }
 
   void FileSearchSession::start() {
+    auto plan = std::make_shared<SearchPlan>(m_buildPlan());
     auto complete = [this](std::string error, std::size_t skipped) { completed(std::move(error), skipped); };
     if (m_fzf.executable.empty() || m_fzfFallback) {
-      m_discovery.start(
-          m_root, m_showHidden,
-          [this, query = foldSearchName(m_query)](
-              const std::filesystem::path& parent, std::span<const Candidate> candidates, GCancellable* cancel
-          ) {
-            std::vector<FileEntry> results;
-            for (const auto& candidate : candidates) {
-              if (g_cancellable_is_cancelled(cancel))
-                break;
-              if (foldSearchName(candidate.name).contains(query))
-                appendSearchResult(results, parent, candidate, cancel);
-            }
-            return publish(this, std::move(results));
+      m_discovery.startPlan(
+          plan, m_showHidden,
+          [this, plan, query = foldSearchName(m_query)] {
+            return RecursiveFileDiscovery::Consumer{
+                [this, plan, query](
+                    const std::filesystem::path& parent, std::span<const Candidate> candidates, const Source& source,
+                    GCancellable* cancel
+                ) {
+                  std::vector<FileEntry> results;
+                  ResultReader reader(*plan, source);
+                  for (const auto& candidate : candidates) {
+                    if (g_cancellable_is_cancelled(cancel))
+                      break;
+                    if (foldSearchName(candidate.name).contains(query))
+                      reader.append(results, parent, candidate, cancel);
+                  }
+                  return publish(this, std::move(results));
+                },
+                {}
+            };
           },
           std::move(complete)
       );
       return;
     }
 
-    auto batch = std::make_shared<FzfBatch>();
-    auto flush = [this, batch, options = m_fzf,
-                  query = m_query](GCancellable* cancel) -> RecursiveFileDiscovery::Publish {
-      auto results = batch->match(options, query, cancel);
-      if (results)
-        return publish(this, std::move(*results));
-      return [this] {
-        // Discard the partial fzf projection and restart the same query with
-        // native matching. Never mix results from the two matching rules.
-        m_entries.clear();
-        m_fzfFallback = true;
-        start();
-        m_changed(false);
-      };
-    };
-    m_discovery.start(
-        m_root, m_showHidden,
-        [batch,
-         flush](const std::filesystem::path& parent, std::span<const Candidate> candidates, GCancellable* cancel) {
-          batch->push(parent, candidates);
-          return batch->ready() ? flush(cancel) : RecursiveFileDiscovery::Publish{};
+    m_discovery.startPlan(
+        plan, m_showHidden,
+        [this, plan, options = m_fzf, query = m_query] {
+          auto batch = std::make_shared<FzfBatch>();
+          auto flush = [this, plan, batch, options,
+                        query](const Source& source, GCancellable* cancel) -> RecursiveFileDiscovery::Publish {
+            auto results = batch->match(options, query, cancel, *plan, source);
+            if (results)
+              return publish(this, std::move(*results));
+            return [this] {
+              // Discard the partial fzf projection and restart with native matching.
+              m_entries.clear();
+              m_fzfFallback = true;
+              start();
+              m_changed(false);
+            };
+          };
+          return RecursiveFileDiscovery::Consumer{
+              [batch, flush](
+                  const std::filesystem::path& parent, std::span<const Candidate> candidates, const Source& source,
+                  GCancellable* cancel
+              ) {
+                batch->push(parent, candidates);
+                return batch->ready() ? flush({source.root, source.rootFd, -1}, cancel)
+                                      : RecursiveFileDiscovery::Publish{};
+              },
+              flush
+          };
         },
-        std::move(complete), flush
+        std::move(complete)
     );
   }
 

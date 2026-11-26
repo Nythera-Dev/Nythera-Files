@@ -1,14 +1,18 @@
 #include "filemanager/file_list_header.h"
 
 #include "cursor-shape-v1-client-protocol.h"
+#include "filemanager/file_list_columns.h"
 #include "filemanager/file_manager_settings.h"
 #include "render/core/renderer.h"
 #include "render/scene/input_area.h"
 #include "render/scene/input_dispatcher.h"
 #include "ui/controls/button.h"
 #include "ui/controls/flex.h"
+#include "ui/controls/label.h"
+#include "ui/controls/scrollbar.h"
 #include "ui/controls/separator.h"
 #include "ui/controls/virtual_grid_view.h"
+#include "ui/dialogs/file_entry_row.h"
 #include "ui/dialogs/file_view_metrics.h"
 #include "ui/palette.h"
 #include "ui/style.h"
@@ -52,9 +56,18 @@ namespace filemanager {
     fileHeader->setVisible(!m_gridMode);
     fileHeader->setParticipatesInLayout(!m_gridMode);
     fileHeader->setExcludeSubtreeFromTabOrder(m_gridMode);
-    fileHeader->setAlign(FlexAlign::Center);
-    fileHeader->setGap(Style::spaceSm);
-    fileHeader->setPadding(5.0F, Style::spaceSm);
+    fileHeader->setMinHeight(36.0F);
+    auto viewport = std::make_unique<Flex>();
+    viewport->setParticipatesInLayout(false);
+    viewport->setClipChildren(true);
+    m_viewport = static_cast<Flex*>(fileHeader->addChild(std::move(viewport)));
+    auto strip = std::make_unique<Flex>();
+    strip->setParticipatesInLayout(false);
+    strip->setMirrorInRtl(false);
+    strip->setAlign(FlexAlign::Center);
+    strip->setGap(Style::spaceSm);
+    strip->setPadding(5.0F, Style::spaceSm);
+    m_strip = static_cast<Flex*>(m_viewport->addChild(std::move(strip)));
     const auto styleHeader = [](Button& button, ButtonContentAlign alignment) {
       auto headerPalette = Button::defaultPalette(ButtonVariant::Ghost);
       headerPalette.normal = {clearColorSpec(), clearColorSpec(), colorSpecFromRole(ColorRole::OnSurfaceVariant)};
@@ -77,6 +90,9 @@ namespace filemanager {
       header->setText(columnLabel(column));
       header->setVariant(ButtonVariant::Ghost);
       header->setOnClick([this, column] { setSortField(columnSortField(column)); });
+      header->setClipChildren(true);
+      header->label()->setFlexGrow(1.0F);
+      header->label()->setMaxLines(1);
       m_headers[index] = header.get();
       styleHeader(
           *header,
@@ -84,7 +100,7 @@ namespace filemanager {
       );
       header->setMinWidth(kMinimumFileColumns[column]);
       header->setMaxWidth(std::max(kMinimumFileColumns[column], m_listColumns[column]));
-      fileHeader->addChild(std::move(header));
+      m_strip->addChild(std::move(header));
     }
     const auto makeColumnMarker = [](ColorSpec color) {
       auto node = std::make_unique<Separator>();
@@ -101,14 +117,28 @@ namespace filemanager {
     for (auto& marker : m_markers) {
       auto node = makeColumnMarker(colorSpecFromRole(ColorRole::Primary, kResizeMarkerIdleOpacity));
       marker = node.get();
-      fileHeader->addChild(std::move(node));
+      m_strip->addChild(std::move(node));
     }
     auto dropMarker = makeColumnMarker(colorSpecFromRole(ColorRole::Primary));
     m_dropMarker = dropMarker.get();
     dropMarker->setZIndex(2);
     dropMarker->setVisible(false);
-    fileHeader->addChild(std::move(dropMarker));
+    m_strip->addChild(std::move(dropMarker));
     return fileHeader;
+  }
+
+  std::unique_ptr<Flex> FileListHeaderController::buildHorizontalScrollbar() {
+    auto track = std::make_unique<Flex>();
+    track->setMinHeight(14.0F);
+    track->setVisible(false);
+    track->setParticipatesInLayout(false);
+    m_horizontalTrack = track.get();
+    auto scrollbar = std::make_unique<Scrollbar>();
+    scrollbar->setOrientation(ScrollOrientation::Horizontal);
+    scrollbar->setParticipatesInLayout(false);
+    scrollbar->setOnScrollChanged([this](float offset) { setScrollOffset(offset); });
+    m_horizontalScrollbar = static_cast<Scrollbar*>(track->addChild(std::move(scrollbar)));
+    return track;
   }
 
   void FileListHeaderController::attachGrid(VirtualGridView* grid) { m_grid = grid; }
@@ -123,7 +153,11 @@ namespace filemanager {
     m_markers.fill(nullptr);
     m_dropMarker = nullptr;
     m_leftGutter = -1.0F;
-    m_rightGutter = -1.0F;
+    m_viewportWidth = 0.0F;
+    m_viewport = nullptr;
+    m_strip = nullptr;
+    m_horizontalTrack = nullptr;
+    m_horizontalScrollbar = nullptr;
   }
 
   void FileListHeaderController::ensureViewScaleLoaded() {
@@ -139,6 +173,9 @@ namespace filemanager {
     m_settings.loadListColumnWidths(m_preferredColumns, m_searchView);
     m_settings.loadListColumnLayout(m_columnLayout, m_searchView);
     m_listColumns = m_preferredColumns;
+    m_scrollOffset = 0.0F;
+    m_pendingFit.clear();
+    m_dividerClick.reset();
     updateColumnHeaders();
   }
 
@@ -150,8 +187,10 @@ namespace filemanager {
     m_viewScale = state.viewScale;
     m_viewScaleLoaded = true;
     if (m_searchView != search) {
+      m_savedViewOffsets[static_cast<std::size_t>(m_searchView)] = m_scrollOffset;
       m_searchView = search;
       reloadColumnPreferences();
+      m_scrollOffset = m_savedViewOffsets[static_cast<std::size_t>(search)];
     } else {
       updateColumnHeaders();
     }
@@ -198,11 +237,10 @@ namespace filemanager {
         auto text = std::string(columnLabel(column));
         if (selected)
           text += m_sortOrder == FileDialogSortOrder::Ascending ? "  ↑" : "  ↓";
-        header->setContentAlign(
-            column == FileColumn::Name || column == FileColumn::Type || (m_searchView && column == kSearchLocationSlot)
-                ? ButtonContentAlign::Start
-                : ButtonContentAlign::End
-        );
+        const bool left =
+            column == FileColumn::Name || column == FileColumn::Type || (m_searchView && column == kSearchLocationSlot);
+        header->setContentAlign(left ? ButtonContentAlign::Start : ButtonContentAlign::End);
+        header->label()->setTextAlign(left ? TextAlign::Start : TextAlign::End);
         header->setText(text);
         header->setSelected(selected);
       }
@@ -214,6 +252,8 @@ namespace filemanager {
       return;
     cancelGesture();
     m_gridMode = gridMode;
+    m_pendingFit.clear();
+    m_dividerClick.reset();
     if (m_callbacks.onViewStateChanged)
       m_callbacks.onViewStateChanged();
     updateColumnHeaders();
@@ -242,6 +282,10 @@ namespace filemanager {
     m_header->setVisible(showHeader);
     m_header->setParticipatesInLayout(showHeader);
     m_header->setExcludeSubtreeFromTabOrder(!showHeader);
+    if (!showHeader && m_horizontalTrack) {
+      m_horizontalTrack->setVisible(false);
+      m_horizontalTrack->setParticipatesInLayout(false);
+    }
     m_visibleColumns = m_gridMode ? std::vector<FileColumn>(kDefaultFileColumns.begin(), kDefaultFileColumns.end())
                                   : m_columnLayout.displayed();
     for (auto column : kFileColumns) {
@@ -253,7 +297,7 @@ namespace filemanager {
     }
     if (showHeader) {
       for (auto column : m_visibleColumns)
-        m_header->addChild(m_header->removeChild(m_headers[columnIndex(column)]));
+        m_strip->addChild(m_strip->removeChild(m_headers[columnIndex(column)]));
       applyColumnWidths();
       if (m_grid)
         m_grid->notifyDataChanged();
@@ -267,71 +311,171 @@ namespace filemanager {
       m_callbacks.onStatus("Unable to save file column layout");
   }
 
+  float FileListHeaderController::columnTextInset(FileColumn column) const {
+    if (column == FileColumn::Name)
+      return fileViewMetrics(m_viewScale).listIcon + Style::spaceSm;
+    return fileColumnTextInset(column == m_visibleColumns.back(), Style::spaceSm);
+  }
+
+  float FileListHeaderController::contentWidth() const {
+    return listContentWidth(m_listColumns, m_visibleColumns, Style::spaceSm);
+  }
+
+  float FileListHeaderController::stripOrigin() const {
+    float x = 0, y = 0;
+    if (m_header)
+      Node::absolutePosition(m_header, x, y);
+    return x + std::max(0.0F, m_leftGutter);
+  }
+
+  std::optional<FileColumn> FileListHeaderController::columnAt(float x) const {
+    const float local = x - stripOrigin();
+    if (m_gridMode || local < 0 || local >= availableWidth())
+      return std::nullopt;
+    for (auto column : m_visibleColumns) {
+      const auto bounds = listColumnBounds(column, m_listColumns, m_visibleColumns, Style::spaceSm, m_scrollOffset);
+      if (local >= bounds.left && local < bounds.right)
+        return column;
+    }
+    return std::nullopt;
+  }
+
+  void FileListHeaderController::setScrollOffset(float offset) {
+    offset = std::clamp(offset, 0.0F, std::max(0.0F, contentWidth() - availableWidth()));
+    if (offset == m_scrollOffset || gestureActive())
+      return;
+    m_scrollOffset = offset;
+    m_dividerClick.reset();
+    if (m_callbacks.onRequestLayout)
+      m_callbacks.onRequestLayout();
+  }
+
+  bool FileListHeaderController::scrollHorizontally(float delta) {
+    if (m_gridMode || contentWidth() <= availableWidth())
+      return false;
+    setScrollOffset(m_scrollOffset + delta);
+    return true;
+  }
+
+  bool FileListHeaderController::headerAt(float x, float y) const {
+    return m_header && !m_gridMode && m_header->containsScenePoint(x, y);
+  }
+
+  void FileListHeaderController::revealColumn(FileColumn column) {
+    if (m_gridMode || !std::ranges::contains(m_visibleColumns, column))
+      return;
+    const auto bounds = listColumnBounds(column, m_listColumns, m_visibleColumns, Style::spaceSm, m_scrollOffset);
+    if (bounds.left < 0.0F || bounds.right > availableWidth())
+      setScrollOffset(m_scrollOffset + bounds.left - Style::spaceSm);
+  }
+
   bool FileListHeaderController::applyColumnWidths() {
     if (!m_header || m_gridMode || m_visibleColumns.empty())
       return false;
     float leftGutter = 0.0F;
-    float rightGutter = 0.0F;
-    if (!m_gridMode && m_grid && m_grid->focusArea()->width() > 0.0F) {
+    float viewportWidth = m_header->width();
+    if (m_grid && m_grid->focusArea()->width() > 0.0F) {
       float headerX = 0.0F, headerY = 0.0F, rowX = 0.0F, rowY = 0.0F;
       Node::absolutePosition(m_header, headerX, headerY);
       Node::absolutePosition(m_grid->focusArea(), rowX, rowY);
       leftGutter = std::max(0.0F, rowX - headerX);
-      rightGutter = std::max(0.0F, m_header->width() - m_grid->focusArea()->width() - leftGutter);
+      viewportWidth = m_grid->focusArea()->width();
     }
-    const bool paddingChanged =
-        std::abs(leftGutter - m_leftGutter) > 0.5F || std::abs(rightGutter - m_rightGutter) > 0.5F;
-    if (paddingChanged) {
-      m_leftGutter = leftGutter;
-      m_rightGutter = rightGutter;
-      m_header->setPadding(5.0F, Style::spaceSm + rightGutter, 5.0F, Style::spaceSm + leftGutter);
+    const bool viewportChanged = m_leftGutter != leftGutter || m_viewportWidth != viewportWidth;
+    m_leftGutter = leftGutter;
+    m_viewportWidth = viewportWidth;
+    const auto widths = listDisplayWidths(
+        m_resizingColumn ? m_listColumns : m_preferredColumns, viewportWidth, m_visibleColumns, Style::spaceSm
+    );
+    const bool changed = widths.widths != m_listColumns.widths;
+    m_listColumns = widths;
+    if (!gestureActive())
+      m_scrollOffset = std::min(m_scrollOffset, std::max(0.0F, contentWidth() - viewportWidth));
+    const bool overflow = contentWidth() > viewportWidth + 0.5F;
+    const bool scrollbarChanged = m_horizontalTrack && m_horizontalTrack->visible() != overflow;
+    if (scrollbarChanged) {
+      m_horizontalTrack->setVisible(overflow);
+      m_horizontalTrack->setParticipatesInLayout(overflow);
     }
-    const auto fitted =
-        fitFileColumns(m_resizingColumn ? m_listColumns : m_preferredColumns, availableWidth(), m_visibleColumns);
-    bool changed = false;
-    bool textInsetChanged = false;
-    for (auto column : m_visibleColumns) {
+    for (const auto column : m_visibleColumns) {
       auto* header = m_headers[columnIndex(column)];
-      changed |= std::abs(fitted[column] - m_listColumns[column]) > 0.5F;
-      header->setMinWidth(fitted[column]);
-      header->setMaxWidth(fitted[column]);
+      header->setMinWidth(widths[column]);
+      header->setMaxWidth(widths[column]);
       const bool name = column == FileColumn::Name;
-      const float inset = name ? fileViewMetrics(m_viewScale).listIcon + Style::spaceSm
-                               : fileColumnTextInset(column == m_visibleColumns.back(), Style::spaceSm);
+      const float inset = columnTextInset(column);
       const bool onLeft = name != Style::rtl();
       const float left = onLeft ? inset : 0.0F;
       const float right = onLeft ? 0.0F : inset;
-      if (header->paddingLeft() != left || header->paddingRight() != right) {
+      if (header->paddingLeft() != left || header->paddingRight() != right)
         header->setPadding(0.0F, right, 0.0F, left);
-        textInsetChanged = true;
-      }
     }
-    m_listColumns = fitted;
-    if (changed && m_grid && !m_gridMode)
+    if (changed && m_grid)
       m_grid->notifyDataChanged();
-    return changed || paddingChanged || textInsetChanged;
+    return changed || viewportChanged || scrollbarChanged;
   }
 
   void FileListHeaderController::arrangeAfterWidthChange(Renderer& renderer) {
     if (!m_header || m_gridMode)
       return;
-    m_header->arrange(
-        renderer,
-        LayoutRect{.x = m_header->x(), .y = m_header->y(), .width = m_header->width(), .height = m_header->height()}
-    );
+    m_viewport->setSize(m_viewportWidth, m_header->height());
+    m_viewport->setPosition(std::max(0.0F, m_leftGutter), 0.0F);
+    const auto width = std::max(m_viewportWidth, contentWidth());
+    if (m_grid && m_strip->x() != -m_scrollOffset) {
+      m_grid->visitVisibleTiles([&](Node& tile, std::size_t) {
+        if (auto* row = dynamic_cast<FileEntryRow*>(&tile))
+          row->setColumnViewport(renderer, width, m_scrollOffset);
+      });
+    }
+    m_strip->setSize(width, m_header->height());
+    m_strip->setPosition(-m_scrollOffset, 0.0F);
+    m_strip->layout(renderer);
+    if (m_horizontalTrack && m_horizontalTrack->visible()) {
+      m_horizontalScrollbar->setPosition(std::max(0.0F, m_leftGutter), 0.0F);
+      m_horizontalScrollbar->setSize(m_viewportWidth, m_horizontalTrack->height());
+      m_horizontalScrollbar->update(m_viewportWidth, contentWidth(), m_scrollOffset);
+      m_horizontalScrollbar->layout(renderer);
+    }
   }
 
   void FileListHeaderController::positionColumnMarkers() {
     if (!m_header || m_gridMode)
       return;
-    const bool rtl = Style::rtl();
-    for (auto column : m_visibleColumns) {
-      auto* header = m_headers[columnIndex(column)];
-      const bool trailing = column == m_visibleColumns.back();
-      const float halfGap = trailing ? 0.0F : Style::spaceSm * 0.5F;
-      const float edge = rtl ? header->x() - halfGap : header->x() + header->width() + halfGap;
+    for (const auto column : m_visibleColumns) {
+      const auto bounds = listColumnBounds(column, m_listColumns, m_visibleColumns, Style::spaceSm);
+      const auto edge = bounds.right + (column == m_visibleColumns.back() ? 0.0F : Style::spaceSm * 0.5F);
       m_markers[columnIndex(column)]->setPosition(edge - 1.0F, (m_header->height() - 20.0F) * 0.5F);
     }
+  }
+
+  void FileListHeaderController::saveWidths() {
+    if (!m_settings.saveListColumnWidths(m_preferredColumns, m_searchView) && m_callbacks.onStatus)
+      m_callbacks.onStatus("Unable to save file column widths");
+  }
+
+  void FileListHeaderController::requestFit(std::optional<FileColumn> column) {
+    if (m_gridMode)
+      return;
+    m_pendingFit = column ? std::vector<FileColumn>{*column} : m_visibleColumns;
+    if (m_callbacks.onRequestLayout)
+      m_callbacks.onRequestLayout();
+  }
+
+  void FileListHeaderController::applyPendingFit(Renderer& renderer) {
+    if (m_pendingFit.empty() || m_gridMode || !m_callbacks.measureColumn)
+      return;
+    const auto columns = std::exchange(m_pendingFit, {});
+    if (m_preferredColumns[FileColumn::Name] == 0.0F)
+      m_preferredColumns[FileColumn::Name] = m_listColumns[FileColumn::Name];
+    for (const auto column : columns) {
+      if (!std::ranges::contains(m_visibleColumns, column))
+        continue;
+      const auto heading = std::string(columnLabel(column)) + "  ↑";
+      const auto headerWidth = renderer.measureText(heading, Style::fontSizeCaption).width;
+      const float inset = columnTextInset(column);
+      const auto width = std::max(headerWidth, m_callbacks.measureColumn(renderer, column)) + inset + Style::spaceSm;
+      m_preferredColumns[column] = listColumnWidth(column, std::ceil(width));
+    }
+    saveWidths();
   }
 
   void FileListHeaderController::layoutVisibleMarkers(Renderer& renderer) {
@@ -348,6 +492,7 @@ namespace filemanager {
 
   void FileListHeaderController::cancelGesture() {
     const auto resize = m_resizingColumn;
+    m_dividerPress.reset();
     m_resizingColumn.reset();
     if (resize && m_markers[columnIndex(*resize)])
       m_markers[columnIndex(*resize)]->setColor(colorSpecFromRole(ColorRole::Primary, kResizeMarkerIdleOpacity));
@@ -380,24 +525,26 @@ namespace filemanager {
     const bool leftButton = event.type == PointerEvent::Type::Button && event.button == BTN_LEFT;
     const bool motion = event.type == PointerEvent::Type::Motion;
     const bool leave = event.type == PointerEvent::Type::Leave;
-    const bool rtl = Style::rtl();
     float hx = 0.0F, hy = 0.0F;
     Node::absolutePosition(m_header, hx, hy);
-    const bool inHeader = !leave && y >= hy - 2.0F && y <= hy + m_header->height() + 2.0F;
-    const float available = availableWidth();
+    const auto origin = stripOrigin();
+    const float columnX = x - origin + m_scrollOffset;
+    const bool inHeader =
+        !leave && x >= origin && x < origin + availableWidth() && y >= hy && y < hy + m_header->height();
+    const bool inHeaderArea = !leave && x >= hx && x < hx + m_header->width() && y >= hy && y < hy + m_header->height();
     if (m_resizingColumn) {
       const auto column = *m_resizingColumn;
       if (leave) {
+        m_dividerPress.reset();
         cancelGesture();
         return true;
       }
       if (pointerSerial)
         m_wayland.setCursorShape(pointerSerial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE);
-      const bool flexibleName = m_preferredColumns[FileColumn::Name] <= 0.0F;
       if (motion) {
-        const float delta = rtl ? m_dragX - x : x - m_dragX;
-        m_listColumns =
-            resizeFileColumnBoundary(m_columnStart, column, delta, available, m_visibleColumns, flexibleName);
+        if (std::abs(x - m_dragX) > 2.0F)
+          m_dividerPress.reset();
+        m_listColumns[column] = listColumnWidth(column, m_columnStart[column] + x - m_dragX);
         applyColumnWidths();
         if (m_grid)
           m_grid->notifyDataChanged();
@@ -406,21 +553,20 @@ namespace filemanager {
         return true;
       }
       if (leftButton && !event.pressed) {
-        if (available >= fileColumnTotal(kMinimumFileColumns, m_visibleColumns)
-            && m_listColumns[column] != m_columnStart[column]) {
-          const bool keepNameFlexible =
-              flexibleName && column != FileColumn::Name && hasOptionalFileColumns(m_visibleColumns);
-          for (auto visible : m_visibleColumns)
-            if (!keepNameFlexible || visible != FileColumn::Name)
-              m_preferredColumns[visible] = m_listColumns[visible];
-          if (!m_settings.saveListColumnWidths(m_preferredColumns, m_searchView) && m_callbacks.onStatus)
-            m_callbacks.onStatus("Unable to save file column widths");
+        if (m_dividerPress) {
+          m_dividerClick = *m_dividerPress;
+        } else if (m_listColumns[column] != m_columnStart[column]) {
+          if (m_preferredColumns[FileColumn::Name] == 0.0F)
+            m_preferredColumns[FileColumn::Name] = m_columnStart[FileColumn::Name];
+          m_preferredColumns[column] = m_listColumns[column];
+          saveWidths();
         }
+        m_dividerPress.reset();
         cancelGesture();
         m_dispatcher.cancelPointerCapture();
         return true;
       }
-      return false;
+      return true;
     }
 
     if (m_columnDrag) {
@@ -451,18 +597,17 @@ namespace filemanager {
           );
         }
 
-        float edge = x - hx;
+        float edge = columnX;
         std::size_t destination = 0;
-        for (auto column : m_visibleColumns) {
+        for (const auto column : m_visibleColumns) {
           if (column == drag.column)
             continue;
-          const auto* header = m_headers[columnIndex(column)];
-          const float center = hx + header->x() + header->width() * 0.5F;
-          if (rtl ? x > center : x < center) {
-            edge = rtl ? header->x() + header->width() + Style::spaceSm * 0.5F : header->x() - Style::spaceSm * 0.5F;
+          const auto bounds = listColumnBounds(column, m_listColumns, m_visibleColumns, Style::spaceSm);
+          if (columnX < (bounds.left + bounds.right) * 0.5F) {
+            edge = bounds.left - Style::spaceSm * 0.5F;
             break;
           }
-          edge = m_markers[columnIndex(column)]->x() + 1.0F;
+          edge = bounds.right + Style::spaceSm * 0.5F;
           ++destination;
         }
         drag.destination = destination;
@@ -478,12 +623,21 @@ namespace filemanager {
     }
 
     std::optional<FileColumn> boundary;
-    if (inHeader && available >= fileColumnTotal(kMinimumFileColumns, m_visibleColumns))
-      for (auto column : m_visibleColumns)
-        if (std::abs(x - (hx + m_markers[columnIndex(column)]->x() + 1.0F)) <= 6.0F) {
+    if (inHeader) {
+      for (const auto column : m_visibleColumns) {
+        const auto bounds = listColumnBounds(column, m_listColumns, m_visibleColumns, Style::spaceSm);
+        const auto edge = bounds.right + (column == m_visibleColumns.back() ? 0.0F : Style::spaceSm * 0.5F);
+        if (std::abs(columnX - edge) <= 6.0F) {
           boundary = column;
           break;
         }
+      }
+    }
+    if (inHeaderArea && event.type == PointerEvent::Type::Button && event.button == BTN_RIGHT && event.pressed) {
+      if (m_callbacks.openHeaderMenu)
+        m_callbacks.openHeaderMenu(boundary ? boundary : columnAt(x), x, y);
+      return true;
+    }
     if ((motion || leave || event.type == PointerEvent::Type::Enter) && m_hoverBoundary != boundary) {
       if (m_hoverBoundary)
         m_markers[columnIndex(*m_hoverBoundary)]->setColor(
@@ -497,6 +651,16 @@ namespace filemanager {
     }
     if (boundary && leftButton && event.pressed) {
       m_dispatcher.cancelPointerCapture();
+      if (m_dividerClick
+          && m_dividerClick->column == *boundary
+          && event.time - m_dividerClick->time <= 500U
+          && std::abs(x - m_dividerClick->x) <= 6.0F) {
+        requestFit(*boundary);
+        m_dividerClick.reset();
+        return true;
+      }
+      m_dividerClick.reset();
+      m_dividerPress = DividerClick{*boundary, event.time, x};
       m_resizingColumn = boundary;
       m_dragX = x;
       m_columnStart = m_listColumns;
@@ -509,23 +673,16 @@ namespace filemanager {
         m_wayland.setCursorShape(pointerSerial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE);
       return true;
     }
-    if (leftButton && event.pressed && inHeader && m_visibleColumns.size() > 1)
-      for (auto column : m_visibleColumns)
-        if (m_headers[columnIndex(column)]->containsScenePoint(x, y)) {
-          m_columnDrag = ColumnDrag{column, x, y, std::nullopt};
-          break;
-        }
+    if (leftButton && event.pressed) {
+      m_dividerClick.reset();
+      if (inHeader) {
+        if (const auto column = columnAt(x))
+          m_columnDrag = ColumnDrag{*column, x, y, std::nullopt};
+      }
+    }
     return false;
   }
 
-  float FileListHeaderController::availableWidth() const {
-    if (!m_header || m_visibleColumns.empty())
-      return 0.0F;
-    // The list's focus plane shares the resolved row width, including the scrollbar gutter.
-    const float rowWidth =
-        m_grid && !m_gridMode && m_grid->focusArea()->width() > 0.0F ? m_grid->focusArea()->width() : m_header->width();
-    const float spacing = static_cast<float>(m_visibleColumns.size() + 1) * Style::spaceSm;
-    return std::max(0.0F, rowWidth - spacing);
-  }
+  float FileListHeaderController::availableWidth() const { return m_viewportWidth; }
 
 } // namespace filemanager

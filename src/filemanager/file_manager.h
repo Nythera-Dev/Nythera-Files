@@ -227,6 +227,7 @@ private:
   void rebuildBreadcrumbs();
   void buildSearchBar(Flex& pane);
   void focusSearch();
+  void toggleSearch();
   void closeSearch();
   void resetSearchSelection();
   void syncSearchUi();
@@ -234,6 +235,18 @@ private:
   void loadSearchView();
   void configureSearchBackend(filemanager::DirectorySession& session);
   void openSearchModeMenu();
+  void openSearchScopeMenu();
+  void toggleSearchOption(bool filemanager::SearchOptions::* option);
+  void updateSearchScopeWidth(float paneWidth);
+  void syncSearchScopeButton();
+  bool activateSearchScopeEntry(const ContextMenuControlEntry& entry);
+  void selectSearchScope(filemanager::SearchSelection selection);
+  void refreshSearchSettings(const filemanager::SearchSettings& previous);
+  void editCustomSearch(std::optional<filemanager::CustomSearch> profile, std::function<void()> refreshParent = {});
+  [[nodiscard]] filemanager::ModalDialogHost& activeModalDialog() {
+    return m_customSearchChild.isOpen() ? m_customSearchChild : m_modalDialog;
+  }
+  void manageCustomSearches();
   void selectSearchMode(filemanager::SearchMode mode);
   void updateSearchThumbnails(Renderer& renderer);
   void updateSearchFolderCounts();
@@ -253,6 +266,10 @@ private:
   [[nodiscard]] bool handleFileViewSpaceSelection(std::uint32_t mods);
   [[nodiscard]] bool handleFileViewTypeahead(std::uint32_t utf32);
   [[nodiscard]] bool handleSidebarKeyboardNavigation(std::uint32_t sym, std::uint32_t mods);
+  void openFileColumnMenu(std::optional<filemanager::FileColumn> column, float x, float y);
+  [[nodiscard]] float measureFileColumn(Renderer& renderer, filemanager::FileColumn column) const;
+  [[nodiscard]] std::string fileColumnText(const FileEntry& entry, filemanager::FileColumn column) const;
+
   void openLocationContextMenu(float x, float y, bool highlightOnOpen);
   void openFocusedContextMenu();
   void syncProgressWindow();
@@ -330,6 +347,7 @@ private:
   filemanager::ProgressWindow m_progressWindow{
       m_wayland, m_renderContext, m_operations, [this](ToplevelSurface* parent) { requestQuit(parent); }
   };
+  std::function<void()> m_refreshSearchProfileList;
   filemanager::ModalDialogHost m_modalDialog{
       m_wayland,
       m_renderContext,
@@ -343,6 +361,7 @@ private:
           .setStatus = [this](std::string text) { setStatus(std::move(text)); },
       },
   };
+  filemanager::ModalDialogHost m_customSearchChild{m_wayland, m_renderContext, m_settings, {}};
   filemanager::ChecksumDialogController m_checksumDialog{
       m_modalDialog,
       m_transfer,
@@ -420,6 +439,12 @@ private:
               },
           .canAdjustScale = [this] { return !m_renamePath; },
           .pointerSerial = [this] { return m_pointerSerial; },
+          .measureColumn = [this](
+                               Renderer& renderer, filemanager::FileColumn column
+                           ) { return measureFileColumn(renderer, column); },
+          .openHeaderMenu = [this](
+                                std::optional<filemanager::FileColumn> column, float x, float y
+                            ) { openFileColumnMenu(column, x, y); },
       },
   };
   filemanager::PlacesSidebarController m_places{
@@ -507,6 +532,8 @@ private:
   Label* m_searchStatus = nullptr;
   Button* m_searchButton = nullptr;
   Button* m_searchModeButton = nullptr;
+  Button* m_searchScopeButton = nullptr;
+  bool m_compactSearchScope = false;
   filemanager::TabId m_searchUiTab = filemanager::kInvalidTabId;
   Label* m_statusLabel = nullptr;
   Label* m_statusDetailLabel = nullptr;
@@ -551,6 +578,8 @@ private:
   std::string m_typeaheadQuery;
   std::chrono::steady_clock::time_point m_typeaheadLastTime{};
   std::optional<std::size_t> m_lastPointerIndex;
+  std::optional<filemanager::FileColumn> m_hoveredFileColumn;
+  std::optional<float> m_filePointerX;
   std::uint32_t m_lastPointerClickTime = 0;
   std::uint32_t m_pointerClickTime = 0;
   bool m_running = true;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/timer_manager.h"
 #include "filemanager/file_operation_manager.h"
 #include "render/scene/input_dispatcher.h"
 #include "wayland/toplevel_surface.h"
@@ -74,10 +75,13 @@ namespace filemanager {
       std::function<void()> onDismiss;
       bool useMeasuredMinHeight = false;
       bool fillContent = false;
+      bool usePreferredInitialHeight = false;
+      bool hoverTooltips = false;
       std::uint32_t preferredWidth = 0;
       std::uint32_t preferredHeight = 0;
       std::uint32_t minWidth = 0;
       std::uint32_t minHeight = 0;
+      std::string sizeStateKey;
     };
 
     struct Callbacks {
@@ -127,6 +131,10 @@ namespace filemanager {
     [[nodiscard]] static std::string sanitizeConflictDisplayText(std::string_view text);
 
     [[nodiscard]] bool isOpen() const noexcept { return m_surface != nullptr; }
+    [[nodiscard]] bool hoverTooltipsEnabled() const noexcept {
+      return m_surface && !m_closeQueued && m_customContent && m_customContent->hoverTooltips;
+    }
+    [[nodiscard]] bool pointerCaptured() const noexcept { return m_dispatcher.pointerCaptured(); }
     [[nodiscard]] bool closeQueued() const noexcept { return m_closeQueued; }
     [[nodiscard]] bool backgroundConflictPending() const noexcept { return m_backgroundConflictPending; }
     [[nodiscard]] ToplevelSurface* surface() const noexcept { return m_surface.get(); }
@@ -138,6 +146,11 @@ namespace filemanager {
   private:
     friend class ::FileManagerTestAccess;
 
+    void recordConfiguredSize(std::uint32_t width, std::uint32_t height);
+    void savePendingDialogSize();
+    using DialogSize = std::pair<std::uint32_t, std::uint32_t>;
+    static std::uint32_t
+    initialExtent(std::uint32_t saved, std::uint32_t fallback, std::uint32_t minimum, std::uint32_t available);
     void buildDialog(float dialogWidth);
     void prepareFrame(bool needsUpdate, bool needsLayout);
     [[nodiscard]] bool submitSymlinkDialog();
@@ -159,6 +172,9 @@ namespace filemanager {
     std::string m_sizeStateKey;
     std::uint32_t m_preferredWidth = 0;
     std::uint32_t m_preferredHeight = 0;
+    std::optional<DialogSize> m_configuredDialogSize;
+    std::optional<DialogSize> m_pendingDialogSize;
+    Timer m_dialogSizeSave;
     std::array<InputArea*, 8> m_resizeEdges{};
     InputArea* m_moveHandle = nullptr;
     Flex* m_titleRow = nullptr;
@@ -171,6 +187,8 @@ namespace filemanager {
     std::optional<ConflictDialogData> m_conflict;
     std::shared_ptr<void> m_conflictRequest;
     std::shared_ptr<std::timed_mutex> m_conflictMutex = std::make_shared<std::timed_mutex>();
+    // Allows headless tests to exercise dialog contents, parenting and responses.
+    std::function<void(ToplevelSurface&, ToplevelSurface*, DialogSize)> m_presentToplevelForTest;
     std::function<bool(const ConflictDialogData&, bool hasRemaining, std::function<void(int, std::string)>)>
         m_conflictDialogHook;
     std::vector<std::pair<std::string, int>> m_choices;

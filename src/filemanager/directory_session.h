@@ -98,6 +98,17 @@ namespace filemanager {
     void setSearchQuery(std::string query);
     void configureSearchBackend(std::string executable, SearchMode defaultMode);
     void setSearchMode(SearchMode mode);
+    void configureSearchScope(
+        SearchSelection selection, std::optional<CustomSearch> profile, SearchLocations excluded,
+        SearchOptions standard = {}
+    );
+    [[nodiscard]] SearchOptions searchOptions() const noexcept {
+      return m_searchProfile ? m_searchProfile->options : m_standardSearchOptions;
+    }
+    [[nodiscard]] bool displayedHiddenItems() const noexcept {
+      return m_search.active() ? searchOptions().showHidden : m_showHidden;
+    }
+    [[nodiscard]] const SearchSelection& searchSelection() const noexcept { return m_searchSelection; }
     [[nodiscard]] SearchMode searchMode() const;
     [[nodiscard]] bool fzfSearchActive() const { return !m_fzfExecutable.empty() && !m_search.usingFallback(); }
     void submitSearch() { m_search.submit(); }
@@ -108,6 +119,7 @@ namespace filemanager {
     [[nodiscard]] const FileSearchSession& search() const noexcept { return m_search; }
 
     [[nodiscard]] std::optional<std::uint64_t> folderItemCount(const FileEntry& entry);
+    [[nodiscard]] std::optional<std::uint64_t> cachedFolderItemCount(const FileEntry& entry) const;
     void updateVisibleSearchFolders(std::unordered_map<std::string, std::size_t> visible);
     void clearFolderCounts();
 
@@ -192,6 +204,10 @@ namespace filemanager {
     std::string m_fzfExecutable;
     SearchMode m_defaultSearchMode = SearchMode::Contiguous;
     SearchMode m_selectedSearchMode = SearchMode::Contiguous;
+    SearchSelection m_searchSelection;
+    SearchOptions m_standardSearchOptions;
+    std::optional<CustomSearch> m_searchProfile;
+    SearchLocations m_globalSearchExclusions;
     bool m_searchOpen = false;
 
     std::unordered_map<std::string, FolderCount> m_folderCounts;

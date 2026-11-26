@@ -233,6 +233,51 @@ namespace {
     TEST_CHECK(!fs::exists(root / "config.toml"));
   }
 
+  void searchSettingsPersistence() {
+    using namespace filemanager;
+    const nythera::test::ScopedTestEnv env({.prefix = "files-search-settings", .setXdgDirs = true});
+    ConfigService shell(ConfigService::SettingsAccess::InheritanceOnly);
+    const auto dir = env.config() / "test-files";
+    const auto state = env.state() / "test-files" / "state.toml";
+    const auto location = dir / "search/config.toml";
+    const CustomSearch original{"Projects", {"/", "/home/me/projects"}, {"/var/cache"}, true};
+    FileManagerSettings settings(shell, dir, state);
+    TEST_CHECK(settings.searchSettings() == SearchSettings{});
+    TEST_CHECK(settings.saveSearchExclusions({"/home/me/private"}));
+    TEST_CHECK(settings.editCustomSearch(std::nullopt, original));
+    TEST_CHECK(!settings.editCustomSearch(std::nullopt, original));
+    TEST_CHECK(!settings.editCustomSearch(std::nullopt, CustomSearch{" ", {"/"}}));
+    TEST_CHECK(!settings.editCustomSearch(std::nullopt, CustomSearch{"Empty", {}}));
+    TEST_CHECK(!settings.editCustomSearch(std::nullopt, CustomSearch{"Relative", {"relative"}}));
+    int updates = 0;
+    settings.setSearchReloadCallback([&](const SearchSettings&) { ++updates; });
+    auto renamed = original;
+    renamed.name = "Work";
+    renamed.included = {"/home/me/projects"};
+    TEST_CHECK(settings.editCustomSearch(original, renamed));
+    renamed.includeMounts = false;
+    TEST_CHECK(updates == 1);
+    FileManagerSettings reopened(shell, dir, state);
+    TEST_CHECK(reopened.searchSettings().profiles.size() == 1);
+    TEST_CHECK(reopened.searchSettings().profiles.front() == renamed);
+    TEST_CHECK(reopened.searchSettings().exclusions == SearchLocations{"/home/me/private"});
+    TEST_CHECK(!reopened.editCustomSearch(original, std::nullopt));
+    TEST_CHECK(reopened.editCustomSearch(renamed, std::nullopt));
+    TEST_CHECK(settings.reload() && updates == 2 && settings.searchSettings().profiles.empty());
+
+    write(location, "exclusions = ['/new/private']\n");
+    drain(settings);
+    TEST_CHECK(updates == 3 && settings.searchSettings().exclusions == SearchLocations{"/new/private"});
+    write(location, "exclusions = ['relative']\n");
+    TEST_CHECK(!settings.reload());
+    TEST_CHECK(settings.searchSettings().exclusions == SearchLocations{"/new/private"});
+    write(location, "exclusions = ['/new/private']\n");
+    write(dir / "config.toml", "[files]\nfzf_search = 'invalid'\n");
+    TEST_CHECK(!settings.reload());
+    TEST_CHECK(settings.editCustomSearch(std::nullopt, original));
+    TEST_CHECK(settings.searchSettings().profiles.front() == original);
+  }
+
   void sharedThemeInheritanceAndStandaloneFallback() {
     const nythera::test::ScopedTestEnv env({.prefix = "files-shared-theme"});
     const auto nytheraDir = env.config() / "nythera";
@@ -343,6 +388,7 @@ int main() {
     separationAndInheritance();
     includesAndLiveUpdates();
     validatesWholeCandidate();
+    searchSettingsPersistence();
     sharedThemeInheritanceAndStandaloneFallback();
   });
 }
