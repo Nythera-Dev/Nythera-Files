@@ -2,6 +2,8 @@
 
 #include "core/files/display_text.h"
 #include "filemanager/file_columns.h"
+#include "render/core/renderer.h"
+#include "ui/style.h"
 
 #include <filesystem>
 #include <optional>
@@ -12,8 +14,19 @@ namespace filemanager {
     return sanitizeFilenameForDisplay(path.parent_path().native());
   }
 
+  inline float measureListColumnText(Renderer& renderer, FileColumn column, bool searchView, std::string_view text) {
+    const float fontSize =
+        column == FileColumn::Name ? Style::fontSizeBody : Style::fontSizeCaption + kMetadataFontSizeIncrease;
+    TextFont font;
+    if (fileColumnUsesTabularNumerals(column, searchView))
+      font.features = "tnum";
+    return renderer.measureText(text, fontSize, font).width;
+  }
+
   inline float listColumnWidth(FileColumn column, float width) {
-    return std::clamp(width, kMinimumFileColumns[column], 10000.0F);
+    // Leave room for the resize handle and an ellipsis, plus artwork in Name.
+    const float minimum = column == FileColumn::Name ? 80.0F : 32.0F;
+    return std::clamp(width, minimum, 10000.0F);
   }
 
   inline float listContentWidth(const FileColumns& widths, std::span<const FileColumn> visible, float gap) {

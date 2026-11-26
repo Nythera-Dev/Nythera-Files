@@ -1,4 +1,4 @@
-#include "filemanager/file_columns.h"
+#include "filemanager/file_list_columns.h"
 
 #include <cmath>
 #include <iostream>
@@ -39,6 +39,13 @@ int main() {
   ok &= expect(limited[FileColumn::Modified] == defaults[FileColumn::Modified], "Size resize changed Modified");
   const auto nameLimited = resizeFileColumnBoundary(defaults, FileColumn::Name, -10000.0F, 600.0F);
   ok &= expect(nameLimited[FileColumn::Name] == kMinimumFileColumns[FileColumn::Name], "Name width fell below minimum");
+  const FileColumns compactPreferred{{80.0F, 32.0F, 40.0F, 144.0F, 152.0F, 152.0F}};
+  const auto compactList = listDisplayWidths(compactPreferred, 80.0F, kDefaultFileColumns, 6.0F);
+  ok &= expect(compactList.widths == compactPreferred.widths, "compact list columns did not retain their saved widths");
+  for (const auto column : kDefaultFileColumns) {
+    const float minimum = listColumnWidth(column, 0.0F);
+    ok &= expect(minimum > 0.0F && minimum < kMinimumFileColumns[column], "list has no smaller structural minimum");
+  }
   const auto narrow = fitFileColumns({}, 180.0F);
   ok &= expect(narrow[FileColumn::Name] >= 0.0F && narrow[FileColumn::Size] >= 0.0F && narrow[FileColumn::Modified] >= 0.0F, "narrow columns became negative");
   ok &= expect(
