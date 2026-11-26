@@ -66,11 +66,13 @@ namespace filemanager {
     inline constexpr int kAlwaysShowTabBar = 30014;
     inline constexpr int kOpenTabsInBackground = 30015;
     inline constexpr int kFileOpenInNewTab = 30016;
+    inline constexpr int kOpenContainingFolder = 30017;
     inline constexpr int kTabContextNew = 30020;
     inline constexpr int kTabContextDuplicate = 30021;
     inline constexpr int kTabContextClose = 30022;
     inline constexpr int kTabContextCloseOthers = 30023;
     inline constexpr int kTabContextCloseRight = 30024;
+    inline constexpr int kFirstSearchMode = 30030;
     inline constexpr int kCompactToolsMenu = 30100;
     inline constexpr int kFirstToolMenuRow = 30101;
     inline constexpr int kActAsAdministrator = 30150;
@@ -181,6 +183,7 @@ namespace filemanager {
 
     [[nodiscard]] std::vector<std::string> externalToolTargets(external_tools::Tool tool) const;
     void persistApplicationMenuPreference();
+    void showApplicationChooser(std::string mime);
 
     WaylandConnection& m_wayland;
     RenderContext& m_renderContext;
@@ -217,6 +220,7 @@ namespace filemanager {
     std::vector<std::pair<external_tools::Tool, external_tools::Choice>> m_externalTools;
     std::vector<std::shared_ptr<GAppInfo>> m_applicationChooserApps;
     std::string m_applicationChooserMime;
+    std::shared_ptr<GCancellable> m_applicationMimeRequest;
   };
 
 } // namespace filemanager

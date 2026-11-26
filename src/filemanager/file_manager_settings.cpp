@@ -361,31 +361,36 @@ namespace filemanager {
 
   bool FileManagerSettings::reset(const ConfigKeyPath& path) { return save({{path, std::nullopt}}); }
 
-  FileViewSettings FileManagerSettings::loadFileView() const {
+  FileViewSettings FileManagerSettings::loadFileView(bool search) const {
     const auto files = m_preferences["files"];
     return {
-        .gridMode = files["grid_view"].value_or(false),
+        .gridMode = files[search ? "search_grid_view" : "grid_view"].value_or(false),
         .showHidden = files["show_hidden"].value_or(false),
         .foldersFirst = files["folders_first"].value_or(true),
         .hiddenLast = files["hidden_last"].value_or(true),
-        .sortField = static_cast<FileDialogSortField>(files["sort_field"].value_or(std::int64_t{0})),
-        .sortOrder =
-            files["sort_descending"].value_or(false) ? FileDialogSortOrder::Descending : FileDialogSortOrder::Ascending,
+        .sortField = static_cast<FileDialogSortField>(
+            files[search ? "search_sort_field" : "sort_field"].value_or(std::int64_t{0})
+        ),
+        .sortOrder = files[search ? "search_sort_descending" : "sort_descending"].value_or(false)
+            ? FileDialogSortOrder::Descending
+            : FileDialogSortOrder::Ascending,
     };
   }
 
-  bool FileManagerSettings::saveFileView(const FileViewSettings& settings, const FileViewSettings& previous) {
+  bool
+  FileManagerSettings::saveFileView(const FileViewSettings& settings, const FileViewSettings& previous, bool search) {
     std::vector<Change> changes;
     const auto add = [&]<typename T>(std::string key, T next, T old) {
       if (next != old)
         changes.emplace_back(ConfigKeyPath{"files", std::move(key)}, literal(next));
     };
-    add("grid_view", settings.gridMode, previous.gridMode);
+    add(search ? "search_grid_view" : "grid_view", settings.gridMode, previous.gridMode);
     add("show_hidden", settings.showHidden, previous.showHidden);
     add("folders_first", settings.foldersFirst, previous.foldersFirst);
     add("hidden_last", settings.hiddenLast, previous.hiddenLast);
-    add("sort_field", static_cast<std::int64_t>(settings.sortField), static_cast<std::int64_t>(previous.sortField));
-    add("sort_descending", settings.sortOrder == FileDialogSortOrder::Descending,
+    add(search ? "search_sort_field" : "sort_field", static_cast<std::int64_t>(settings.sortField),
+        static_cast<std::int64_t>(previous.sortField));
+    add(search ? "search_sort_descending" : "sort_descending", settings.sortOrder == FileDialogSortOrder::Descending,
         previous.sortOrder == FileDialogSortOrder::Descending);
     return save(std::move(changes));
   }
@@ -424,30 +429,42 @@ namespace filemanager {
     return save({{{"files", "admin_inactivity_timeout_seconds"}, literal(static_cast<std::int64_t>(seconds))}});
   }
 
-  void FileManagerSettings::loadListColumnWidths(FileColumns& out) const {
-    if (const auto widths = m_preferences["files"]["list_column_widths"].value_exact<std::string_view>())
+  void FileManagerSettings::loadListColumnWidths(FileColumns& out, bool search) const {
+    if (const auto widths = m_preferences["files"][search ? "search_column_widths" : "list_column_widths"]
+                                .value_exact<std::string_view>())
       parseFileColumns(*widths, out);
   }
 
-  bool FileManagerSettings::saveListColumnWidths(const FileColumns& columns) {
-    return save({{{"files", "list_column_widths"}, literal(serializeFileColumns(columns))}});
+  bool FileManagerSettings::saveListColumnWidths(const FileColumns& columns, bool search) {
+    return save(
+        {{{"files", search ? "search_column_widths" : "list_column_widths"}, literal(serializeFileColumns(columns))}}
+    );
   }
 
-  void FileManagerSettings::loadListColumnLayout(FileColumnLayout& out) const {
-    if (const auto columns = m_preferences["files"]["list_column_layout"].value_exact<std::string_view>())
+  void FileManagerSettings::loadListColumnLayout(FileColumnLayout& out, bool search) const {
+    const auto columns =
+        m_preferences["files"][search ? "search_column_layout" : "list_column_layout"].value_exact<std::string_view>();
+    if (!columns)
+      return;
+    if (search)
+      parseSearchFileColumnLayout(*columns, out);
+    else
       parseFileColumnLayout(*columns, out);
   }
 
-  bool FileManagerSettings::saveListColumnLayout(const FileColumnLayout& layout) {
-    return save({{{"files", "list_column_layout"}, literal(serializeFileColumnLayout(layout))}});
+  bool FileManagerSettings::saveListColumnLayout(const FileColumnLayout& layout, bool search) {
+    const auto text = search ? serializeSearchFileColumnLayout(layout) : serializeFileColumnLayout(layout);
+    return save({{{"files", search ? "search_column_layout" : "list_column_layout"}, literal(text)}});
   }
 
-  float FileManagerSettings::loadViewScale(float defaultScale) const {
-    return static_cast<float>(m_preferences["files"]["view_scale"].value_or(static_cast<double>(defaultScale)));
+  float FileManagerSettings::loadViewScale(float defaultScale, bool search) const {
+    return static_cast<float>(
+        m_preferences["files"][search ? "search_view_scale" : "view_scale"].value_or(static_cast<double>(defaultScale))
+    );
   }
 
-  bool FileManagerSettings::saveViewScale(float scale) {
-    return save({{{"files", "view_scale"}, std::format("{:.6f}", scale)}});
+  bool FileManagerSettings::saveViewScale(float scale, bool search) {
+    return save({{{"files", search ? "search_view_scale" : "view_scale"}, std::format("{:.6f}", scale)}});
   }
 
   float FileManagerSettings::loadSidebarWidth(float defaultWidth, float minWidth, float maxWidth) const {

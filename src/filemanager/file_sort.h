@@ -58,6 +58,9 @@ namespace filemanager {
       rhsHasValue = rhs.hasAccessed;
       comparison = lhs.accessed < rhs.accessed ? -1 : (lhs.accessed > rhs.accessed ? 1 : 0);
       break;
+    case FileDialogSortField::Location:
+      comparison = lhs.absPath.parent_path().compare(rhs.absPath.parent_path());
+      break;
     case FileDialogSortField::Type: {
       lhsHasValue = !lhs.type.empty();
       rhsHasValue = !rhs.type.empty();

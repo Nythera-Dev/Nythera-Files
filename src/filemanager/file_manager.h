@@ -22,6 +22,7 @@
 #include "filemanager/places_model.h"
 #include "filemanager/places_sidebar.h"
 #include "filemanager/properties_window.h"
+#include "filemanager/search_thumbnails.h"
 #include "filemanager/tab_bar_controller.h"
 #include "filemanager/tab_manager.h"
 #include "net/http_client.h"
@@ -115,9 +116,8 @@ private:
   void updateWindowTitle();
   [[nodiscard]] std::unique_ptr<Flex> buildHeaderAppBar();
   void updateAdminHeaderUi(int surfaceWidth = 0);
-  bool enterAdministratorMode(
-      filemanager::TabId tabId, std::optional<std::filesystem::path> targetDirectory = std::nullopt
-  );
+  bool
+  enterAdministratorMode(filemanager::TabId tabId, std::optional<std::filesystem::path> targetDirectory = std::nullopt);
   void finishAdministratorMode(filemanager::TabId tabId, std::string statusMessage = {});
   void recordAdminTabUserActivity(filemanager::BrowserTab& tab);
   [[nodiscard]] filemanager::TabManager::Callbacks makeTabManagerCallbacks();
@@ -204,8 +204,10 @@ private:
   std::function<bool()> requestProtectedCopy(
       filemanager::BrowserTab& tab, const std::filesystem::path& path, ProtectedCopyReady ready, bool thumbnail = false
   );
-  void openProtectedFile(filemanager::TabId tabId, const std::filesystem::path& path,
-                         std::function<void(const std::filesystem::path&)> launch);
+  void openProtectedFile(
+      filemanager::TabId tabId, const std::filesystem::path& path,
+      std::function<void(const std::filesystem::path&)> launch
+  );
   void saveProtectedChanges(const std::filesystem::path& path);
   void launchFileUri(filemanager::TabId tab, GFile* file, std::string success = {});
   struct ProtectedThumbnail {
@@ -220,8 +222,22 @@ private:
   bool m_protectedThumbnailPending = false;
   Timer m_protectedThumbnailRetry;
   void clearProtectedThumbnails();
-  std::optional<std::string> protectedThumbnailPath(filemanager::BrowserTab& tab, const FileEntry& entry, std::size_t index);
+  std::optional<std::string>
+  protectedThumbnailPath(filemanager::BrowserTab& tab, const FileEntry& entry, std::size_t index);
   void rebuildBreadcrumbs();
+  void buildSearchBar(Flex& pane);
+  void focusSearch();
+  void closeSearch();
+  void resetSearchSelection();
+  void syncSearchUi();
+  void applyActiveView();
+  void loadSearchView();
+  void configureSearchBackend(filemanager::DirectorySession& session);
+  void openSearchModeMenu();
+  void selectSearchMode(filemanager::SearchMode mode);
+  void updateSearchThumbnails(Renderer& renderer);
+  void updateSearchFolderCounts();
+  void releaseSearchThumbnails();
   void setLocationEditMode(bool editing, bool preserveOutsideClickFocus = false);
   void deferCancelLocationEdit();
   void pasteLocationFromClipboard();
@@ -257,6 +273,7 @@ private:
   void querySelectionInfoAsync(const std::filesystem::path& path) { activeTab().querySelectionInfoAsync(path); }
   [[nodiscard]] bool currentDirectoryWritable() const { return activeSession().currentDirectoryWritable(); }
   [[nodiscard]] std::vector<std::string> selectedPaths() const { return activeTab().selectedPathsOrdered(); }
+  [[nodiscard]] std::vector<std::string> selectedOperationPaths() const;
   [[nodiscard]] std::optional<std::pair<std::filesystem::path, bool>> symlinkSelection() const {
     return activeTab().symlinkSelection();
   }
@@ -301,6 +318,10 @@ private:
   GioPollSource m_gioPollSource;
   FileOperationManager m_operations;
   ThumbnailService m_pickerThumbnails;
+  filemanager::SearchThumbnails m_searchThumbnails{m_pickerThumbnails, [this] {
+                                                     if (m_surface)
+                                                       m_surface->requestUpdate();
+                                                   }};
   ThumbnailService::Subscription m_thumbnailPendingSub;
   LayerPopupHostRegistry m_pickerHosts;
   std::unique_ptr<FileDialogPopup> m_destinationPicker;
@@ -365,10 +386,14 @@ private:
               },
           .onViewModeOrScaleChanged =
               [this] {
-                if (m_listHeader.gridMode())
-                  activeSession().clearFolderCounts();
-                activeTab().viewState.gridMode = m_listHeader.gridMode();
-                activeTab().viewState.viewScale = m_listHeader.viewScale();
+                if (m_listHeader.gridMode()) {
+                  if (activeSession().search().active())
+                    activeSession().updateVisibleSearchFolders({});
+                  else
+                    activeSession().clearFolderCounts();
+                }
+                activeTab().displayedViewState().gridMode = m_listHeader.gridMode();
+                activeTab().displayedViewState().viewScale = m_listHeader.viewScale();
                 applyViewScale();
               },
           .onRequestLayout =
@@ -477,6 +502,12 @@ private:
   std::uint32_t m_pointerSerial = 0;
   VirtualGridView* m_grid = nullptr;
   Input* m_locationInput = nullptr;
+  Input* m_searchInput = nullptr;
+  Flex* m_searchBar = nullptr;
+  Label* m_searchStatus = nullptr;
+  Button* m_searchButton = nullptr;
+  Button* m_searchModeButton = nullptr;
+  filemanager::TabId m_searchUiTab = filemanager::kInvalidTabId;
   Label* m_statusLabel = nullptr;
   Label* m_statusDetailLabel = nullptr;
   Label* m_statusFreeLabel = nullptr;

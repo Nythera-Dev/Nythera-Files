@@ -2,6 +2,7 @@
 
 #include "core/files/directory_scanner.h"
 #include "filemanager/admin_protocol.h"
+#include "filemanager/file_search_session.h"
 #include "ui/dialogs/file_dialog.h"
 
 #include <cstdint>
@@ -30,6 +31,8 @@ namespace filemanager {
     struct Callbacks {
       std::function<FileDialogSortField()> sortField;
       std::function<FileDialogSortOrder()> sortOrder;
+      std::function<FileDialogSortField()> searchSortField;
+      std::function<FileDialogSortOrder()> searchSortOrder;
       std::function<bool()> isSizeColumnVisible;
       std::function<bool()> isRenaming;
       std::function<void()> onDeferRefreshDuringRename;
@@ -55,8 +58,7 @@ namespace filemanager {
     struct PrivilegedBackend {
       std::function<bool()> isActive;
       std::function<AdminRequestId(
-          const std::filesystem::path& path,
-          bool userInitiated,
+          const std::filesystem::path& path, bool userInitiated,
           std::function<void(const std::vector<AdminDirEntryRecord>&)> onBatch,
           std::function<void(bool ok, bool writable, const std::string& errorDetail)> onComplete
       )>
@@ -92,9 +94,21 @@ namespace filemanager {
     [[nodiscard]] bool active() const noexcept { return m_active; }
     void setHistory(std::vector<std::filesystem::path> back, std::vector<std::filesystem::path> forward);
 
-    void sortEntries();
+    void sortEntries(bool includeBrowsing = false);
+    void setSearchQuery(std::string query);
+    void configureSearchBackend(std::string executable, SearchMode defaultMode);
+    void setSearchMode(SearchMode mode);
+    [[nodiscard]] SearchMode searchMode() const;
+    [[nodiscard]] bool fzfSearchActive() const { return !m_fzfExecutable.empty() && !m_search.usingFallback(); }
+    void submitSearch() { m_search.submit(); }
+    void closeSearch();
+    [[nodiscard]] bool canSearch() const { return !m_browsingTrash && !isPrivilegedBackendActive(); }
+    [[nodiscard]] bool searchOpen() const noexcept { return m_searchOpen; }
+    void openSearch() noexcept { m_searchOpen = true; }
+    [[nodiscard]] const FileSearchSession& search() const noexcept { return m_search; }
 
     [[nodiscard]] std::optional<std::uint64_t> folderItemCount(const FileEntry& entry);
+    void updateVisibleSearchFolders(std::unordered_map<std::string, std::size_t> visible);
     void clearFolderCounts();
 
     void monitorDirectory();
@@ -109,8 +123,12 @@ namespace filemanager {
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return m_path; }
     [[nodiscard]] bool browsingTrash() const noexcept { return m_browsingTrash; }
-    [[nodiscard]] const std::vector<FileEntry>& entries() const noexcept { return m_entries; }
-    [[nodiscard]] std::vector<FileEntry>& entries() noexcept { return m_entries; }
+    [[nodiscard]] const std::vector<FileEntry>& entries() const noexcept {
+      return m_search.active() ? m_search.entries() : m_entries;
+    }
+    [[nodiscard]] std::vector<FileEntry>& entries() noexcept {
+      return m_search.active() ? m_search.entries() : m_entries;
+    }
     [[nodiscard]] const std::vector<std::filesystem::path>& backHistory() const noexcept { return m_backHistory; }
     [[nodiscard]] std::vector<std::filesystem::path>& backHistory() noexcept { return m_backHistory; }
     [[nodiscard]] const std::vector<std::filesystem::path>& forwardHistory() const noexcept { return m_forwardHistory; }
@@ -148,7 +166,10 @@ namespace filemanager {
       std::optional<std::uint64_t> items;
     };
 
+    [[nodiscard]] FileSearchSession::Order fileOrder(bool search = false) const;
+    void sortFileEntries(std::vector<FileEntry>& entries);
     void fetchNext(GFileEnumerator* enumerator, std::uint64_t generation);
+    void enqueueFolderCount(const std::string& path);
     void startNextFolderCount();
     void handleMonitorEvent(GFile* file, GFile* otherFile, GFileMonitorEvent event);
     void queryMonitoredFile(
@@ -167,10 +188,17 @@ namespace filemanager {
     std::vector<std::filesystem::path> m_forwardHistory;
     std::vector<FileEntry> m_entries;
     std::vector<FileEntry> m_loadingEntries;
+    FileSearchSession m_search;
+    std::string m_fzfExecutable;
+    SearchMode m_defaultSearchMode = SearchMode::Contiguous;
+    SearchMode m_selectedSearchMode = SearchMode::Contiguous;
+    bool m_searchOpen = false;
 
     std::unordered_map<std::string, FolderCount> m_folderCounts;
     std::vector<std::pair<std::string, std::uint64_t>> m_pendingFolderCounts;
     std::uint64_t m_nextFolderCountId = 0;
+    std::unordered_map<std::string, std::size_t> m_visibleSearchFolders;
+    std::string m_runningFolderCountPath;
     GCancellable* m_folderCountCancellable = nullptr;
     bool m_folderCountRunning = false;
 

@@ -58,8 +58,9 @@ namespace filemanager {
     [[nodiscard]] PanelTransparencyMode transparencyMode() const;
     [[nodiscard]] bool reset(const nythera::config::ConfigKeyPath& path);
 
-    [[nodiscard]] FileViewSettings loadFileView() const;
-    [[nodiscard]] bool saveFileView(const FileViewSettings& settings, const FileViewSettings& previous);
+    [[nodiscard]] FileViewSettings loadFileView(bool search = false) const;
+    [[nodiscard]] bool
+    saveFileView(const FileViewSettings& settings, const FileViewSettings& previous, bool search = false);
 
     [[nodiscard]] bool showApplicationMenuBar() const;
     [[nodiscard]] bool setShowApplicationMenuBar(bool show);
@@ -73,14 +74,14 @@ namespace filemanager {
     [[nodiscard]] int adminInactivityTimeoutSeconds() const;
     [[nodiscard]] bool setAdminInactivityTimeoutSeconds(int seconds);
 
-    void loadListColumnWidths(FileColumns& out) const;
-    [[nodiscard]] bool saveListColumnWidths(const FileColumns& columns);
+    void loadListColumnWidths(FileColumns& out, bool search = false) const;
+    [[nodiscard]] bool saveListColumnWidths(const FileColumns& columns, bool search = false);
 
-    void loadListColumnLayout(FileColumnLayout& out) const;
-    [[nodiscard]] bool saveListColumnLayout(const FileColumnLayout& layout);
+    void loadListColumnLayout(FileColumnLayout& out, bool search = false) const;
+    [[nodiscard]] bool saveListColumnLayout(const FileColumnLayout& layout, bool search = false);
 
-    [[nodiscard]] float loadViewScale(float defaultScale = 1.0F) const;
-    [[nodiscard]] bool saveViewScale(float scale);
+    [[nodiscard]] float loadViewScale(float defaultScale = 1.0F, bool search = false) const;
+    [[nodiscard]] bool saveViewScale(float scale, bool search = false);
 
     [[nodiscard]] float loadSidebarWidth(float defaultWidth, float minWidth, float maxWidth) const;
     [[nodiscard]] bool saveSidebarWidth(float width);

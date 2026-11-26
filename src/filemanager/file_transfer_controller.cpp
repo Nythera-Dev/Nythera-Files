@@ -491,7 +491,9 @@ namespace filemanager {
   }
 
   void FileTransferController::applyPendingPasteSelection(BrowserTab& tab) {
-    if (!tab.pendingPasteSelection || tab.session.loading())
+    if (!tab.pendingPasteSelection
+        || tab.session.loading()
+        || tab.session.search().status() == FileSearchSession::Status::Searching)
       return;
     auto pending = std::move(*tab.pendingPasteSelection);
     tab.pendingPasteSelection.reset();
@@ -666,8 +668,8 @@ namespace filemanager {
     auto* grid = isActive && m_callbacks.grid ? m_callbacks.grid() : nullptr;
     const auto primaryPath = tab.session.entries()[*first].absPath;
     tab.pendingDropScrollGeneration = pending.request.dropScrollGeneration;
-    const bool reveal =
-        !tab.pendingDropScrollGeneration || (*tab.pendingDropScrollGeneration == tab.scrollState.userScrollGeneration);
+    const bool reveal = !tab.pendingDropScrollGeneration
+        || (*tab.pendingDropScrollGeneration == tab.displayedScrollState().userScrollGeneration);
     tab.pendingPasteRevealPath = reveal ? std::optional(primaryPath) : std::nullopt;
     tab.session.clearChooseFirstAfterLoad();
     if (m_callbacks.onApplyPasteSelection)
@@ -692,7 +694,7 @@ namespace filemanager {
     auto& tab = m_tabs.activeTab();
     auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr;
     if (tab.pendingDropScrollGeneration) {
-      if (!grid || *tab.pendingDropScrollGeneration != tab.scrollState.userScrollGeneration) {
+      if (!grid || *tab.pendingDropScrollGeneration != tab.displayedScrollState().userScrollGeneration) {
         tab.pendingPasteRevealPath.reset();
         tab.pendingDropScrollGeneration.reset();
         return;
@@ -1583,6 +1585,7 @@ namespace filemanager {
     const auto& activeSession = m_tabs.activeTab().session;
     const std::filesystem::path path(m_dragSources.front());
     const auto previewEntry = std::ranges::find(activeSession.entries(), path, &FileEntry::absPath);
+    m_dragPreviewIcon->setAllowFilesystemQueries(!activeSession.search().active());
     m_dragPreviewIcon->setFile(path, previewEntry != activeSession.entries().end() && previewEntry->isDir);
     m_dragPreviewLabel->setText(
         m_dragSources.size() == 1 ? filemanager::sanitizeFilenameForDisplay(path.filename().string())
