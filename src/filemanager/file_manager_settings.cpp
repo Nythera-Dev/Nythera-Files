@@ -153,6 +153,7 @@ namespace filemanager {
     };
     add(m_configDir, true);
     add(m_configDir, false);
+    add(searchSettingsPath(), false);
     for (const auto& dir : loaded.config.includeDirs)
       add(dir, true);
     for (const auto& path : loaded.watchPaths) {
@@ -261,12 +262,13 @@ namespace filemanager {
     auto loaded = mergeConfigWithSources(m_configDir.string());
     if (auto error = validateFilesConfiguration(loaded)) {
       updateWatches(loaded);
+      (void)reloadSearchSettings();
       kLog.warn("Retaining the previous Files configuration: {}", error->origin.prefixed(error->message));
       reportProblem(std::move(*error));
       return false;
     }
     accept(std::move(loaded), true);
-    return true;
+    return reloadSearchSettings();
   }
 
   bool FileManagerSettings::save(std::vector<Change> changes) {

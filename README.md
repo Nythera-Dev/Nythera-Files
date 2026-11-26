@@ -72,6 +72,22 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 - Disk-usage and file-comparison integrations where suitable applications are available.
 - MIME-aware icons and file-type handling.
 
+### Search scopes
+
+Search starts in **Current folder & subfolders**. The scope menu also offers **Current folder only**, **Home**, **Local drives**, **All drives**, and named **Custom searches**. Local drives searches home and mounted local storage. All drives also searches mounted network storage such as SMB and NFS. For either drive scope, **Include system directories** adds the root filesystem. Files discovers storage that is already mounted and skips untriggered automounts.
+
+The results view opens when you enter a query. Clearing the query returns to browsing with the search bar still open. The scope menu saves **Show hidden items** and **Follow symbolic links** for standard scopes and separately for each custom search. Both options start off. Following links searches directory targets within their eligible source and lists descendants at their resolved locations. Exclusions and mount boundaries still apply.
+
+Use **Define custom search…** to save included folders and optional additional exclusions, one absolute folder path per line. **Manage custom searches…** lets you edit, rename or delete these profiles. Entering `/` reveals **Include mounted filesystems**. Leave it unchecked to search the root filesystem only, or check it to add mounted local and network storage. Explicitly listed mount paths are searched independently.
+
+Set global exclusions in `$XDG_CONFIG_HOME/nythera/files/search/config.toml` (or `$NYTHERA_CONFIG_HOME/files/search/config.toml` when using the Nythera override). This file also stores profiles saved through the editor.
+
+```toml
+exclusions = ["/home/me/private", "/mnt/storage/staging"]
+```
+
+Global and profile exclusions are applied before traversal. Virtual and kernel-managed filesystems such as `/proc`, `/sys`, and `/dev` are always skipped.
+
 ### Optional fzf search
 
 Files uses an installed `fzf` from `PATH` when it is available. The search bar offers Contains, Fuzzy, Starts with, Ends with, Exclude, Exact match and None. Contains is the default. The mode adds matching operators internally, while the search field keeps the text you entered. Explicit fzf operators override the selected mode. Compound expressions use None, which also accepts raw fzf syntax. A multi-word query without operators is treated as one phrase by the named modes.
@@ -84,7 +100,9 @@ fzf_search = false
 search_default_mode = "contiguous"
 ```
 
-The default-mode values are `contiguous`, `fuzzy`, `starts_with`, `ends_with`, `exclude`, `exact` and `none`. If fzf cannot start or fails during search, Files runs the query again using conventional substring matching. Search results have their own saved list or grid view, column layout, and sort order. The default list shows Name, Location, Size, Modified and Type. Hover over a result to see its containing directory's absolute path. Files counts immediate items in visible matching folders when the Size column is shown.
+The default-mode values are `contiguous`, `fuzzy`, `starts_with`, `ends_with`, `exclude`, `exact` and `none`. If fzf cannot start or fails during search, Files runs the query again using conventional substring matching. Search results have their own saved list or grid view, column layout, and sort order. The default list shows Name, Location, Size, Modified and Type. The Location column and grid subtitles show the absolute containing-directory path. Hover over a result to see the full path. Files counts immediate items in visible matching folders when the Size column is shown.
+
+In either list view, drag a column's right divider to resize it, or double-click the divider to fit its displayed contents. Drag a heading to reorder columns. Right-click the header for visibility and sizing options. When columns extend beyond the viewport, scroll horizontally with the scrollbar, a touchpad, or Shift+wheel. Browsing and search remember their own column widths and order.
 
 ## Appearance & Theming
 

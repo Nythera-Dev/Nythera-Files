@@ -73,6 +73,15 @@ namespace filemanager {
     inline constexpr int kTabContextCloseOthers = 30023;
     inline constexpr int kTabContextCloseRight = 30024;
     inline constexpr int kFirstSearchMode = 30030;
+    inline constexpr int kFirstSearchScope = 30040;
+    inline constexpr int kSearchIncludeSystem = 30046;
+    inline constexpr int kUseCustomSearch = 30047;
+    inline constexpr int kDefineCustomSearch = 30048;
+    inline constexpr int kManageCustomSearches = 30049;
+    inline constexpr int kFirstFitColumn = 30050;
+    inline constexpr int kFitAllColumns = 30056;
+    inline constexpr int kSearchShowHidden = 30057;
+    inline constexpr int kSearchFollowLinks = 30058;
     inline constexpr int kCompactToolsMenu = 30100;
     inline constexpr int kFirstToolMenuRow = 30101;
     inline constexpr int kActAsAdministrator = 30150;
@@ -118,9 +127,9 @@ namespace filemanager {
 
     FileMenuController(
         WaylandConnection& wayland, RenderContext& renderContext, AnimationManager& menuAnimations,
-        InputDispatcher& dispatcher, FileManagerSettings& settings, FileOperationManager& operations,
-        TabManager& tabs, FileListHeaderController& listHeader, PlacesSidebarController& places,
-        ChecksumDialogController& checksumDialog, NativeDataTransfer& transfer, Callbacks callbacks
+        InputDispatcher& dispatcher, FileManagerSettings& settings, FileOperationManager& operations, TabManager& tabs,
+        FileListHeaderController& listHeader, PlacesSidebarController& places, ChecksumDialogController& checksumDialog,
+        NativeDataTransfer& transfer, Callbacks callbacks
     );
     ~FileMenuController();
 
@@ -152,8 +161,12 @@ namespace filemanager {
     void openContextMenu(std::size_t index, float x, float y, bool highlightOnOpen = false);
     void openEmptyContextMenu(float x, float y, bool highlightOnOpen = false);
     void showPlacesMenu(std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false);
-    void openColumnHeaderMenu(std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false);
-    void openTabContextMenu(std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false);
+    [[nodiscard]] std::vector<ContextMenuControlEntry> columnVisibilityEntries() const;
+    void
+    openColumnHeaderMenu(std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false);
+    void
+    openTabContextMenu(std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false);
+    void openSearchDropdown(std::vector<ContextMenuControlEntry> entries, const Node& trigger, bool highlightOnOpen);
     void setNextPlacesHighlightOnOpen(bool highlight) noexcept { m_nextPlacesHighlightOnOpen = highlight; }
     [[nodiscard]] bool applicationMenuCollapsed() const noexcept { return m_applicationMenuCollapsed; }
     void openApplicationChooser();
@@ -178,6 +191,8 @@ namespace filemanager {
     launchApplicationForFile(GAppInfo* app, const std::filesystem::path& path, GError** error);
 
   private:
+    void openMainContextMenu(ContextMenuPopupRequest request, bool highlightOnOpen, bool preferSurfaceOutput);
+
     bool launchProtectedApplication(const BrowserTab& tab, GAppInfo* app, const std::filesystem::path& path);
     friend class ::FileManagerTestAccess;
 

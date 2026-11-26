@@ -21,6 +21,7 @@
 #include "ui/palette.h"
 #include "ui/scroll_into_view.h"
 #include "ui/style.h"
+#include "ui/tooltip/tooltip_manager.h"
 #include "wayland/wayland_connection.h"
 
 #include <algorithm>
@@ -82,6 +83,10 @@ namespace filemanager {
   }
 
   void ModalDialogHost::forceCloseImmediate() {
+    if (hoverTooltipsEnabled())
+      TooltipManager::instance().forceDestroy();
+    savePendingDialogSize();
+    m_configuredDialogSize.reset();
     m_wayland.stopKeyRepeat();
     m_dispatcher.setTextInputContext(nullptr, nullptr);
     if (m_customContent && m_customContent->onDismiss)
@@ -117,9 +122,7 @@ namespace filemanager {
       m_surface->requestLayout();
   }
 
-  void ModalDialogHost::setFocus(InputArea* area) {
-    m_dispatcher.setFocus(area);
-  }
+  void ModalDialogHost::setFocus(InputArea* area) { m_dispatcher.setFocus(area); }
 
   void ModalDialogHost::registerCard(Flex* card) {
     if (card != nullptr)
@@ -347,7 +350,8 @@ namespace filemanager {
               if (self->m_conflictDialogHook(request->data, request->hasRemaining, std::move(respond)))
                 return G_SOURCE_REMOVE;
             }
-            const bool mainWindowOpen = self->m_callbacks.isMainWindowOpen ? self->m_callbacks.isMainWindowOpen() : true;
+            const bool mainWindowOpen =
+                self->m_callbacks.isMainWindowOpen ? self->m_callbacks.isMainWindowOpen() : true;
             if (!mainWindowOpen) {
               self->m_backgroundConflictPending = true;
               if (self->m_callbacks.syncProgressWindow)
@@ -373,7 +377,8 @@ namespace filemanager {
                     : restoreFolders
                     ? std::vector<std::pair<std::string, int>>{{"Keep Both", 2}, {"Skip", 3}, {"Cancel", 4}}
                     : folders
-                    ? std::vector<std::pair<std::string, int>>{{"Merge", 5}, {"Keep Both", 2}, {"Skip", 3}, {"Cancel", 4}}
+                    ? std::vector<
+                          std::pair<std::string, int>>{{"Merge", 5}, {"Keep Both", 2}, {"Skip", 3}, {"Cancel", 4}}
                     : incompatible
                     ? std::vector<std::pair<std::string, int>>{{"Keep Both", 2}, {"Skip", 3}, {"Cancel", 4}}
                     : std::vector<
@@ -446,6 +451,31 @@ namespace filemanager {
     };
   }
 
+  std::uint32_t ModalDialogHost::initialExtent(
+      std::uint32_t saved, std::uint32_t fallback, std::uint32_t minimum, std::uint32_t available
+  ) {
+    return std::clamp(saved > 0 ? saved : fallback, std::min(minimum, available), available);
+  }
+
+  void ModalDialogHost::recordConfiguredSize(std::uint32_t width, std::uint32_t height) {
+    if (!m_resizable || width == 0 || height == 0)
+      return;
+    const DialogSize size{width, height};
+    const auto previous = std::exchange(m_configuredDialogSize, size);
+    if (m_customContent && !m_customContent->sizeStateKey.empty() && previous && *previous != size) {
+      m_pendingDialogSize = size;
+      m_dialogSizeSave.start(std::chrono::milliseconds(250), [this] { savePendingDialogSize(); });
+    }
+  }
+
+  void ModalDialogHost::savePendingDialogSize() {
+    m_dialogSizeSave.stop();
+    if (const auto size = std::exchange(m_pendingDialogSize, std::nullopt)) {
+      if (!m_settings.saveDialogSize(m_sizeStateKey, size->first, size->second) && m_callbacks.setStatus)
+        m_callbacks.setStatus("Unable to save dialog size");
+    }
+  }
+
   void ModalDialogHost::showDialog(
       std::string title, std::string message, std::vector<std::pair<std::string, int>> choices,
       std::function<void(int)> response, ToplevelSurface* parent, bool applyToAllCheckbox, bool alternativeName,
@@ -453,7 +483,7 @@ namespace filemanager {
   ) {
     if (!alternativeName || m_textPrompt)
       m_conflict.reset();
-    if (m_surface || !m_wayland.isConnected()) {
+    if (m_surface || (!m_wayland.isConnected() && !m_presentToplevelForTest)) {
       m_conflict.reset();
       if (response)
         response(-1);
@@ -473,7 +503,10 @@ namespace filemanager {
     m_divider = nullptr;
     m_preferredWidth = 0;
     m_preferredHeight = 0;
-    m_sizeStateKey = FileManagerSettings::dialogSizeStateKey(m_title, alternativeName && !m_textPrompt);
+    m_configuredDialogSize.reset();
+    m_sizeStateKey = m_customContent && !m_customContent->sizeStateKey.empty()
+        ? m_customContent->sizeStateKey
+        : FileManagerSettings::dialogSizeStateKey(m_title, alternativeName && !m_textPrompt);
     if (m_resizable) {
       if (const auto saved = m_settings.loadDialogSize(m_sizeStateKey)) {
         m_preferredWidth = saved->first;
@@ -493,50 +526,62 @@ namespace filemanager {
     auto surface = std::make_unique<ToplevelSurface>(m_wayland);
     surface->setRenderContext(&m_renderContext);
     surface->setConfigureCallback([this](std::uint32_t width, std::uint32_t height) {
-      if (m_surface) {
-        if (m_resizable && width > 0 && height > 0) {
-          m_preferredWidth = width;
-          m_preferredHeight = height;
-        }
+      recordConfiguredSize(width, height);
+      if (m_surface)
         m_surface->requestLayout();
-      }
     });
     surface->setClosedCallback([this] { closeDialog(-1); });
     surface->setPrepareFrameCallback([this](bool update, bool layout) { prepareFrame(update, layout); });
-    const auto* outputInfo = m_wayland.outputs().empty() ? nullptr : &m_wayland.outputs().front();
-    const auto maxWidth = static_cast<std::uint32_t>(
-        outputInfo == nullptr ? 720 : std::min(720, outputInfo->logicalWidth > 0 ? outputInfo->logicalWidth - 40 : 720)
-    );
-    const auto maxHeight = static_cast<std::uint32_t>(
-        outputInfo == nullptr ? 900 : std::min(900, outputInfo->logicalHeight > 0 ? outputInfo->logicalHeight - 80 : 900)
-    );
-    const std::uint32_t requestedMinWidth = (m_customContent && m_customContent->minWidth > 0)
+    const bool usePreferredInitialHeight = m_customContent && m_customContent->usePreferredInitialHeight;
+    const auto& outputs = m_wayland.outputs();
+    const auto* parentOutput = parent ? m_wayland.outputForSurface(parent->wlSurface()) : nullptr;
+    const auto onParent = std::ranges::find(outputs, parentOutput, &WaylandOutput::output);
+    const auto* outputInfo = onParent != outputs.end() ? &*onParent : outputs.empty() ? nullptr : &outputs.front();
+    const auto displayLimit = [&](int logical, int margin, int legacyLimit) {
+      if (logical <= 0)
+        return usePreferredInitialHeight ? UINT32_MAX : static_cast<std::uint32_t>(legacyLimit);
+      const int available = std::max(1, logical - margin);
+      return static_cast<std::uint32_t>(usePreferredInitialHeight ? available : std::min(legacyLimit, available));
+    };
+    const auto maxWidth = displayLimit(outputInfo ? outputInfo->effectiveLogicalWidth() : 0, 40, 720);
+    const auto maxHeight = displayLimit(outputInfo ? outputInfo->effectiveLogicalHeight() : 0, 80, 900);
+    const auto requestedMinWidth = (m_customContent && m_customContent->minWidth > 0)
         ? m_customContent->minWidth
         : (alternativeName && !m_textPrompt ? 520U : 420U);
+    const auto requestedMinHeight = (m_customContent && m_customContent->minHeight > 0)
+        ? m_customContent->minHeight
+        : (alternativeName && !m_textPrompt ? 260U : 180U);
     const auto minWidth = std::min(requestedMinWidth, maxWidth);
-    const std::uint32_t defaultWidth = (m_customContent && m_customContent->preferredWidth > 0)
-        ? m_customContent->preferredWidth
-        : (alternativeName ? 720U : 520U);
-    const auto width = m_resizable
-        ? (m_preferredWidth > 0 ? std::max(m_preferredWidth, minWidth) : std::min(maxWidth, defaultWidth))
-        : std::min(maxWidth, defaultWidth);
+    const auto defaultWidth = m_customContent && m_customContent->preferredWidth > 0 ? m_customContent->preferredWidth
+        : alternativeName                                                            ? 720U
+                                                                                     : 520U;
+    const auto width = usePreferredInitialHeight ? initialExtent(m_preferredWidth, defaultWidth, minWidth, maxWidth)
+        : m_preferredWidth > 0                   ? std::max(m_preferredWidth, minWidth)
+                                                 : std::min(maxWidth, defaultWidth);
+    const auto preferredHeight = usePreferredInitialHeight
+        ? initialExtent(m_preferredHeight, m_customContent->preferredHeight, requestedMinHeight, maxHeight)
+        : 0U;
     buildDialog(static_cast<float>(width));
+    if (m_presentToplevelForTest) {
+      m_surface = std::move(surface);
+      m_presentToplevelForTest(*m_surface, parent, {width, preferredHeight});
+      return;
+    }
     ScaledRenderer measureRenderer(m_renderContext, outputInfo == nullptr ? 1.0F : outputInfo->configuredScale());
     LayoutConstraints constraints;
     constraints.setExactWidth(static_cast<float>(width));
     const auto measured = m_root->measure(measureRenderer, constraints);
-    const auto measuredHeight = std::clamp(static_cast<std::uint32_t>(std::ceil(measured.height)), 180U, maxHeight);
-    const std::uint32_t requestedMinHeight = (m_customContent && m_customContent->minHeight > 0)
-        ? m_customContent->minHeight
-        : (alternativeName && !m_textPrompt ? 260U : 180U);
-    const auto minHeight = (m_customContent && m_customContent->useMeasuredMinHeight)
+    const auto measuredHeight =
+        std::clamp(static_cast<std::uint32_t>(std::ceil(measured.height)), std::min(180U, maxHeight), maxHeight);
+    const auto minHeight = m_customContent && m_customContent->useMeasuredMinHeight
         ? measuredHeight
         : std::min(requestedMinHeight, maxHeight);
-    const auto defaultHeight = (m_customContent && m_customContent->preferredHeight > 0)
+    const auto defaultHeight = m_customContent && m_customContent->preferredHeight > 0
         ? std::clamp(std::min(measuredHeight, m_customContent->preferredHeight), minHeight, maxHeight)
         : measuredHeight;
-    const auto height =
-        m_resizable && m_preferredHeight > 0 ? std::max(m_preferredHeight, minHeight) : defaultHeight;
+    const auto height = usePreferredInitialHeight ? preferredHeight
+        : m_preferredHeight > 0                   ? std::max(m_preferredHeight, minHeight)
+                                                  : defaultHeight;
     if (measured.height > static_cast<float>(height) && !(m_customContent && m_customContent->fillContent)) {
       UiPhaseScope layoutPhase(UiPhase::Layout);
       const auto focus = m_dispatcher.captureTabFocus();
@@ -629,6 +674,8 @@ namespace filemanager {
         }
       }
     }
+    if (hoverTooltipsEnabled())
+      TooltipManager::instance().forceDestroy();
     m_closeQueued = true;
     m_wayland.stopKeyRepeat();
     m_dispatcher.setTextInputContext(nullptr, nullptr);
@@ -652,7 +699,9 @@ namespace filemanager {
                          && (self->m_resultPending <= 3 || self->m_resultPending == 5)
                      ? 10
                      : 0);
+          self->savePendingDialogSize();
           if (self->m_resizable
+              && (!self->m_customContent || self->m_customContent->sizeStateKey.empty())
               && self->m_surface
               && self->m_surface->width() >= 360
               && self->m_surface->height() >= 180) {
@@ -698,9 +747,16 @@ namespace filemanager {
   }
 
   void ModalDialogHost::handlePointer(const PointerEvent& event) {
-    if (!m_surface || event.surface != m_surface->wlSurface())
+    if (!m_surface || m_closeQueued || event.surface != m_surface->wlSurface())
       return;
     const float x = static_cast<float>(event.sx), y = static_cast<float>(event.sy);
+    auto& tooltip = TooltipManager::instance();
+    const bool tooltips = hoverTooltipsEnabled();
+    if (tooltips
+        && (event.type == PointerEvent::Type::Leave
+            || event.type == PointerEvent::Type::Axis
+            || (event.type == PointerEvent::Type::Button && event.pressed)))
+      tooltip.forceDestroy();
     switch (event.type) {
     case PointerEvent::Type::Enter:
       m_dispatcher.pointerEnter(x, y, event.serial);
@@ -721,6 +777,12 @@ namespace filemanager {
           event.axisGestureSerial
       );
       break;
+    }
+    if (tooltips && (event.type == PointerEvent::Type::Enter || event.type == PointerEvent::Type::Motion)) {
+      tooltip.setPointerPosition(x, y);
+      tooltip.onHoverChange(
+          m_dispatcher.hoveredArea(), m_surface->xdgSurface(), m_wayland.outputForSurface(m_surface->wlSurface())
+      );
     }
   }
 
@@ -983,8 +1045,9 @@ namespace filemanager {
           const auto existingStart = m_message.find("\n\n") + 2;
           const auto existingMetadataEnd = m_message.find('\n', m_message.find('\n', existingStart) + 1);
           const auto destinationEnd = m_message.find('\n', existingMetadataEnd + 1);
-          destinationPath =
-              std::filesystem::path(m_message.substr(existingMetadataEnd + 1, destinationEnd - existingMetadataEnd - 1));
+          destinationPath = std::filesystem::path(
+              m_message.substr(existingMetadataEnd + 1, destinationEnd - existingMetadataEnd - 1)
+          );
         }
         m_destination = destinationPath;
         const auto clearNameError = [this] {
@@ -993,8 +1056,8 @@ namespace filemanager {
           requestLayout();
         };
         m_alternativeNameInput->setOnChange([clearNameError](const std::string&) { clearNameError(); });
-        const bool directory =
-            m_conflict ? m_conflict->incoming.isDirectory : m_message.substr(m_message.find('\n') + 1).starts_with("Folder");
+        const bool directory = m_conflict ? m_conflict->incoming.isDirectory
+                                          : m_message.substr(m_message.find('\n') + 1).starts_with("Folder");
         const auto stem = directory ? incomingName : std::filesystem::path(incomingName).stem().string();
         const auto extension = directory ? std::string{} : std::filesystem::path(incomingName).extension().string();
         const bool checkDestination = !m_conflict || m_conflict->pathAccess == ConflictPathAccess::Local;
@@ -1143,8 +1206,9 @@ namespace filemanager {
     m_root->addChild(std::move(footer));
     if (m_resizable) {
       const std::array<std::uint32_t, 8> edges{
-          XDG_TOPLEVEL_RESIZE_EDGE_TOP,         XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM,      XDG_TOPLEVEL_RESIZE_EDGE_LEFT,
-          XDG_TOPLEVEL_RESIZE_EDGE_RIGHT,       XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT,    XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT,
+          XDG_TOPLEVEL_RESIZE_EDGE_TOP,         XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM,
+          XDG_TOPLEVEL_RESIZE_EDGE_LEFT,        XDG_TOPLEVEL_RESIZE_EDGE_RIGHT,
+          XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT,    XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT,
           XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT, XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT
       };
       const std::array<std::uint32_t, 8> cursors{

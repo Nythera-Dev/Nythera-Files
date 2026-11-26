@@ -20,6 +20,7 @@ class Flex;
 class InputDispatcher;
 class Renderer;
 class Separator;
+class Scrollbar;
 class VirtualGridView;
 class WaylandConnection;
 
@@ -39,6 +40,8 @@ namespace filemanager {
       std::function<bool()> canHandlePointer;
       std::function<bool()> canAdjustScale;
       std::function<std::uint32_t()> pointerSerial;
+      std::function<float(Renderer&, FileColumn)> measureColumn;
+      std::function<void(std::optional<FileColumn>, float, float)> openHeaderMenu;
     };
 
     FileListHeaderController(
@@ -47,6 +50,7 @@ namespace filemanager {
 
     void loadInitialState();
     [[nodiscard]] std::unique_ptr<Flex> buildHeader();
+    [[nodiscard]] std::unique_ptr<Flex> buildHorizontalScrollbar();
     void attachGrid(VirtualGridView* grid);
     void detachUi();
 
@@ -66,6 +70,15 @@ namespace filemanager {
     void positionColumnMarkers();
     void layoutVisibleMarkers(Renderer& renderer);
     void cancelGesture();
+    void requestFit(std::optional<FileColumn> column);
+    void applyPendingFit(Renderer& renderer);
+    [[nodiscard]] std::optional<FileColumn> columnAt(float x) const;
+    [[nodiscard]] float scrollOffset() const { return m_scrollOffset; }
+    [[nodiscard]] float contentWidth() const;
+    [[nodiscard]] float columnTextInset(FileColumn column) const;
+    bool scrollHorizontally(float delta);
+    void revealColumn(FileColumn column);
+    [[nodiscard]] bool headerAt(float x, float y) const;
     bool handlePointer(const PointerEvent& event, float x, float y);
 
     [[nodiscard]] bool gridMode() const noexcept { return m_gridMode; }
@@ -93,7 +106,15 @@ namespace filemanager {
       std::optional<std::size_t> destination;
     };
 
+    void saveWidths();
     [[nodiscard]] float availableWidth() const;
+    [[nodiscard]] float stripOrigin() const;
+    void setScrollOffset(float offset);
+    struct DividerClick {
+      FileColumn column;
+      std::uint32_t time;
+      float x;
+    };
 
     FileManagerSettings& m_settings;
     WaylandConnection& m_wayland;
@@ -101,6 +122,10 @@ namespace filemanager {
     Callbacks m_callbacks;
 
     Flex* m_header = nullptr;
+    Flex* m_viewport = nullptr;
+    Flex* m_strip = nullptr;
+    Flex* m_horizontalTrack = nullptr;
+    Scrollbar* m_horizontalScrollbar = nullptr;
     VirtualGridView* m_grid = nullptr;
     std::array<Button*, kFileColumns.size()> m_headers{};
     std::array<Separator*, kFileColumns.size()> m_markers{};
@@ -108,6 +133,11 @@ namespace filemanager {
 
     std::optional<FileColumn> m_resizingColumn;
     std::optional<FileColumn> m_hoverBoundary;
+    std::optional<DividerClick> m_dividerClick;
+    std::optional<DividerClick> m_dividerPress;
+    std::vector<FileColumn> m_pendingFit;
+    float m_scrollOffset = 0.0F;
+    std::array<float, 2> m_savedViewOffsets{};
     float m_dragX = 0.0F;
     FileColumns m_columnStart{};
     FileColumns m_listColumns{};
@@ -116,7 +146,7 @@ namespace filemanager {
     FileColumnLayout m_columnLayout;
     std::vector<FileColumn> m_visibleColumns;
     float m_leftGutter = -1.0F;
-    float m_rightGutter = -1.0F;
+    float m_viewportWidth = 0.0F;
     std::optional<ColumnDrag> m_columnDrag;
 
     FileDialogSortField m_sortField = FileDialogSortField::Name;

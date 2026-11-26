@@ -39,8 +39,16 @@ void FileManager::buildSearchBar(Flex& pane) {
   input->setOnChange([this](const std::string& query) {
     if (!activeSession().searchOpen())
       return;
-    resetSearchSelection();
-    activeSession().setSearchQuery(query);
+    auto& tab = activeTab();
+    if (!tab.session.search().active() && !query.empty()) {
+      tab.browsingSelection = filemanager::BrowserTab::BrowsingSelection{
+          std::move(tab.selectedPath), std::move(tab.selectedPaths), std::move(tab.selectionAnchor)
+      };
+      tab.searchScrollState = {};
+    }
+    if (tab.session.search().active() || !query.empty())
+      resetSearchSelection();
+    tab.session.setSearchQuery(query);
     updateStatusBar();
   });
   input->setOnSubmit([this](const std::string&) {
@@ -59,6 +67,18 @@ void FileManager::buildSearchBar(Flex& pane) {
   input->setTrailingLabel(std::move(status));
 
   m_searchBar->addChild(std::move(input));
+
+  auto scope = std::make_unique<Button>();
+  m_searchScopeButton = scope.get();
+  m_compactSearchScope = false;
+  scope->setVariant(ButtonVariant::Outline);
+  scope->setTrailingGlyph("chevron-down");
+  scope->setFontSize(Style::fontSizeCaption);
+  scope->setContentAlign(ButtonContentAlign::Start);
+  scope->label()->setFlexGrow(1.0F);
+  scope->label()->setEllipsize(TextEllipsize::End);
+  scope->setOnClick([this] { openSearchScopeMenu(); });
+  m_searchBar->addChild(std::move(scope));
 
   auto mode = std::make_unique<Button>();
   m_searchModeButton = mode.get();
@@ -95,6 +115,8 @@ void FileManager::focusSearch() {
   if (!activeSession().searchOpen()) {
     loadSearchView();
     configureSearchBackend(activeSession());
+    const auto& settings = m_settings.searchSettings();
+    activeSession().configureSearchScope({}, std::nullopt, settings.exclusions, settings.standardOptions);
   }
   activeSession().openSearch();
   syncSearchUi();
@@ -104,6 +126,13 @@ void FileManager::focusSearch() {
   }
   if (m_surface)
     m_surface->requestLayout();
+}
+
+void FileManager::toggleSearch() {
+  if (activeSession().searchOpen())
+    closeSearch();
+  else
+    focusSearch();
 }
 
 void FileManager::closeSearch() {
@@ -126,7 +155,7 @@ void FileManager::resetSearchSelection() {
   tab.selectedPaths.clear();
   tab.selectionAnchor.reset();
   tab.cancelSelectionInfoQuery();
-  if (m_grid)
+  if (m_grid && tab.session.search().active())
     m_grid->scrollView().requestScrollToOffset(0.0F);
 }
 
@@ -152,31 +181,29 @@ void FileManager::openSearchModeMenu() {
         .toggleState = index == current ? 1 : 0,
     });
   }
-  float x{}, y{};
-  Node::absolutePosition(m_searchModeButton, x, y);
-  m_menus.openTabContextMenu(
-      std::move(entries), x, y + m_searchModeButton->height(),
-      m_wayland.lastInputSource() == WaylandSeat::InputSource::Keyboard
+  m_menus.openSearchDropdown(
+      std::move(entries), *m_searchModeButton, m_wayland.lastInputSource() == WaylandSeat::InputSource::Keyboard
   );
 }
 
 void FileManager::selectSearchMode(filemanager::SearchMode mode) {
   if (!activeSession().searchOpen() || !activeSession().fzfSearchActive())
     return;
-  if (!filemanager::manualSearchMode(activeSession().search().query()))
+  if (activeSession().search().active() && !filemanager::manualSearchMode(activeSession().search().query()))
     resetSearchSelection();
   activeSession().setSearchMode(mode);
   syncSearchUi();
 }
 
 void FileManager::syncSearchUi() {
-  if (m_listHeader.searchView() != activeSession().searchOpen())
+  if (m_listHeader.searchView() != activeSession().search().active())
     applyActiveView();
   if (!m_searchBar)
     return;
   const auto& session = activeSession();
   const bool open = session.searchOpen();
   m_searchButton->setEnabled(!activeTab().administratorBrowsing && session.canSearch());
+  m_searchButton->setSelected(open);
   if ((open != m_searchBar->visible() || m_searchUiTab != activeTab().id)) {
     m_searchUiTab = activeTab().id;
     m_searchInput->setValue(session.search().query());
@@ -195,6 +222,12 @@ void FileManager::syncSearchUi() {
     m_searchStatus->setVisible(false);
     return;
   }
+
+  syncSearchScopeButton();
+  m_searchInput->setPlaceholder(
+      session.searchSelection().scope == filemanager::SearchScope::Recursive ? "Search this folder and subfolders"
+                                                                             : "Search files and folders"
+  );
 
   const bool fzf = session.fzfSearchActive();
   m_searchModeButton->setVisible(fzf);

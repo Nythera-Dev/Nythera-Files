@@ -170,6 +170,11 @@ namespace filemanager {
     return std::nullopt;
   }
 
+  std::optional<std::uint64_t> DirectorySession::cachedFolderItemCount(const FileEntry& entry) const {
+    const auto found = m_folderCounts.find(entry.absPath.native());
+    return found == m_folderCounts.end() ? std::nullopt : found->second.items;
+  }
+
   void DirectorySession::enqueueFolderCount(const std::string& path) {
     if (m_folderCounts.contains(path))
       return;
@@ -374,6 +379,23 @@ namespace filemanager {
     return manualSearchMode(m_search.query()).value_or(m_selectedSearchMode);
   }
 
+  void DirectorySession::configureSearchScope(
+      SearchSelection selection, std::optional<CustomSearch> profile, SearchLocations excluded, SearchOptions standard
+  ) {
+    const bool changed = selection != m_searchSelection
+        || profile != m_searchProfile
+        || excluded != m_globalSearchExclusions
+        || (!profile && standard != m_standardSearchOptions);
+    m_standardSearchOptions = standard;
+    if (!changed)
+      return;
+    m_searchSelection = std::move(selection);
+    m_searchProfile = std::move(profile);
+    m_globalSearchExclusions = std::move(excluded);
+    if (m_search.active())
+      setSearchQuery(m_search.query());
+  }
+
   void DirectorySession::setSearchQuery(std::string query) {
     if (!m_searchOpen || !canSearch())
       return;
@@ -382,8 +404,9 @@ namespace filemanager {
     const auto manual = m_fzfExecutable.empty() ? std::nullopt : manualSearchMode(query);
     const FzfSearch backend{m_fzfExecutable, manual.value_or(m_selectedSearchMode), manual.has_value()};
     clearFolderCounts();
+    const auto options = searchOptions();
     m_search.edit(
-        m_path, std::move(query), m_showHidden, fileOrder(true),
+        m_path, std::move(query), options.showHidden, fileOrder(true),
         [this](bool complete) {
           if (complete) {
             if (m_callbacks.onEntriesLoaded)
@@ -401,7 +424,14 @@ namespace filemanager {
             m_callbacks.onCancelFileGesture();
           return true;
         },
-        backend
+        backend,
+        [current = m_path, selection = m_searchSelection, profile = m_searchProfile,
+         excluded = m_globalSearchExclusions, options] {
+          return resolveSearchScope(
+              selection, current, g_get_home_dir(), profile ? &*profile : nullptr, excluded, discoverSearchMounts(),
+              options.followSymlinks
+          );
+        }
     );
     if (m_callbacks.onEntriesChanged)
       m_callbacks.onEntriesChanged();
@@ -410,10 +440,14 @@ namespace filemanager {
   void DirectorySession::closeSearch() {
     if (!m_searchOpen)
       return;
+    const bool wasActive = m_search.active();
     m_searchOpen = false;
+    m_searchSelection = {};
+    m_searchProfile.reset();
     m_selectedSearchMode = m_defaultSearchMode;
     m_search.cancel();
-    clearFolderCounts();
+    if (wasActive)
+      clearFolderCounts();
     if (m_callbacks.onEntriesChanged)
       m_callbacks.onEntriesChanged();
   }

@@ -14,6 +14,7 @@
 #include "filemanager/file_columns.h"
 #include "filemanager/file_creation.h"
 #include "filemanager/file_interaction.h"
+#include "filemanager/file_list_columns.h"
 #include "filemanager/file_sort.h"
 #include "filemanager/file_transfer_payload.h"
 #include "filemanager/file_view_menu.h"
@@ -174,15 +175,7 @@ public:
       return;
     const auto& entry = session.entries()[index];
     const bool searchResult = session.search().active();
-    std::string location;
-    if (session.searchOpen()) {
-      const auto parent = entry.absPath.parent_path();
-      const auto relative = parent.lexically_relative(session.path());
-      const auto display = relative == "." && parent.has_filename() ? parent.filename()
-          : relative.empty() || relative == "."                     ? parent
-                                                                    : relative;
-      location = filemanager::sanitizeFilenameForDisplay(display.string());
-    }
+    const auto location = searchResult ? filemanager::searchLocationText(entry.absPath) : std::string{};
     // Search provides viewport thumbnails separately from the shared artwork lookup.
     const bool allowThumbnails = !searchResult && tab.capabilities().canGenerateThumbnails;
     const auto useSearchArtwork = [&entry, searchResult](FileIcon* icon) {
@@ -228,6 +221,9 @@ public:
       if (!location.empty()
           && m_owner.m_listHeader.columnLayout().visible[columnIndex(filemanager::kSearchLocationSlot)])
         row.setSearchLocation(location);
+      row.setColumnViewport(
+          *m_renderer, std::max(tile.width(), m_owner.m_listHeader.contentWidth()), m_owner.m_listHeader.scrollOffset()
+      );
       useSearchArtwork(row.fileIcon());
     }
   }
@@ -241,11 +237,19 @@ public:
     if (index >= session.entries().size())
       return {};
     const auto& entry = session.entries()[index];
+    if (!m_owner.m_listHeader.gridMode() && m_owner.m_hoveredFileColumn && m_renderer) {
+      const auto column = *m_owner.m_hoveredFileColumn;
+      const auto value = m_owner.fileColumnText(entry, column);
+      const auto fontSize = column == FileColumn::Name ? Style::fontSizeBody : Style::fontSizeCaption;
+      const auto width = m_owner.m_listHeader.listColumns()[column] - m_owner.m_listHeader.columnTextInset(column);
+      if (!value.empty() && m_renderer->measureText(value, fontSize).width > width)
+        return value;
+    }
     auto found = session.trashOriginalPaths().find(entry.absPath.string());
     const auto description = guessFileTypeDescription(entry.absPath, entry.isDir, entry.type);
     auto tooltip = filemanager::sanitizeFilenameForDisplay(entry.name) + "\n" + description;
-    if (session.searchOpen())
-      tooltip += "\n" + filemanager::sanitizeFilenameForDisplay(entry.absPath.parent_path().string());
+    if (session.search().active())
+      tooltip += "\n" + filemanager::searchLocationText(entry.absPath);
     return found == session.trashOriginalPaths().end()
         ? tooltip
         : tooltip + "\nOriginal location: " + filemanager::sanitizeFilenameForDisplay(found->second);
@@ -952,6 +956,9 @@ FileManager::FileManager(std::string initialPath)
   m_listHeader.loadInitialState();
   m_listHeader.applyTabViewState(activeTab().viewState);
   updateWindowTitle();
+  m_settings.setSearchReloadCallback([this](const filemanager::SearchSettings& previous) {
+    refreshSearchSettings(previous);
+  });
   m_operations.setConflictResolver(m_modalDialog.makeConflictResolver());
   m_operations.setAdminConflictResolver(
       m_modalDialog.makeConflictResolver(filemanager::ConflictPathAccess::ExecutorOnly)
@@ -1203,6 +1210,7 @@ void FileManager::beginRenamePath(const std::filesystem::path& path) {
   m_typeaheadQuery.clear();
   m_grid->setSelectedIndex(index, false);
   m_grid->scrollToIndex(index);
+  m_listHeader.revealColumn(FileColumn::Name);
   m_renamePath = path;
   const auto stablePath = path.string();
   InputArea* editor = m_grid->beginInlineEdit(
@@ -1358,6 +1366,8 @@ FileManager::~FileManager() {
   m_tabBar.detachUi();
   m_menus.closeContextMenu();
   m_transfers.shutdown();
+  m_customSearchChild.forceCloseImmediate();
+  m_modalDialog.forceCloseImmediate();
   m_menus.closeApplicationPicker();
   if (m_destinationPicker) {
     m_destinationPicker->closeFileDialogWithoutResult();
@@ -1395,10 +1405,13 @@ int FileManager::run() {
         m_tabBar.updateTheme();
         updateAdminHeaderUi();
         m_modalDialog.updateTheme();
+        m_customSearchChild.updateTheme();
         if (m_surface)
           m_surface->requestLayout();
         if (m_modalDialog.isOpen())
           m_modalDialog.requestLayout();
+        if (m_customSearchChild.isOpen())
+          m_customSearchChild.requestLayout();
       },
       "file-manager-theme"
   );
@@ -1431,13 +1444,14 @@ int FileManager::run() {
         || m_transfers.isDragPending()
         || m_tabBar.gestureActive()
         || m_resizingSidebar
-        || m_modalDialog.isOpen()
+        || (m_modalDialog.isOpen()
+            && (!activeModalDialog().hoverTooltipsEnabled() || activeModalDialog().pointerCaptured()))
         || (m_destinationPicker && m_destinationPicker->isOpen())
-        || m_dispatcher.pointerCaptured()
+        || (!m_modalDialog.isOpen() && m_dispatcher.pointerCaptured())
         || (m_grid && m_grid->rubberBandActive());
   });
   m_dispatcher.setHoverChangeCallback([this](InputArea*, InputArea* next) {
-    if (m_surface)
+    if (m_surface && !activeModalDialog().hoverTooltipsEnabled())
       TooltipManager::instance().onHoverChange(
           next, m_surface->xdgSurface(), m_wayland.outputForSurface(m_surface->wlSurface())
       );
@@ -1462,6 +1476,9 @@ int FileManager::run() {
   m_surface->setRenderContext(&m_renderContext);
   m_surface->setAnimationManager(&m_menuAnimations);
   m_surface->setClosedCallback([this] {
+    m_customSearchChild.forceCloseImmediate();
+    if (m_refreshSearchProfileList)
+      m_modalDialog.forceCloseImmediate();
     m_windowOpen = false;
     m_tabs.shutdownAll();
     if (m_destinationPicker) {
@@ -1511,6 +1528,7 @@ int FileManager::run() {
           self->m_searchStatus = nullptr;
           self->m_searchButton = nullptr;
           self->m_searchModeButton = nullptr;
+          self->m_searchScopeButton = nullptr;
           self->m_statusLabel = nullptr;
           if (!self->m_operations.active() && self->m_transfers.pendingClipboardReads() == 0)
             self->m_running = false;
@@ -1546,8 +1564,8 @@ int FileManager::run() {
   m_pickerHosts.registerHost(
       [this](wl_surface* surface) -> std::optional<LayerPopupParentContext> {
         auto* parent = m_surface.get();
-        if (m_modalDialog.isOpen() && m_modalDialog.ownsSurface(surface))
-          parent = m_modalDialog.surface();
+        if (activeModalDialog().ownsSurface(surface))
+          parent = activeModalDialog().surface();
         if (!parent || surface != parent->wlSurface())
           return std::nullopt;
         return LayerPopupParentContext{
@@ -1561,8 +1579,8 @@ int FileManager::run() {
       },
       {}, {},
       [this]() -> std::optional<LayerPopupParentContext> {
-        if (m_modalDialog.isOpen())
-          return m_pickerHosts.contextForSurface(m_modalDialog.wlSurface());
+        if (activeModalDialog().isOpen())
+          return m_pickerHosts.contextForSurface(activeModalDialog().wlSurface());
         return m_surface ? m_pickerHosts.contextForSurface(m_surface->wlSurface()) : std::nullopt;
       }
   );
@@ -1595,17 +1613,19 @@ int FileManager::run() {
       m_destinationPicker->onKeyboardEvent(event);
     else if (m_menus.isContextMenuOpen() && m_menus.handleKeyboard(event))
       return;
-    else if (m_modalDialog.ownsSurface(m_wayland.lastKeyboardSurface()))
-      m_modalDialog.handleKeyboard(event);
+    else if (activeModalDialog().ownsSurface(m_wayland.lastKeyboardSurface()))
+      activeModalDialog().handleKeyboard(event);
     else if (
         m_propertiesWindow
         && m_propertiesWindow->isOpen()
         && m_propertiesWindow->ownsSurface(m_wayland.lastKeyboardSurface())
     )
       m_propertiesWindow->handleKeyboard(event);
-    else if (m_modalDialog.isOpen())
-      m_modalDialog.handleKeyboard(event);
-    else if (m_progressWindow.ownsSurface(m_wayland.lastKeyboardSurface()))
+    else if (m_modalDialog.isOpen()) {
+      // While a nested editor is open, the management surface stays visible but modal.
+      if (!m_customSearchChild.isOpen())
+        m_modalDialog.handleKeyboard(event);
+    } else if (m_progressWindow.ownsSurface(m_wayland.lastKeyboardSurface()))
       m_progressWindow.handleKeyboard(event);
     else
       handleKeyboard(event);
@@ -1639,6 +1659,7 @@ int FileManager::run() {
         TooltipManager::instance().forceDestroy();
         m_dispatcher.setTextInputContext(nullptr, nullptr);
         m_dispatcher.setSceneRoot(nullptr);
+        m_customSearchChild.forceCloseImmediate();
         m_modalDialog.forceCloseImmediate();
         m_progressWindow.close();
         if (m_surface) {
@@ -1751,6 +1772,8 @@ void FileManager::pinPlace(const std::filesystem::path& path) {
 }
 
 void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry) {
+  if (activateSearchScopeEntry(entry))
+    return;
   if (entry.id >= kFirstSearchMode
       && entry.id < kFirstSearchMode + static_cast<int>(filemanager::kSearchModeLabels.size())) {
     selectSearchMode(static_cast<filemanager::SearchMode>(entry.id - kFirstSearchMode));
@@ -2222,6 +2245,12 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
                                : m_listHeader.viewScale()
                 + (entry.id == kZoomIn ? filemanager::kFileViewZoomStep : -filemanager::kFileViewZoomStep)
     );
+  } else if (entry.id == kFitAllColumns) {
+    m_listHeader.requestFit(std::nullopt);
+  } else if (
+      entry.id >= kFirstFitColumn && entry.id < kFirstFitColumn + static_cast<int>(filemanager::kFileColumns.size())
+  ) {
+    m_listHeader.requestFit(static_cast<FileColumn>(entry.id - kFirstFitColumn));
   } else if (
       entry.id >= kFirstColumnAction
       && entry.id < kFirstColumnAction + static_cast<int>(filemanager::kFileColumns.size())
@@ -2260,9 +2289,13 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
       toggleSortOrder();
   } else if (entry.id == 50) {
     recordAdminTabUserActivity(tab);
-    session.setShowHidden(!session.showHidden());
-    persistFileViewState();
-    enumerate(session.path());
+    if (session.search().active()) {
+      toggleSearchOption(&filemanager::SearchOptions::showHidden);
+    } else {
+      session.setShowHidden(!session.showHidden());
+      persistFileViewState();
+      enumerate(session.path());
+    }
   } else if (entry.id == 51 || entry.id == 52) {
     recordAdminTabUserActivity(tab);
     if (entry.id == 51)
@@ -2331,7 +2364,7 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
   }
   if (changed("saved_places") || changed("place_order") || changed("hidden_mounts"))
     m_places.reloadPreferences();
-  const bool searchView = activeSession().searchOpen();
+  const bool searchView = activeSession().search().active();
   if (searchView ? changed("search_column_widths") || changed("search_column_layout")
                  : changed("list_column_widths") || changed("list_column_layout"))
     m_listHeader.reloadColumnPreferences();
@@ -2376,7 +2409,7 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
     auto& state = tab->viewState;
     if (grid) {
       state.gridMode = view.gridMode;
-      if (view.gridMode && !tab->session.searchOpen())
+      if (view.gridMode && !tab->session.search().active())
         tab->session.clearFolderCounts();
     }
     if (scale)
@@ -2435,7 +2468,7 @@ void FileManager::persistFileViewState() {
   tab.viewState.showHidden = next.showHidden;
   tab.viewState.foldersFirst = next.foldersFirst;
   tab.viewState.hiddenLast = next.hiddenLast;
-  if (!m_settings.saveFileView(next, previous, tab.session.searchOpen()))
+  if (!m_settings.saveFileView(next, previous, tab.session.search().active()))
     setStatus("Unable to save file view preferences");
 }
 
@@ -3278,7 +3311,7 @@ void FileManager::loadSearchView() {
 void FileManager::applyActiveView() {
   auto& tab = activeTab();
   const auto& state = tab.displayedViewState();
-  const bool search = tab.session.searchOpen();
+  const bool search = tab.session.search().active();
   const bool geometryChanged = m_listHeader.gridMode() != state.gridMode
       || m_listHeader.viewScale() != state.viewScale
       || m_listHeader.searchView() != search;
@@ -3595,7 +3628,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_breadcrumbBar = static_cast<Flex*>(locationBar->addChild(std::move(crumb)));
     navigation->addChild(std::move(locationBar));
     navigation->addChild(makeButton("↻", [this] { activateContextMenuEntry({.id = 13}); }, &m_refreshButton));
-    auto searchButton = makeButton("", [this] { focusSearch(); }, &m_searchButton);
+    auto searchButton = makeButton("", [this] { toggleSearch(); }, &m_searchButton);
     searchButton->setGlyph("search");
     searchButton->setTooltip("Search (Ctrl+F)");
     navigation->addChild(std::move(searchButton));
@@ -3751,6 +3784,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
       updateSelectionSummary();
     });
     mainPane->addChild(std::move(grid));
+    mainPane->addChild(m_listHeader.buildHorizontalScrollbar());
 
     auto status = std::make_unique<Label>();
     m_statusLabel = status.get();
@@ -3844,13 +3878,14 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
         static_cast<int>(static_cast<float>(m_surface->width()) - 2.0F * kWindowPadding - sidebarSpace);
     m_menus.syncResponsiveMenuBar(headerWidth);
     updateAdminHeaderUi(headerWidth);
+    updateSearchScopeWidth(static_cast<float>(m_surface->width()) - (showSidebar ? effectiveSidebar : 0.0F));
     m_root->setSize(static_cast<float>(m_surface->width()), static_cast<float>(m_surface->height()));
     m_root->layout(renderer);
     m_tabBar.syncLayout(renderer);
-    if (m_listHeader.applyColumnWidths()) {
-      m_listHeader.arrangeAfterWidthChange(renderer);
+    m_listHeader.applyPendingFit(renderer);
+    if (m_listHeader.applyColumnWidths())
       m_surface->requestLayout();
-    }
+    m_listHeader.arrangeAfterWidthChange(renderer);
     m_listHeader.positionColumnMarkers();
     finishPendingTransferReveal(renderer);
     m_listHeader.layoutVisibleMarkers(renderer);
@@ -3973,7 +4008,13 @@ void FileManager::closeDialog(int response) { m_modalDialog.closeDialog(response
 
 void FileManager::syncTooltipHover() {
   m_dispatcher.syncPointerHover();
-  if (m_surface)
+  const auto column = m_filePointerX ? m_listHeader.columnAt(*m_filePointerX) : std::nullopt;
+  if (column != m_hoveredFileColumn) {
+    m_hoveredFileColumn = column;
+    if (m_dispatcher.hoveredArea())
+      m_dispatcher.hoveredArea()->requestTooltipRefresh();
+  }
+  if (m_surface && !activeModalDialog().hoverTooltipsEnabled())
     TooltipManager::instance().onHoverChange(
         m_dispatcher.hoveredArea(), m_surface->xdgSurface(), m_wayland.outputForSurface(m_surface->wlSurface())
     );
@@ -3981,14 +4022,19 @@ void FileManager::syncTooltipHover() {
 
 void FileManager::handlePointer(const PointerEvent& event) {
   if (m_surface && event.surface == m_surface->wlSurface()) {
-    if (event.type == PointerEvent::Type::Enter || event.type == PointerEvent::Type::Motion)
-      TooltipManager::instance().setPointerPosition(static_cast<float>(event.sx), static_cast<float>(event.sy));
+    if (event.type == PointerEvent::Type::Enter || event.type == PointerEvent::Type::Motion) {
+      m_filePointerX = static_cast<float>(event.sx);
+      TooltipManager::instance().setPointerPosition(*m_filePointerX, static_cast<float>(event.sy));
+    }
     // Menu routing below can consume the leave before the main dispatcher sees it.
-    if (event.type == PointerEvent::Type::Leave)
+    if (event.type == PointerEvent::Type::Leave) {
+      m_filePointerX.reset();
       m_dispatcher.pointerLeave();
+    }
     if (event.type == PointerEvent::Type::Axis || (event.type == PointerEvent::Type::Button && event.pressed))
       TooltipManager::instance().forceDestroy();
   } else if (event.type == PointerEvent::Type::Enter) {
+    m_filePointerX.reset();
     m_dispatcher.pointerLeave();
   }
   dispatchPointer(event);
@@ -4024,7 +4070,7 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
   if (event.type == PointerEvent::Type::Button && event.pressed)
     m_lastInputSerial = event.serial;
   if (m_modalDialog.isOpen()) {
-    m_modalDialog.handlePointer(event);
+    activeModalDialog().handlePointer(event);
     return;
   }
   if (m_progressWindow.ownsSurface(event.surface)) {
@@ -4057,6 +4103,22 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
     return;
   if (m_listHeader.handlePointer(event, x, y))
     return;
+  if (m_grid
+      && event.type == PointerEvent::Type::Axis
+      && (event.axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL
+          || (event.axis == WL_POINTER_AXIS_VERTICAL_SCROLL && (m_keyboardModifiers & KeyMod::Shift)))) {
+    const InputArea::PointerData scroll{
+        .axis = event.axis,
+        .axisSource = event.axisSource,
+        .axisValue = event.axisValue,
+        .axisDiscrete = event.axisDiscrete,
+        .axisValue120 = event.axisValue120,
+        .axisLines = event.axisLines,
+    };
+    if ((m_grid->containsScenePoint(x, y) || m_listHeader.headerAt(x, y))
+        && m_listHeader.scrollHorizontally(scroll.scrollDelta(32.0F)))
+      return;
+  }
   if (m_statusDivider && m_statusStrip) {
     float dx = 0.0F, dy = 0.0F;
     Node::absolutePosition(m_statusDivider, dx, dy);

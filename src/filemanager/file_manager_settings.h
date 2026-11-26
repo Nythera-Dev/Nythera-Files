@@ -7,6 +7,7 @@
 #include "core/inotify/inotify.h"
 #include "filemanager/configuration_notice.h"
 #include "filemanager/file_columns.h"
+#include "filemanager/search_scope.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -39,6 +40,13 @@ namespace filemanager {
     FileDialogSortOrder sortOrder = FileDialogSortOrder::Ascending;
   };
 
+  struct SearchSettings {
+    SearchLocations exclusions;
+    std::vector<CustomSearch> profiles;
+    SearchOptions standardOptions;
+    bool operator==(const SearchSettings&) const = default;
+  };
+
   class FileManagerSettings final : public PollSource {
   public:
     using ProblemCallback = std::function<void(const ConfigurationProblem&, const std::filesystem::path&)>;
@@ -54,6 +62,14 @@ namespace filemanager {
     void dispatch(const std::vector<pollfd>& fds, std::size_t startIdx) override;
     bool reload();
     [[nodiscard]] const toml::table& preferences() const { return m_preferences; }
+    [[nodiscard]] const SearchSettings& searchSettings() const { return m_searchSettings; }
+    [[nodiscard]] bool saveStandardSearchOptions(SearchOptions options);
+    [[nodiscard]] bool saveSearchExclusions(const SearchLocations& exclusions);
+    [[nodiscard]] bool
+    editCustomSearch(const std::optional<CustomSearch>& previous, const std::optional<CustomSearch>& replacement);
+    void setSearchReloadCallback(std::function<void(const SearchSettings&)> callback) {
+      m_onSearchReload = std::move(callback);
+    }
     [[nodiscard]] bool readlineShortcuts() const;
     [[nodiscard]] PanelTransparencyMode transparencyMode() const;
     [[nodiscard]] bool reset(const nythera::config::ConfigKeyPath& path);
@@ -115,6 +131,8 @@ namespace filemanager {
   private:
     using Change = std::pair<nythera::config::ConfigKeyPath, std::optional<std::string>>;
     bool save(std::vector<Change> changes);
+    bool reloadSearchSettings();
+    [[nodiscard]] std::filesystem::path searchSettingsPath() const;
     void reportProblem(ConfigurationProblem problem);
     void updateWatches(const nythera::config::SourcedMergeResult& loaded);
     void accept(nythera::config::SourcedMergeResult loaded, bool notify);
@@ -125,6 +143,8 @@ namespace filemanager {
     const std::filesystem::path m_configDir;
     StateStore m_state;
     toml::table m_preferences;
+    SearchSettings m_searchSettings;
+    std::function<void(const SearchSettings&)> m_onSearchReload;
     ReloadCallback m_onReload;
     std::function<void()> m_onManualReload;
     ProblemCallback m_onProblem;

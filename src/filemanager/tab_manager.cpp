@@ -437,6 +437,7 @@ namespace filemanager {
               tab->selectedPath.reset();
               tab->selectedPaths.clear();
               tab->selectionAnchor.reset();
+              tab->browsingSelection.reset();
               tab->pendingScrollOffsetAfterRefresh.reset();
               if (m_callbacks.onAnyBeforePathChange)
                 m_callbacks.onAnyBeforePathChange(*tab, newPath);
@@ -536,7 +537,15 @@ namespace filemanager {
         .onEntriesChanged =
             [this, tabId] {
               auto* tab = findTab(tabId);
-              if (tab != nullptr && tabId == m_activeTabId && m_callbacks.onActiveEntriesChanged)
+              if (!tab)
+                return;
+              if (!tab->session.search().active() && tab->browsingSelection) {
+                tab->selectedPath = std::move(tab->browsingSelection->path);
+                tab->selectedPaths = std::move(tab->browsingSelection->paths);
+                tab->selectionAnchor = std::move(tab->browsingSelection->anchor);
+                tab->browsingSelection.reset();
+              }
+              if (tabId == m_activeTabId && m_callbacks.onActiveEntriesChanged)
                 m_callbacks.onActiveEntriesChanged(*tab);
             },
         .onEntryChangedAt =
