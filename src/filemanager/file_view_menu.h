@@ -66,7 +66,8 @@ namespace filemanager {
   }
 
   inline ContextMenuControlEntry fileSortByMenuEntry(
-      FileDialogSortField sortField, FileDialogSortOrder sortOrder, bool foldersFirst, bool hiddenLast
+      FileDialogSortField sortField, FileDialogSortOrder sortOrder, bool foldersFirst, bool hiddenLast,
+      bool search = false
   ) {
     const auto field = [sortField](int id, const char* label, FileDialogSortField value) {
       return ContextMenuControlEntry{
@@ -78,8 +79,6 @@ namespace filemanager {
         field(54, "Size", FileDialogSortField::Size),
         field(61, "Type", FileDialogSortField::Type),
         field(55, "Modified", FileDialogSortField::Modified),
-        field(56, "Created", FileDialogSortField::Created),
-        field(57, "Accessed", FileDialogSortField::Accessed),
         {.id = 58,
          .label = "Ascending",
          .radio = true,
@@ -91,6 +90,14 @@ namespace filemanager {
         {.id = 51, .label = "Folders First", .checkmark = true, .toggleState = foldersFirst ? 1 : 0},
         {.id = 52, .label = "Hidden Files Last", .checkmark = true, .toggleState = hiddenLast ? 1 : 0}
     };
+    if (search) {
+      children.insert(children.begin() + 1, field(63, "Location", FileDialogSortField::Location));
+    } else {
+      children.insert(
+          children.begin() + 4,
+          {field(56, "Created", FileDialogSortField::Created), field(57, "Accessed", FileDialogSortField::Accessed)}
+      );
+    }
     return {
         .id = 100,
         .label = "Sort By",
@@ -103,12 +110,13 @@ namespace filemanager {
 
   inline void appendFileMenuEntries(
       std::vector<ContextMenuControlEntry>& entries, FileMenuContext context, bool gridMode, bool showHidden,
-      FileDialogSortField sortField, FileDialogSortOrder sortOrder, bool foldersFirst, bool hiddenLast
+      FileDialogSortField sortField, FileDialogSortOrder sortOrder, bool foldersFirst, bool hiddenLast,
+      bool search = false
   ) {
     if (context == FileMenuContext::Toolbar || context == FileMenuContext::Empty) {
       entries.push_back({.id = 14, .label = gridMode ? "Switch to List" : "Switch to Grid"});
       entries.push_back({.id = 50, .label = "Show Hidden Files", .checkmark = true, .toggleState = showHidden ? 1 : 0});
     }
-    entries.push_back(fileSortByMenuEntry(sortField, sortOrder, foldersFirst, hiddenLast));
+    entries.push_back(fileSortByMenuEntry(sortField, sortOrder, foldersFirst, hiddenLast, search));
   }
 } // namespace filemanager

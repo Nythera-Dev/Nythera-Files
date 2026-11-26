@@ -393,6 +393,18 @@ namespace filemanager {
                 return tab->viewState.sortOrder;
               return FileDialogSortOrder::Ascending;
             },
+        .searchSortField =
+            [this, tabId] {
+              if (const auto* tab = findTab(tabId))
+                return tab->searchViewState.sortField;
+              return FileDialogSortField::Name;
+            },
+        .searchSortOrder =
+            [this, tabId] {
+              if (const auto* tab = findTab(tabId))
+                return tab->searchViewState.sortOrder;
+              return FileDialogSortOrder::Ascending;
+            },
         .isSizeColumnVisible =
             [this] { return m_callbacks.isSizeColumnVisible ? m_callbacks.isSizeColumnVisible() : false; },
         .isRenaming = [this, tabId] { return m_callbacks.isRenaming ? m_callbacks.isRenaming(tabId) : false; },

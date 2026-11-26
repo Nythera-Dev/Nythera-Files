@@ -324,6 +324,7 @@ namespace filemanager {
       std::uint64_t generation;
       std::filesystem::path path;
       std::shared_ptr<GCancellable> cancel;
+      bool useFastType;
       bool symlink = false;
       std::string target;
       bool hasSize = false;
@@ -332,9 +333,11 @@ namespace filemanager {
     auto cancel = std::shared_ptr<GCancellable>(g_cancellable_new(), g_object_unref);
     m_selectionInfoCancellable = G_CANCELLABLE(g_object_ref(cancel.get()));
     GFile* file = isTrashTabPath(path) ? g_file_new_for_uri(path.c_str()) : g_file_new_for_path(path.c_str());
-    constexpr const char* attributes =
-        "standard::type,standard::is-symlink,standard::symlink-target,standard::content-type,standard::size";
-    auto* initialReq = new SelectionInfoRequest{this, weakAlive, generation, path, std::move(cancel)};
+    const bool useFastType = session.search().active();
+    const char* attributes = useFastType
+        ? "standard::type,standard::is-symlink,standard::symlink-target,standard::fast-content-type,standard::size"
+        : "standard::type,standard::is-symlink,standard::symlink-target,standard::content-type,standard::size";
+    auto* initialReq = new SelectionInfoRequest{this, weakAlive, generation, path, std::move(cancel), useFastType};
     g_file_query_info_async(
         file, attributes, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, G_PRIORITY_DEFAULT, initialReq->cancel.get(),
         [](GObject* source, GAsyncResult* result, gpointer data) {
@@ -366,7 +369,11 @@ namespace filemanager {
           if (!symlink) {
             std::string description = "File";
             if (info != nullptr) {
-              const char* contentType = g_file_info_get_content_type(info);
+              const char* contentType = g_file_info_get_attribute_string(
+                  info,
+                  req->useFastType ? G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
+                                   : G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE
+              );
               gchar* typeName = contentType == nullptr ? nullptr : g_content_type_get_description(contentType);
               description = gFileInfoTypeOrUnknown(info) == G_FILE_TYPE_DIRECTORY ? "Folder"
                   : typeName != nullptr                                           ? typeName
@@ -395,8 +402,10 @@ namespace filemanager {
           g_clear_object(&info);
           auto* followReq = req.release();
           g_file_query_info_async(
-              G_FILE(source), "standard::type,standard::content-type", G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT,
-              followReq->cancel.get(),
+              G_FILE(source),
+              followReq->useFastType ? "standard::type,standard::fast-content-type"
+                                     : "standard::type,standard::content-type",
+              G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT, followReq->cancel.get(),
               [](GObject* followSource, GAsyncResult* followResult, gpointer followData) {
                 std::unique_ptr<SelectionInfoRequest> follow(static_cast<SelectionInfoRequest*>(followData));
                 GError* followError = nullptr;
@@ -417,7 +426,11 @@ namespace filemanager {
                     targetInfo == nullptr || gFileInfoTypeOrUnknown(targetInfo) == G_FILE_TYPE_SYMBOLIC_LINK;
                 std::string description = broken ? "Broken symbolic link" : "File";
                 if (targetInfo != nullptr && !broken) {
-                  const char* contentType = g_file_info_get_content_type(targetInfo);
+                  const char* contentType = g_file_info_get_attribute_string(
+                      targetInfo,
+                      follow->useFastType ? G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE
+                                          : G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE
+                  );
                   gchar* typeName = contentType == nullptr ? nullptr : g_content_type_get_description(contentType);
                   description = gFileInfoTypeOrUnknown(targetInfo) == G_FILE_TYPE_DIRECTORY ? "Folder"
                       : typeName != nullptr                                                 ? typeName

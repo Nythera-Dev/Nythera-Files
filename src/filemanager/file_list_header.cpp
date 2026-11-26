@@ -41,8 +41,8 @@ namespace filemanager {
     m_gridMode = viewSettings.gridMode;
     m_sortField = viewSettings.sortField;
     m_sortOrder = viewSettings.sortOrder;
-    m_settings.loadListColumnWidths(m_preferredColumns);
-    m_settings.loadListColumnLayout(m_columnLayout);
+    m_settings.loadListColumnWidths(m_preferredColumns, m_searchView);
+    m_settings.loadListColumnLayout(m_columnLayout, m_searchView);
     m_listColumns = m_preferredColumns;
   }
 
@@ -74,9 +74,9 @@ namespace filemanager {
     for (auto column : kFileColumns) {
       const auto index = columnIndex(column);
       auto header = std::make_unique<Button>();
-      header->setText(kFileColumnLabels[index]);
+      header->setText(columnLabel(column));
       header->setVariant(ButtonVariant::Ghost);
-      header->setOnClick([this, index] { setSortField(kColumnSortFields[index]); });
+      header->setOnClick([this, column] { setSortField(columnSortField(column)); });
       m_headers[index] = header.get();
       styleHeader(
           *header,
@@ -111,9 +111,7 @@ namespace filemanager {
     return fileHeader;
   }
 
-  void FileListHeaderController::attachGrid(VirtualGridView* grid) {
-    m_grid = grid;
-  }
+  void FileListHeaderController::attachGrid(VirtualGridView* grid) { m_grid = grid; }
 
   void FileListHeaderController::detachUi() {
     m_resizingColumn.reset();
@@ -137,20 +135,26 @@ namespace filemanager {
 
   void FileListHeaderController::reloadColumnPreferences() {
     m_preferredColumns = FileColumns{};
-    m_columnLayout = FileColumnLayout{};
-    m_settings.loadListColumnWidths(m_preferredColumns);
-    m_settings.loadListColumnLayout(m_columnLayout);
+    m_columnLayout = m_searchView ? kDefaultSearchColumnLayout : FileColumnLayout{};
+    m_settings.loadListColumnWidths(m_preferredColumns, m_searchView);
+    m_settings.loadListColumnLayout(m_columnLayout, m_searchView);
+    m_listColumns = m_preferredColumns;
     updateColumnHeaders();
   }
 
-  void FileListHeaderController::applyTabViewState(const TabViewState& state) {
+  void FileListHeaderController::applyTabViewState(const TabViewState& state, bool search) {
     cancelGesture();
     m_gridMode = state.gridMode;
     m_sortField = state.sortField;
     m_sortOrder = state.sortOrder;
     m_viewScale = state.viewScale;
     m_viewScaleLoaded = true;
-    updateColumnHeaders();
+    if (m_searchView != search) {
+      m_searchView = search;
+      reloadColumnPreferences();
+    } else {
+      updateColumnHeaders();
+    }
     syncSortControls();
   }
 
@@ -168,8 +172,8 @@ namespace filemanager {
   }
 
   void FileListHeaderController::toggleSortOrder() {
-    m_sortOrder =
-        m_sortOrder == FileDialogSortOrder::Ascending ? FileDialogSortOrder::Descending : FileDialogSortOrder::Ascending;
+    m_sortOrder = m_sortOrder == FileDialogSortOrder::Ascending ? FileDialogSortOrder::Descending
+                                                                : FileDialogSortOrder::Ascending;
     if (m_callbacks.onViewStateChanged)
       m_callbacks.onViewStateChanged();
     if (m_callbacks.onSortChanged)
@@ -177,14 +181,28 @@ namespace filemanager {
     syncSortControls();
   }
 
+  std::string_view FileListHeaderController::columnLabel(FileColumn column) const {
+    return (m_searchView ? kSearchFileColumnLabels : kFileColumnLabels)[columnIndex(column)];
+  }
+
+  FileDialogSortField FileListHeaderController::columnSortField(FileColumn column) const {
+    return m_searchView && column == kSearchLocationSlot ? FileDialogSortField::Location
+                                                         : kColumnSortFields[columnIndex(column)];
+  }
+
   void FileListHeaderController::syncSortControls() {
     for (auto column : kFileColumns) {
       const auto index = columnIndex(column);
       if (auto* header = m_headers[index]) {
-        const bool selected = m_sortField == kColumnSortFields[index];
-        auto text = std::string(kFileColumnLabels[index]);
+        const bool selected = m_sortField == columnSortField(column);
+        auto text = std::string(columnLabel(column));
         if (selected)
           text += m_sortOrder == FileDialogSortOrder::Ascending ? "  ↑" : "  ↓";
+        header->setContentAlign(
+            column == FileColumn::Name || column == FileColumn::Type || (m_searchView && column == kSearchLocationSlot)
+                ? ButtonContentAlign::Start
+                : ButtonContentAlign::End
+        );
         header->setText(text);
         header->setSelected(selected);
       }
@@ -212,7 +230,7 @@ namespace filemanager {
     m_viewScale = scale;
     if (m_callbacks.onViewModeOrScaleChanged)
       m_callbacks.onViewModeOrScaleChanged();
-    if (!m_settings.saveViewScale(m_viewScale) && m_callbacks.onStatus)
+    if (!m_settings.saveViewScale(m_viewScale, m_searchView) && m_callbacks.onStatus)
       m_callbacks.onStatus("Unable to save file view zoom");
   }
 
@@ -245,7 +263,7 @@ namespace filemanager {
   }
 
   void FileListHeaderController::persistColumnLayout() {
-    if (!m_settings.saveListColumnLayout(m_columnLayout) && m_callbacks.onStatus)
+    if (!m_settings.saveListColumnLayout(m_columnLayout, m_searchView) && m_callbacks.onStatus)
       m_callbacks.onStatus("Unable to save file column layout");
   }
 
@@ -299,9 +317,7 @@ namespace filemanager {
       return;
     m_header->arrange(
         renderer,
-        LayoutRect{
-            .x = m_header->x(), .y = m_header->y(), .width = m_header->width(), .height = m_header->height()
-        }
+        LayoutRect{.x = m_header->x(), .y = m_header->y(), .width = m_header->width(), .height = m_header->height()}
     );
   }
 
@@ -397,7 +413,7 @@ namespace filemanager {
           for (auto visible : m_visibleColumns)
             if (!keepNameFlexible || visible != FileColumn::Name)
               m_preferredColumns[visible] = m_listColumns[visible];
-          if (!m_settings.saveListColumnWidths(m_preferredColumns) && m_callbacks.onStatus)
+          if (!m_settings.saveListColumnWidths(m_preferredColumns, m_searchView) && m_callbacks.onStatus)
             m_callbacks.onStatus("Unable to save file column widths");
         }
         cancelGesture();
@@ -506,8 +522,8 @@ namespace filemanager {
     if (!m_header || m_visibleColumns.empty())
       return 0.0F;
     // The list's focus plane shares the resolved row width, including the scrollbar gutter.
-    const float rowWidth = m_grid && !m_gridMode && m_grid->focusArea()->width() > 0.0F ? m_grid->focusArea()->width()
-                                                                                        : m_header->width();
+    const float rowWidth =
+        m_grid && !m_gridMode && m_grid->focusArea()->width() > 0.0F ? m_grid->focusArea()->width() : m_header->width();
     const float spacing = static_cast<float>(m_visibleColumns.size() + 1) * Style::spaceSm;
     return std::max(0.0F, rowWidth - spacing);
   }

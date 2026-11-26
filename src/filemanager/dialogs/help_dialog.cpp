@@ -33,6 +33,8 @@ namespace filemanager {
         HelpDialogController::ShortcutEntry{"Back / Forward", "Alt+Left / Alt+Right"},
         HelpDialogController::ShortcutEntry{"Go to Home Folder", "Alt+Home"},
         HelpDialogController::ShortcutEntry{"Edit Location", "Ctrl+L / Alt+D"},
+        HelpDialogController::ShortcutEntry{"Search Files and Folders", "Ctrl+F"},
+        HelpDialogController::ShortcutEntry{"Close Search", "Esc"},
         HelpDialogController::ShortcutEntry{"Move Selection Up", "Up"},
         HelpDialogController::ShortcutEntry{"Move Selection Down", "Down"},
         HelpDialogController::ShortcutEntry{"Quit", "Ctrl+Q"},

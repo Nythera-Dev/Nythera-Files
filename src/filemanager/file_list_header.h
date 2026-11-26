@@ -57,7 +57,7 @@ namespace filemanager {
     void adjustViewScale(float value);
     void ensureViewScaleLoaded();
     void reloadColumnPreferences();
-    void applyTabViewState(const TabViewState& state);
+    void applyTabViewState(const TabViewState& state, bool search = false);
 
     void updateColumnHeaders();
     void persistColumnLayout();
@@ -74,9 +74,14 @@ namespace filemanager {
     [[nodiscard]] FileDialogSortOrder sortOrder() const noexcept { return m_sortOrder; }
     [[nodiscard]] const FileColumns& listColumns() const noexcept { return m_listColumns; }
     [[nodiscard]] const std::vector<FileColumn>& visibleColumns() const noexcept { return m_visibleColumns; }
+    [[nodiscard]] bool searchView() const noexcept { return m_searchView; }
+    [[nodiscard]] std::string_view columnLabel(FileColumn column) const;
+    [[nodiscard]] FileDialogSortField columnSortField(FileColumn column) const;
     [[nodiscard]] FileColumnLayout& columnLayout() noexcept { return m_columnLayout; }
     [[nodiscard]] const FileColumnLayout& columnLayout() const noexcept { return m_columnLayout; }
-    [[nodiscard]] bool gestureActive() const noexcept { return m_resizingColumn.has_value() || m_columnDrag.has_value(); }
+    [[nodiscard]] bool gestureActive() const noexcept {
+      return m_resizingColumn.has_value() || m_columnDrag.has_value();
+    }
 
   private:
     friend class ::FileManagerTestAccess;
@@ -107,6 +112,7 @@ namespace filemanager {
     FileColumns m_columnStart{};
     FileColumns m_listColumns{};
     FileColumns m_preferredColumns{};
+    bool m_searchView = false;
     FileColumnLayout m_columnLayout;
     std::vector<FileColumn> m_visibleColumns;
     float m_leftGutter = -1.0F;

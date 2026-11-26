@@ -8,13 +8,13 @@
 #include "filemanager/file_view_menu.h"
 #include "filemanager/property_operations.h"
 #include "render/render_context.h"
-#include "ui/tooltip/tooltip_manager.h"
 #include "ui/controls/box.h"
 #include "ui/controls/button.h"
 #include "ui/controls/flex.h"
 #include "ui/controls/label.h"
 #include "ui/dialogs/file_view_metrics.h"
 #include "ui/palette.h"
+#include "ui/tooltip/tooltip_manager.h"
 
 #include <algorithm>
 #include <charconv>
@@ -293,6 +293,8 @@ namespace filemanager {
   }
 
   void FileMenuController::closeApplicationPicker() {
+    if (auto request = std::exchange(m_applicationMimeRequest, {}))
+      g_cancellable_cancel(request.get());
     if (m_applicationPicker)
       m_applicationPicker->close();
   }
@@ -663,11 +665,13 @@ namespace filemanager {
     };
     if (!gridMode) {
       std::vector<ContextMenuControlEntry> columns;
-      for (auto column : filemanager::kFileColumns) {
+      for (auto column : m_listHeader.columnLayout().order) {
+        if (m_listHeader.searchView() && column == FileColumn::Accessed)
+          continue;
         const auto index = columnIndex(column);
         columns.push_back(
             {.id = menu_id::kFirstColumnAction + static_cast<int>(index),
-             .label = std::string(filemanager::kFileColumnLabels[index]),
+             .label = std::string(m_listHeader.columnLabel(column)),
              .enabled = column != FileColumn::Name,
              .checkmark = true,
              .toggleState = m_listHeader.columnLayout().visible[index] ? 1 : 0}
@@ -686,7 +690,8 @@ namespace filemanager {
         {
             {.separator = true},
             filemanager::fileSortByMenuEntry(
-                m_listHeader.sortField(), m_listHeader.sortOrder(), session.foldersFirst(), session.hiddenLast()
+                m_listHeader.sortField(), m_listHeader.sortOrder(), session.foldersFirst(), session.hiddenLast(),
+                m_listHeader.searchView()
             ),
             {.id = 50,
              .label = "Show Hidden Files",
@@ -1117,7 +1122,7 @@ namespace filemanager {
             : session.entries()[index].isDir ? filemanager::FileMenuContext::Folder
                                              : filemanager::FileMenuContext::File,
         m_listHeader.gridMode(), session.showHidden(), m_listHeader.sortField(), m_listHeader.sortOrder(),
-        session.foldersFirst(), session.hiddenLast()
+        session.foldersFirst(), session.hiddenLast(), m_listHeader.searchView()
     );
     if (!session.browsingTrash() && !targetIsDir) {
       const auto checksums = m_callbacks.checksumMenuEntries ? m_callbacks.checksumMenuEntries()
@@ -1140,6 +1145,11 @@ namespace filemanager {
            .actionGlyph = "copy"}
       );
     }
+    if (session.search().active())
+      entries.insert(
+          std::next(entries.begin()),
+          {.id = menu_id::kOpenContainingFolder, .label = "Open Containing Folder", .actionGlyph = "folder-open"}
+      );
     auto* output = m_wayland.lastPointerOutput();
     if (!output)
       output = m_wayland.outputForSurface(surface->wlSurface());
@@ -1194,7 +1204,7 @@ namespace filemanager {
     filemanager::appendFileMenuEntries(
         entries, session.browsingTrash() ? filemanager::FileMenuContext::Trash : filemanager::FileMenuContext::Empty,
         m_listHeader.gridMode(), session.showHidden(), m_listHeader.sortField(), m_listHeader.sortOrder(),
-        session.foldersFirst(), session.hiddenLast()
+        session.foldersFirst(), session.hiddenLast(), m_listHeader.searchView()
     );
     filemanager::groupFileMenuEntries(
         entries, session.browsingTrash() ? filemanager::FileMenuContext::Trash : filemanager::FileMenuContext::Empty
@@ -1292,13 +1302,62 @@ namespace filemanager {
     if (!m_applicationPicker || !m_contextMenuTarget || session.browsingTrash() || !tab.capabilities().canLaunchApps)
       return;
     const auto targetEntry = std::ranges::find(session.entries(), *m_contextMenuTarget, &FileEntry::absPath);
-    m_applicationChooserMime = targetEntry != session.entries().end() ? targetEntry->type : std::string{};
-    if (m_applicationChooserMime.empty()) {
-      if (gchar* guessed = g_content_type_guess(m_contextMenuTarget->filename().c_str(), nullptr, 0, nullptr)) {
-        m_applicationChooserMime = guessed;
-        g_free(guessed);
-      }
+    std::string mime = targetEntry != session.entries().end() ? targetEntry->type : std::string{};
+    if (mime.empty()) {
+      g_autofree char* guessed = g_content_type_guess(m_contextMenuTarget->filename().c_str(), nullptr, 0, nullptr);
+      if (guessed)
+        mime = guessed;
     }
+    closeApplicationPicker();
+    if (!session.search().active()) {
+      showApplicationChooser(std::move(mime));
+      return;
+    }
+
+    // The chooser uses the actual MIME type for recommendations and for setting the default app.
+    struct Request {
+      FileMenuController* owner;
+      std::shared_ptr<GCancellable> cancel;
+      TabId tabId;
+      std::uint64_t navigation;
+      std::string query;
+      std::filesystem::path path;
+    };
+    m_applicationMimeRequest = std::shared_ptr<GCancellable>(g_cancellable_new(), g_object_unref);
+    g_autoptr(GFile) file = g_file_new_for_path(m_contextMenuTarget->c_str());
+    g_file_query_info_async(
+        file, G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE, G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT,
+        m_applicationMimeRequest.get(),
+        [](GObject* source, GAsyncResult* result, gpointer data) {
+          const std::unique_ptr<Request> request(static_cast<Request*>(data));
+          g_autoptr(GFileInfo) info = g_file_query_info_finish(G_FILE(source), result, nullptr);
+          if (g_cancellable_is_cancelled(request->cancel.get()))
+            return;
+          auto& self = *request->owner;
+          self.m_applicationMimeRequest.reset();
+          const auto& active = self.m_tabs.activeTab();
+          if (active.id != request->tabId
+              || active.session.navigationGeneration() != request->navigation
+              || !active.session.search().active()
+              || active.session.search().query() != request->query
+              || self.m_contextMenuTarget != request->path
+              || !self.m_applicationPicker
+              || !active.capabilities().canLaunchApps)
+            return;
+          const auto* detectedType =
+              info ? g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE) : nullptr;
+          self.showApplicationChooser(detectedType ? detectedType : "");
+        },
+        new Request{
+            this, m_applicationMimeRequest, tab.id, session.navigationGeneration(), session.search().query(),
+            *m_contextMenuTarget
+        }
+    );
+  }
+
+  void FileMenuController::showApplicationChooser(std::string mime) {
+    const auto& tab = m_tabs.activeTab();
+    m_applicationChooserMime = std::move(mime);
     m_applicationChooserApps.clear();
     std::vector<SearchPickerOption> options;
     std::unordered_set<std::string> recommendedIds;

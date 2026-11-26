@@ -1,6 +1,7 @@
 #include "filemanager/directory_session.h"
 
 #include "filemanager/file_columns.h"
+#include "filemanager/file_entry_info.h"
 #include "filemanager/file_sort.h"
 #include "filemanager/folder_size.h"
 #include "filemanager/wastebin_fallback.h"
@@ -14,35 +15,6 @@
 namespace filemanager {
 
   namespace {
-
-    FileEntry makeFileEntry(GFileInfo* info, const std::filesystem::path& path) {
-      FileEntry entry;
-      entry.name = g_file_info_get_name(info);
-      entry.absPath = path;
-      entry.isDir = gFileInfoTypeOrUnknown(info) == G_FILE_TYPE_DIRECTORY;
-      entry.size = g_file_info_get_size(info);
-      if (const auto* type = g_file_info_get_content_type(info))
-        entry.type = type;
-      entry.mtime = std::filesystem::file_time_type::clock::from_sys(
-          std::chrono::system_clock::from_time_t(
-              static_cast<std::time_t>(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_MODIFIED))
-          )
-      );
-      entry.hasCreated = g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_CREATED);
-      entry.created = entry.hasCreated ? g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_CREATED) : 0;
-      entry.hasAccessed = g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_ACCESS);
-      entry.accessed = entry.hasAccessed ? g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_ACCESS) : 0;
-      entry.isSymlink =
-          g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK) && g_file_info_get_is_symlink(info);
-      if (!entry.isSymlink
-          && g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_DEVICE)
-          && g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_INODE)) {
-        entry.device = static_cast<std::uint64_t>(g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_DEVICE));
-        entry.inode = g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_UNIX_INODE);
-        entry.hasIdentity = true;
-      }
-      return entry;
-    }
 
     FileEntry makeFileEntryFromAdminRecord(const AdminDirEntryRecord& rec, const std::filesystem::path& dirPath) {
       FileEntry entry;
@@ -111,6 +83,7 @@ namespace filemanager {
   void DirectorySession::shutdown() {
     if (m_alive)
       *m_alive = false;
+    m_search.cancel();
     clearFolderCounts();
     cancelDirectoryWritableQuery();
     cancelEnumeration();
@@ -133,6 +106,7 @@ namespace filemanager {
     const bool pathChanged = path != m_path;
     if (m_callbacks.onBeforeNavigate)
       m_callbacks.onBeforeNavigate(path, pathChanged);
+    closeSearch();
     if (recordHistory && pathChanged) {
       m_backHistory.push_back(m_path);
       m_forwardHistory.clear();
@@ -169,6 +143,8 @@ namespace filemanager {
             std::exchange(m_activePrivilegedFolderCountRequestId, kInvalidAdminRequestId)
         );
       }
+      m_visibleSearchFolders.clear();
+      m_runningFolderCountPath.clear();
       m_pendingFolderCounts.clear();
       m_folderCountRunning = false;
       std::erase_if(m_folderCounts, [](const auto& item) { return !item.second.items.has_value(); });
@@ -182,19 +158,44 @@ namespace filemanager {
   }
 
   std::optional<std::uint64_t> DirectorySession::folderItemCount(const FileEntry& entry) {
-    if (!m_active
-        || !entry.isDir
-        || m_loading
-        || !(m_callbacks.isSizeColumnVisible && m_callbacks.isSizeColumnVisible()))
+    if (!m_active || !entry.isDir || !(m_callbacks.isSizeColumnVisible && m_callbacks.isSizeColumnVisible()))
       return std::nullopt;
     const auto path = entry.absPath.string();
     if (const auto found = m_folderCounts.find(path); found != m_folderCounts.end())
       return found->second.items;
+    if (!m_search.active() && !m_loading) {
+      enqueueFolderCount(path);
+      startNextFolderCount();
+    }
+    return std::nullopt;
+  }
+
+  void DirectorySession::enqueueFolderCount(const std::string& path) {
+    if (m_folderCounts.contains(path))
+      return;
     const auto id = ++m_nextFolderCountId;
     m_folderCounts.emplace(path, FolderCount{id, std::nullopt});
     m_pendingFolderCounts.emplace_back(path, id);
+  }
+
+  void DirectorySession::updateVisibleSearchFolders(std::unordered_map<std::string, std::size_t> visible) {
+    if (!m_active || !m_search.active() || m_visibleSearchFolders == visible)
+      return;
+    for (const auto& [path, index] : m_visibleSearchFolders) {
+      if (!visible.contains(path)) {
+        if (auto found = m_folderCounts.find(path); found != m_folderCounts.end() && !found->second.items)
+          m_folderCounts.erase(found);
+        if (m_folderCountCancellable && path == m_runningFolderCountPath)
+          g_cancellable_cancel(m_folderCountCancellable);
+      }
+    }
+    m_visibleSearchFolders = std::move(visible);
+    std::erase_if(m_pendingFolderCounts, [this](const auto& pending) {
+      return !m_visibleSearchFolders.contains(pending.first);
+    });
+    for (const auto& [path, index] : m_visibleSearchFolders)
+      enqueueFolderCount(path);
     startNextFolderCount();
-    return std::nullopt;
   }
 
   void DirectorySession::startNextFolderCount() {
@@ -259,6 +260,7 @@ namespace filemanager {
       };
       m_folderCountRunning = true;
       m_folderCountCancellable = g_cancellable_new();
+      m_runningFolderCountPath = path;
       GTask* task = g_task_new(
           directory, m_folderCountCancellable,
           [](GObject*, GAsyncResult* result, gpointer) {
@@ -272,25 +274,35 @@ namespace filemanager {
               return;
             auto* self = request->session;
             GCancellable* taskCancellable = g_task_get_cancellable(completed);
-            if (g_cancellable_is_cancelled(taskCancellable) != FALSE
-                || taskCancellable != self->m_folderCountCancellable) {
-              if (!self->m_active)
-                std::erase_if(self->m_folderCounts, [](const auto& item) { return !item.second.items.has_value(); });
+            if (taskCancellable != self->m_folderCountCancellable)
               return;
-            }
             g_clear_object(&self->m_folderCountCancellable);
             self->m_folderCountRunning = false;
+            self->m_runningFolderCountPath.clear();
             const auto found = self->m_folderCounts.find(request->path.string());
             if (count && found != self->m_folderCounts.end() && found->second.id == request->id) {
               found->second.items = *count;
-              const auto row = std::ranges::find(self->m_entries, request->path, &FileEntry::absPath);
-              if (row != self->m_entries.end() && self->m_callbacks.onEntryChangedAt)
-                self->m_callbacks.onEntryChangedAt(static_cast<std::size_t>(row - self->m_entries.begin()));
+              if (self->m_callbacks.onEntryChangedAt) {
+                if (self->m_search.active()) {
+                  const auto visible = self->m_visibleSearchFolders.find(found->first);
+                  const auto& entries = self->entries();
+                  if (visible != self->m_visibleSearchFolders.end()
+                      && visible->second < entries.size()
+                      && entries[visible->second].absPath == request->path)
+                    self->m_callbacks.onEntryChangedAt(visible->second);
+                } else {
+                  const auto row = std::ranges::find(self->m_entries, request->path, &FileEntry::absPath);
+                  if (row != self->m_entries.end())
+                    self->m_callbacks.onEntryChangedAt(static_cast<std::size_t>(row - self->m_entries.begin()));
+                }
+              }
             }
             self->startNextFolderCount();
           },
           nullptr
       );
+      if (m_search.active())
+        g_task_set_priority(task, G_PRIORITY_LOW);
       g_task_set_task_data(
           task, new Request{this, m_alive, std::filesystem::path(std::move(path)), id},
           [](gpointer data) { delete static_cast<Request*>(data); }
@@ -315,6 +327,8 @@ namespace filemanager {
       m_privilegedBackend.cancelRequest(std::exchange(m_activePrivilegedFolderCountRequestId, kInvalidAdminRequestId));
     }
     m_folderCountRunning = false;
+    m_visibleSearchFolders.clear();
+    m_runningFolderCountPath.clear();
     m_pendingFolderCounts.clear();
     m_folderCounts.clear();
   }
@@ -340,6 +354,70 @@ namespace filemanager {
     m_loading = true;
   }
 
+  void DirectorySession::configureSearchBackend(std::string executable, SearchMode defaultMode) {
+    const bool backendChanged = m_fzfExecutable != executable;
+    m_fzfExecutable = std::move(executable);
+    m_defaultSearchMode = defaultMode;
+    if (!m_search.active())
+      m_selectedSearchMode = defaultMode;
+    else if (backendChanged)
+      setSearchQuery(m_search.query());
+  }
+
+  void DirectorySession::setSearchMode(SearchMode mode) {
+    m_selectedSearchMode = mode;
+    if (m_search.active() && !manualSearchMode(m_search.query()))
+      setSearchQuery(m_search.query());
+  }
+
+  SearchMode DirectorySession::searchMode() const {
+    return manualSearchMode(m_search.query()).value_or(m_selectedSearchMode);
+  }
+
+  void DirectorySession::setSearchQuery(std::string query) {
+    if (!m_searchOpen || !canSearch())
+      return;
+    if (query.empty())
+      m_selectedSearchMode = m_defaultSearchMode;
+    const auto manual = m_fzfExecutable.empty() ? std::nullopt : manualSearchMode(query);
+    const FzfSearch backend{m_fzfExecutable, manual.value_or(m_selectedSearchMode), manual.has_value()};
+    clearFolderCounts();
+    m_search.edit(
+        m_path, std::move(query), m_showHidden, fileOrder(true),
+        [this](bool complete) {
+          if (complete) {
+            if (m_callbacks.onEntriesLoaded)
+              m_callbacks.onEntriesLoaded(false);
+            if (m_callbacks.onAfterEntriesLoaded)
+              m_callbacks.onAfterEntriesLoaded();
+          } else if (m_callbacks.onEntriesChanged) {
+            m_callbacks.onEntriesChanged();
+          }
+        },
+        [this] {
+          if (m_callbacks.isRenaming && m_callbacks.isRenaming())
+            return false;
+          if (m_active && m_callbacks.onCancelFileGesture)
+            m_callbacks.onCancelFileGesture();
+          return true;
+        },
+        backend
+    );
+    if (m_callbacks.onEntriesChanged)
+      m_callbacks.onEntriesChanged();
+  }
+
+  void DirectorySession::closeSearch() {
+    if (!m_searchOpen)
+      return;
+    m_searchOpen = false;
+    m_selectedSearchMode = m_defaultSearchMode;
+    m_search.cancel();
+    clearFolderCounts();
+    if (m_callbacks.onEntriesChanged)
+      m_callbacks.onEntriesChanged();
+  }
+
   void DirectorySession::refreshPreservingSelection() {
     m_chooseFirstAfterLoad = false;
     enumerate(m_path);
@@ -355,6 +433,10 @@ namespace filemanager {
         m_callbacks.onDeferRefreshDuringRename();
       return;
     }
+    if (!canSearch() || path != m_path)
+      closeSearch();
+    else if (m_search.active())
+      setSearchQuery(m_search.query());
     closeMonitor();
     cancelEnumeration();
     m_path = path;
@@ -410,7 +492,7 @@ namespace filemanager {
             }
             m_loading = false;
             m_entries = std::move(m_loadingEntries);
-            sortEntries();
+            sortFileEntries(m_entries);
             const bool chooseFirst = m_chooseFirstAfterLoad;
             m_chooseFirstAfterLoad = false;
             if (m_callbacks.onEnumerateCompletedStatus)
@@ -546,12 +628,12 @@ namespace filemanager {
           if (infos == nullptr) {
             self->m_loading = false;
             self->m_entries = std::move(self->m_loadingEntries);
-            self->sortEntries();
+            self->sortFileEntries(self->m_entries);
             const bool chooseFirst = self->m_chooseFirstAfterLoad;
             self->m_chooseFirstAfterLoad = false;
             if (self->m_callbacks.onEnumerateCompletedStatus)
               self->m_callbacks.onEnumerateCompletedStatus(self->m_entries.empty());
-            if (self->m_callbacks.onEntriesLoaded)
+            if (!self->m_search.active() && self->m_callbacks.onEntriesLoaded)
               self->m_callbacks.onEntriesLoaded(chooseFirst);
             g_object_unref(activeEnumerator);
             self->applyPendingMonitorChanges();
@@ -566,13 +648,33 @@ namespace filemanager {
     );
   }
 
-  void DirectorySession::sortEntries() {
+  void DirectorySession::sortEntries(bool includeBrowsing) {
+    if (m_search.active()) {
+      if (includeBrowsing)
+        sortFileEntries(m_entries);
+      m_search.setOrder(fileOrder(true));
+      return;
+    }
     if (m_active && m_callbacks.onCancelFileGesture)
       m_callbacks.onCancelFileGesture();
-    const auto field = m_callbacks.sortField ? m_callbacks.sortField() : FileDialogSortField::Name;
-    const auto order = m_callbacks.sortOrder ? m_callbacks.sortOrder() : FileDialogSortOrder::Ascending;
-    std::ranges::stable_sort(m_entries, [this, field, order](const FileEntry& lhs, const FileEntry& rhs) {
-      return filemanager::fileEntryLess(lhs, rhs, field, order, m_foldersFirst, m_hiddenLast);
+    sortFileEntries(m_entries);
+  }
+
+  FileSearchSession::Order DirectorySession::fileOrder(bool search) const {
+    const auto& field = search ? m_callbacks.searchSortField : m_callbacks.sortField;
+    const auto& order = search ? m_callbacks.searchSortOrder : m_callbacks.sortOrder;
+    return {
+        field ? field() : FileDialogSortField::Name,
+        order ? order() : FileDialogSortOrder::Ascending,
+        m_foldersFirst,
+        m_hiddenLast,
+    };
+  }
+
+  void DirectorySession::sortFileEntries(std::vector<FileEntry>& entries) {
+    const auto order = fileOrder();
+    std::ranges::stable_sort(entries, [order](const FileEntry& lhs, const FileEntry& rhs) {
+      return fileEntryLess(lhs, rhs, order.field, order.direction, order.foldersFirst, order.hiddenLast);
     });
   }
 
@@ -837,7 +939,7 @@ namespace filemanager {
           self->m_folderCounts.erase(query->path.string());
           if (!query->replacedPath.empty()) {
             self->m_folderCounts.erase(query->replacedPath.string());
-            if (self->m_callbacks.onEntryMonitoredRenamed)
+            if (!self->m_search.active() && self->m_callbacks.onEntryMonitoredRenamed)
               self->m_callbacks.onEntryMonitoredRenamed(query->replacedPath, query->path);
           }
           if (replacedEntry != self->m_entries.end())
@@ -848,7 +950,9 @@ namespace filemanager {
           else
             self->m_entries.push_back(std::move(entry));
 
-          self->sortEntries();
+          self->sortFileEntries(self->m_entries);
+          if (self->m_search.active())
+            return;
           if (self->m_callbacks.onEntriesChanged)
             self->m_callbacks.onEntriesChanged();
           if (self->m_callbacks.onStatus)
@@ -867,6 +971,8 @@ namespace filemanager {
     if (oldSize == m_entries.size())
       return;
     m_folderCounts.erase(path.string());
+    if (m_search.active())
+      return;
     if (m_callbacks.onEntryMonitoredRemoved)
       m_callbacks.onEntryMonitoredRemoved(path);
     if (m_callbacks.onEntriesChanged)

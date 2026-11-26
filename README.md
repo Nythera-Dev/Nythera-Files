@@ -41,6 +41,7 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 - List and grid views with adjustable scaling.
 - Multiple tabs, including tab reordering and reopening closed tabs.
 - Breadcrumb navigation and directory history.
+- **Search (Ctrl+F)** finds files and folders by part of their name in the current folder and its subfolders. Results appear as the search runs. Use **Open Containing Folder** on a result or **Esc** to return to browsing. Search follows the tab's hidden-file setting and skips inaccessible folders and symlink traversal. Search runs with your regular user permissions and is available in regular folder tabs. Eligible visible results on local filesystems generate thumbnails asynchronously. Other results use fast file-type icons. Opening a file or choosing an application can use its full file type.
 - Sorting, file selection and drag-and-drop.
 - Configurable details-view columns.
 - File and folder properties.
@@ -70,6 +71,20 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 - Open With and terminal integration.
 - Disk-usage and file-comparison integrations where suitable applications are available.
 - MIME-aware icons and file-type handling.
+
+### Optional fzf search
+
+Files uses an installed `fzf` from `PATH` when it is available. The search bar offers Contains, Fuzzy, Starts with, Ends with, Exclude, Exact match and None. Contains is the default. The mode adds matching operators internally, while the search field keeps the text you entered. Explicit fzf operators override the selected mode. Compound expressions use None, which also accepts raw fzf syntax. A multi-word query without operators is treated as one phrase by the named modes.
+
+Set these preferences in the Files `config.toml` to disable fzf or change the default mode.
+
+```toml
+[files]
+fzf_search = false
+search_default_mode = "contiguous"
+```
+
+The default-mode values are `contiguous`, `fuzzy`, `starts_with`, `ends_with`, `exclude`, `exact` and `none`. If fzf cannot start or fails during search, Files runs the query again using conventional substring matching. Search results have their own saved list or grid view, column layout, and sort order. The default list shows Name, Location, Size, Modified and Type. Hover over a result to see its containing directory's absolute path. Files counts immediate items in visible matching folders when the Size column is shown.
 
 ## Appearance & Theming
 
@@ -173,7 +188,7 @@ There is no stable packaged release yet.
 
 Nythera Files grew out of Nythera Shell, itself a fork of [Noctalia](https://github.com/noctalia-dev/noctalia).
 
-The underlying rendering and UI foundations owe a great deal to the original Noctalia developers and contributors.
+The underlying rendering and UI foundations owe a great deal to the original Noctalia developers and contributors. Recursive filename search adapts the GIO traversal and Unicode matching from [Luciole](https://github.com/noctalia-dev/luciole/tree/cb6375a5e046ae9ce3eaba7d12ba53a85e2c769a/src/fs) under the MIT licence.
 
 Dolphin, Thunar, COSMIC Files and other Linux file managers have also provided plenty of inspiration.
 

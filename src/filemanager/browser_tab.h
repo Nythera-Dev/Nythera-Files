@@ -87,6 +87,15 @@ namespace filemanager {
     AdminSessionClient adminSession;
     TabViewState viewState;
     ScrollViewState scrollState;
+    TabViewState searchViewState;
+    ScrollViewState searchScrollState;
+
+    [[nodiscard]] TabViewState& displayedViewState() noexcept {
+      return session.searchOpen() ? searchViewState : viewState;
+    }
+    [[nodiscard]] ScrollViewState& displayedScrollState() noexcept {
+      return session.searchOpen() ? searchScrollState : scrollState;
+    }
     std::optional<float> pendingScrollOffsetAfterRefresh;
 
     std::optional<std::filesystem::path> selectedPath;

@@ -109,6 +109,11 @@ _nythera_files_sources = files(
   'src/filemanager/configuration_notice.cpp',
   'src/filemanager/file_list_header.cpp',
   'src/filemanager/directory_session.cpp',
+  'src/filemanager/file_search_session.cpp',
+  'src/filemanager/fzf_search.cpp',
+  'src/filemanager/file_manager_search.cpp',
+  'src/filemanager/search_thumbnails.cpp',
+  'src/filemanager/recursive_file_discovery.cpp',
   'src/filemanager/browser_tab.cpp',
   'src/filemanager/tab_manager.cpp',
   'src/filemanager/tab_bar_controller.cpp',
@@ -289,6 +294,20 @@ if build_tests
     override_options: ['b_ndebug=false'],
   )
   test('file_manager_keyboard_audit', file_manager_keyboard_audit_test_exe)
+
+  file_manager_search_test_exe = executable('file_manager_search_test',
+    sources: files('tests/file_manager_search_test.cpp'),
+    dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('file_manager_search', file_manager_search_test_exe, timeout: 30)
+
+  fzf_search_test_exe = executable('fzf_search_test',
+    sources: files('tests/fzf_search_test.cpp'),
+    dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('fzf_search', fzf_search_test_exe, timeout: 20)
 
   file_sort_test_exe = executable('file_sort_test',
     sources: files('tests/file_sort_test.cpp'), dependencies: [nythera_lib_dep, gio_dep],

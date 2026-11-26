@@ -173,7 +173,34 @@ public:
     if (index >= session.entries().size() || m_renderer == nullptr)
       return;
     const auto& entry = session.entries()[index];
-    const bool allowThumbnails = tab.capabilities().canGenerateThumbnails;
+    const bool searchResult = session.search().active();
+    std::string location;
+    if (session.searchOpen()) {
+      const auto parent = entry.absPath.parent_path();
+      const auto relative = parent.lexically_relative(session.path());
+      const auto display = relative == "." && parent.has_filename() ? parent.filename()
+          : relative.empty() || relative == "."                     ? parent
+                                                                    : relative;
+      location = filemanager::sanitizeFilenameForDisplay(display.string());
+    }
+    // Search provides viewport thumbnails separately from the shared artwork lookup.
+    const bool allowThumbnails = !searchResult && tab.capabilities().canGenerateThumbnails;
+    const auto useSearchArtwork = [&entry, searchResult](FileIcon* icon) {
+      if (!searchResult)
+        return;
+      const bool broken = entry.isSymlink && entry.type == "inode/symlink";
+      std::vector<std::string> names;
+      if (!broken && !entry.isDir && !entry.type.empty()) {
+        g_autoptr(GIcon) themed = g_content_type_get_icon(entry.type.c_str());
+        if (themed && G_IS_THEMED_ICON(themed)) {
+          for (const auto* name = g_themed_icon_get_names(G_THEMED_ICON(themed)); name && *name; ++name)
+            names.emplace_back(*name);
+        }
+      }
+      names.emplace_back(entry.isDir ? "folder" : "text-x-generic");
+      icon->setThemedIconNames(std::move(names));
+      icon->setSymlinkState(entry.isSymlink, broken);
+    };
     const auto protectedThumbnail = m_owner.protectedThumbnailPath(tab, entry, index);
     const bool cut =
         !session.browsingTrash() && tab.capabilities().canMutate && m_owner.m_transfers.isPathCut(entry.absPath);
@@ -187,6 +214,9 @@ public:
           *m_renderer, entry, index, tile.width(), tile.height(), selected,
           hovered || m_owner.m_transfers.dropIndex() == index, false, cut, protectedThumbnail, itemFocused
       );
+      if (!location.empty())
+        tileNode.setSearchLocation(location);
+      useSearchArtwork(tileNode.fileIcon());
     } else {
       auto& row = static_cast<FileEntryRow&>(tile);
       row.setAllowThumbnailsAndMetadata(allowThumbnails);
@@ -195,6 +225,10 @@ public:
           *m_renderer, entry, index, tile.width(), selected, hovered || m_owner.m_transfers.dropIndex() == index, false,
           session.folderItemCount(entry), cut, protectedThumbnail, itemFocused
       );
+      if (!location.empty()
+          && m_owner.m_listHeader.columnLayout().visible[columnIndex(filemanager::kSearchLocationSlot)])
+        row.setSearchLocation(location);
+      useSearchArtwork(row.fileIcon());
     }
   }
   void onActivate(std::size_t index) override {
@@ -209,7 +243,9 @@ public:
     const auto& entry = session.entries()[index];
     auto found = session.trashOriginalPaths().find(entry.absPath.string());
     const auto description = guessFileTypeDescription(entry.absPath, entry.isDir, entry.type);
-    const auto tooltip = filemanager::sanitizeFilenameForDisplay(entry.name) + "\n" + description;
+    auto tooltip = filemanager::sanitizeFilenameForDisplay(entry.name) + "\n" + description;
+    if (session.searchOpen())
+      tooltip += "\n" + filemanager::sanitizeFilenameForDisplay(entry.absPath.parent_path().string());
     return found == session.trashOriginalPaths().end()
         ? tooltip
         : tooltip + "\nOriginal location: " + filemanager::sanitizeFilenameForDisplay(found->second);
@@ -310,8 +346,8 @@ namespace {
     return button;
   }
 
-  filemanager::TabViewState loadInitialTabViewState(filemanager::FileManagerSettings& settings) {
-    const auto view = settings.loadFileView();
+  filemanager::TabViewState loadInitialTabViewState(filemanager::FileManagerSettings& settings, bool search = false) {
+    const auto view = settings.loadFileView(search);
     return filemanager::TabViewState{
         .gridMode = view.gridMode,
         .showHidden = view.showHidden,
@@ -319,7 +355,7 @@ namespace {
         .hiddenLast = view.hiddenLast,
         .sortField = view.sortField,
         .sortOrder = view.sortOrder,
-        .viewScale = settings.loadViewScale(filemanager::kFileViewDefaultScale),
+        .viewScale = settings.loadViewScale(filemanager::kFileViewDefaultScale, search),
     };
   }
 
@@ -329,6 +365,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
   return filemanager::TabManager::Callbacks{
       .onBeforeTabSwitch =
           [this](filemanager::BrowserTab& outgoing, filemanager::BrowserTab&) {
+            m_searchThumbnails.clear();
             clearProtectedThumbnails();
             if (m_refreshAfterRename) {
               outgoing.needsRefresh = true;
@@ -351,22 +388,8 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               m_grid->resetTransientStateForDataSwap();
           },
       .onActiveTabChanged =
-          [this](filemanager::BrowserTab& active, const filemanager::TabViewState& previousViewState) {
-            const bool modeOrScaleChanged = previousViewState.gridMode != active.viewState.gridMode
-                || previousViewState.viewScale != active.viewState.viewScale;
-            m_listHeader.applyTabViewState(active.viewState);
-            if (m_grid != nullptr) {
-              if (modeOrScaleChanged) {
-                const auto metrics = filemanager::fileViewMetrics(m_listHeader.viewScale());
-                m_grid->setAdapter(nullptr);
-                m_grid->setAdapter(m_adapter.get());
-                m_grid->setColumns(m_listHeader.gridMode() ? 0 : 1);
-                m_grid->setMinCellWidth(metrics.gridCellWidth);
-                m_grid->setCellHeight(m_listHeader.gridMode() ? metrics.gridCellHeight : metrics.listRowHeight);
-                m_grid->setRowGap(m_listHeader.gridMode() ? 3.0F : 1.0F);
-              }
-              m_grid->bindScrollState(&active.scrollState);
-            }
+          [this](filemanager::BrowserTab& active, const filemanager::TabViewState&) {
+            applyActiveView();
             m_statusMessage = active.lastStatusMessage;
             m_statusMessageTimer.stop();
             if (!m_statusMessage.empty())
@@ -374,7 +397,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
             else
               m_statusMessageUntil = {};
             if (active.needsRefresh) {
-              active.pendingScrollOffsetAfterRefresh = active.scrollState.offset;
+              active.pendingScrollOffsetAfterRefresh = active.displayedScrollState().offset;
               active.needsRefresh = false;
               active.session.refreshPreservingSelection();
             } else {
@@ -389,7 +412,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
                 if (m_grid != nullptr
                     && active.selectedPath
                     && (!active.pendingDropScrollGeneration
-                        || *active.pendingDropScrollGeneration == active.scrollState.userScrollGeneration)) {
+                        || *active.pendingDropScrollGeneration == active.displayedScrollState().userScrollGeneration)) {
                   const auto entry =
                       std::ranges::find(active.session.entries(), *active.selectedPath, &FileEntry::absPath);
                   if (entry != active.session.entries().end())
@@ -438,8 +461,10 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
           },
       .onCancelFileGesture = [this] { cancelFileGesture(); },
       .onActiveBeforeNavigate =
-          [this](filemanager::BrowserTab&, const std::filesystem::path&, bool pathChanged) {
-            if (pathChanged) {
+          [this](filemanager::BrowserTab& tab, const std::filesystem::path&, bool pathChanged) {
+            if (tab.session.search().active())
+              resetSearchSelection();
+            if (pathChanged || tab.session.searchOpen()) {
               if (m_renamePath)
                 cancelRename();
               m_pendingInlineRenamePath.reset();
@@ -474,6 +499,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
           },
       .onActiveEntriesLoaded =
           [this](filemanager::BrowserTab& active, bool chooseFirst) {
+            syncSearchUi();
             if (m_grid != nullptr) {
               m_grid->notifyDataChanged();
               if (active.pendingScrollOffsetAfterRefresh.has_value()) {
@@ -487,7 +513,10 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               m_surface->requestLayout();
           },
       .onActiveEntriesChanged =
-          [this](filemanager::BrowserTab&) {
+          [this](filemanager::BrowserTab& tab) {
+            if (!tab.session.search().active() || tab.session.entries().empty())
+              m_searchThumbnails.clear();
+            syncSearchUi();
             if (m_grid != nullptr) {
               m_grid->notifyDataChanged();
               restoreSelection();
@@ -726,7 +755,8 @@ FileManager::FileManager(std::string initialPath)
                   tabPtr->needsRefresh = true;
                 continue;
               }
-              if (historyReplay
+              if (tabPtr->session.search().active()
+                  || historyReplay
                   || matchesDir(tabPtr->session.path(), srcParent)
                   || matchesDir(tabPtr->session.path(), dstPath)
                   || matchesDir(tabPtr->session.path(), dstParent)) {
@@ -858,7 +888,7 @@ FileManager::FileManager(std::string initialPath)
               .isRenaming = [this] { return m_renamePath.has_value(); },
               .keyboardModifiers = [this] { return m_keyboardModifiers; },
               .pointerSerial = [this] { return m_pointerSerial; },
-              .selectedPathsOrdered = [this] { return selectedPaths(); },
+              .selectedPathsOrdered = [this] { return selectedOperationPaths(); },
               .selectedPath = [this] { return activeTab().selectedPath; },
               .onApplyPasteSelection =
                   [this](
@@ -977,7 +1007,7 @@ void FileManager::duplicateSelection() {
       || tab.session.loading()
       || !currentDirectoryWritable())
     return;
-  auto paths = selectedPaths();
+  auto paths = selectedOperationPaths();
   if (paths.empty())
     return;
   if (const auto id = m_operations.duplicate(
@@ -1148,7 +1178,7 @@ void FileManager::beginRenamePath(const std::filesystem::path& path) {
     setStatus("Wait for the current Administrator operation to finish");
     return;
   }
-  if (path.parent_path() != session.path()) {
+  if (!session.search().active() && path.parent_path() != session.path()) {
     m_pendingInlineRenamePath.reset();
     return;
   }
@@ -1339,6 +1369,7 @@ FileManager::~FileManager() {
   if (m_surface)
     m_surface->setSceneRoot(nullptr);
   m_selectionTimer.stop();
+  releaseSearchThumbnails();
   TooltipManager::instance().shutdown();
   m_renderContext.cleanup();
   m_sharedContext.cleanup();
@@ -1452,6 +1483,7 @@ int FileManager::run() {
             return G_SOURCE_REMOVE;
           auto* self = request->self;
           self->m_dispatcher.setSceneRoot(nullptr);
+          self->releaseSearchThumbnails();
           if (self->m_surface) {
             self->m_surface->setSceneRoot(nullptr);
             self->m_surface.reset();
@@ -1471,6 +1503,11 @@ int FileManager::run() {
           self->m_adminFinishButton = nullptr;
           self->m_grid = nullptr;
           self->m_locationInput = nullptr;
+          self->m_searchBar = nullptr;
+          self->m_searchInput = nullptr;
+          self->m_searchStatus = nullptr;
+          self->m_searchButton = nullptr;
+          self->m_searchModeButton = nullptr;
           self->m_statusLabel = nullptr;
           if (!self->m_operations.active() && self->m_transfers.pendingClipboardReads() == 0)
             self->m_running = false;
@@ -1714,6 +1751,11 @@ void FileManager::pinPlace(const std::filesystem::path& path) {
 }
 
 void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry) {
+  if (entry.id >= kFirstSearchMode
+      && entry.id < kFirstSearchMode + static_cast<int>(filemanager::kSearchModeLabels.size())) {
+    selectSearchMode(static_cast<filemanager::SearchMode>(entry.id - kFirstSearchMode));
+    return;
+  }
   auto& tab = activeTab();
   auto& session = tab.session;
   const auto caps = tab.capabilities();
@@ -1804,6 +1846,13 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     return;
   case kCloseTab:
     (void)closeTab(tab.id);
+    return;
+  case kOpenContainingFolder:
+    if (const auto& target = m_menus.contextMenuTarget(); session.search().active()
+        && target
+        && std::ranges::find(session.entries(), *target, &FileEntry::absPath) != session.entries().end()) {
+      navigate(target->parent_path());
+    }
     return;
   case kOpenFolderInNewTab:
     if (m_menus.contextMenuTarget() && !session.browsingTrash())
@@ -2064,7 +2113,7 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
       setStatus("This action is unavailable in Administrator Mode");
       return;
     }
-    auto targets = selectedPaths();
+    auto targets = selectedOperationPaths();
     if (!targets.empty())
       m_operations.trash(std::move(targets));
   } else if (entry.id == 6 && !session.browsingTrash()) {
@@ -2072,7 +2121,7 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
       setStatus("This action is unavailable in Administrator Mode");
       return;
     }
-    auto targets = selectedPaths();
+    auto targets = selectedOperationPaths();
     if (!targets.empty()) {
       const auto prompt = filemanager::permanentDeletePrompt(targets, targets.size());
       showDialog(
@@ -2179,12 +2228,16 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
   ) {
     recordAdminTabUserActivity(tab);
     const auto column = static_cast<FileColumn>(entry.id - kFirstColumnAction);
-    if (column != FileColumn::Name) {
+    if (column != FileColumn::Name && !(m_listHeader.searchView() && column == FileColumn::Accessed)) {
       auto& visible = m_listHeader.columnLayout().visible[columnIndex(column)];
       visible = !visible;
       if (column == FileColumn::Size && !visible) {
-        for (const auto& tabPtr : m_tabs.tabs())
-          tabPtr->session.clearFolderCounts();
+        if (session.search().active()) {
+          session.updateVisibleSearchFolders({});
+        } else {
+          for (const auto& tabPtr : m_tabs.tabs())
+            tabPtr->session.clearFolderCounts();
+        }
       }
       if (!m_listHeader.gridMode())
         m_listHeader.updateColumnHeaders();
@@ -2195,10 +2248,11 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     const auto field = static_cast<FileDialogSortField>(entry.id - 53);
     if (field != m_listHeader.sortField())
       setSortField(field);
-  } else if (entry.id == 61) {
+  } else if (entry.id == 61 || (entry.id == 63 && m_listHeader.searchView())) {
     recordAdminTabUserActivity(tab);
-    if (m_listHeader.sortField() != FileDialogSortField::Type)
-      setSortField(FileDialogSortField::Type);
+    const auto field = entry.id == 63 ? FileDialogSortField::Location : FileDialogSortField::Type;
+    if (m_listHeader.sortField() != field)
+      setSortField(field);
   } else if (entry.id == 58 || entry.id == 62) {
     recordAdminTabUserActivity(tab);
     const auto requested = entry.id == 58 ? FileDialogSortOrder::Ascending : FileDialogSortOrder::Descending;
@@ -2216,7 +2270,7 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     else
       session.setHiddenLast(!session.hiddenLast());
     persistFileViewState();
-    sortEntries();
+    session.sortEntries(true);
     if (m_grid) {
       m_grid->notifyDataChanged();
       restoreSelection();
@@ -2252,6 +2306,13 @@ void FileManager::openProperties(const std::filesystem::path& path) {
 void FileManager::applyFilesPreferences(const toml::table& previous) {
   const auto& current = m_settings.preferences();
   const auto changed = [&](std::string_view key) { return previous["files"][key] != current["files"][key]; };
+  if (changed("fzf_search") || changed("search_default_mode")) {
+    for (const auto& tab : m_tabs.tabs()) {
+      if (tab->session.searchOpen())
+        configureSearchBackend(tab->session);
+    }
+    syncSearchUi();
+  }
   if (changed("readline_shortcuts"))
     Input::setReadlineShortcutsEnabled(m_settings.readlineShortcuts());
   if (previous["theme"]["transparency_mode"] != current["theme"]["transparency_mode"])
@@ -2270,7 +2331,9 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
   }
   if (changed("saved_places") || changed("place_order") || changed("hidden_mounts"))
     m_places.reloadPreferences();
-  if (changed("list_column_widths") || changed("list_column_layout"))
+  const bool searchView = activeSession().searchOpen();
+  if (searchView ? changed("search_column_widths") || changed("search_column_layout")
+                 : changed("list_column_widths") || changed("list_column_layout"))
     m_listHeader.reloadColumnPreferences();
 
   const bool grid = changed("grid_view");
@@ -2280,28 +2343,54 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
   const bool hiddenLast = changed("hidden_last");
   const bool sortField = changed("sort_field");
   const bool sortOrder = changed("sort_descending");
-  if (!(grid || scale || hidden || foldersFirst || hiddenLast || sortField || sortOrder))
+  const bool searchGrid = changed("search_grid_view");
+  const bool searchScale = changed("search_view_scale");
+  const bool searchSortField = changed("search_sort_field");
+  const bool searchSortOrder = changed("search_sort_descending");
+  if (!(grid
+        || scale
+        || hidden
+        || foldersFirst
+        || hiddenLast
+        || sortField
+        || sortOrder
+        || searchGrid
+        || searchScale
+        || searchSortField
+        || searchSortOrder))
     return;
   const auto view = loadInitialTabViewState(m_settings);
+  const auto search = loadInitialTabViewState(m_settings, true);
   for (const auto& tab : m_tabs.tabs()) {
+    auto& searchState = tab->searchViewState;
+    if (searchGrid)
+      searchState.gridMode = search.gridMode;
+    if (searchScale)
+      searchState.viewScale = search.viewScale;
+    if (searchSortField)
+      searchState.sortField = search.sortField;
+    if (searchSortOrder)
+      searchState.sortOrder = search.sortOrder;
+    if ((searchSortField || searchSortOrder) && tab.get() != &activeTab() && tab->session.search().active())
+      tab->session.sortEntries();
     auto& state = tab->viewState;
     if (grid) {
       state.gridMode = view.gridMode;
-      if (view.gridMode)
+      if (view.gridMode && !tab->session.searchOpen())
         tab->session.clearFolderCounts();
     }
     if (scale)
       state.viewScale = view.viewScale;
     if (hidden) {
-      state.showHidden = view.showHidden;
+      searchState.showHidden = state.showHidden = view.showHidden;
       tab->session.setShowHidden(view.showHidden);
     }
     if (foldersFirst) {
-      state.foldersFirst = view.foldersFirst;
+      searchState.foldersFirst = state.foldersFirst = view.foldersFirst;
       tab->session.setFoldersFirst(view.foldersFirst);
     }
     if (hiddenLast) {
-      state.hiddenLast = view.hiddenLast;
+      searchState.hiddenLast = state.hiddenLast = view.hiddenLast;
       tab->session.setHiddenLast(view.hiddenLast);
     }
     if (sortField)
@@ -2311,13 +2400,13 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
     if (tab.get() != &activeTab() && (hidden || foldersFirst || hiddenLast || sortField || sortOrder))
       tab->needsRefresh = true;
   }
-  m_listHeader.applyTabViewState(activeTab().viewState);
-  if (grid || scale)
-    applyViewScale();
+  applyActiveView();
   if (hidden) {
     activeSession().refreshPreservingSelection();
-  } else if (foldersFirst || hiddenLast || sortField || sortOrder) {
-    sortEntries();
+  } else if (
+      foldersFirst || hiddenLast || sortField || sortOrder || (searchView && (searchSortField || searchSortOrder))
+  ) {
+    activeSession().sortEntries(foldersFirst || hiddenLast || sortField || sortOrder);
     if (m_grid) {
       m_grid->notifyDataChanged();
       restoreSelection(false);
@@ -2328,22 +2417,25 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
 
 void FileManager::persistFileViewState() {
   auto& tab = activeTab();
+  auto& state = tab.displayedViewState();
   const filemanager::FileViewSettings previous{
-      tab.viewState.gridMode,   tab.viewState.showHidden, tab.viewState.foldersFirst,
-      tab.viewState.hiddenLast, tab.viewState.sortField,  tab.viewState.sortOrder,
+      state.gridMode, state.showHidden, state.foldersFirst, state.hiddenLast, state.sortField, state.sortOrder,
   };
   const filemanager::FileViewSettings next{
       m_listHeader.gridMode(),  tab.session.showHidden(), tab.session.foldersFirst(),
       tab.session.hiddenLast(), m_listHeader.sortField(), m_listHeader.sortOrder(),
   };
-  tab.viewState.gridMode = next.gridMode;
+  state.gridMode = next.gridMode;
+  state.showHidden = next.showHidden;
+  state.foldersFirst = next.foldersFirst;
+  state.hiddenLast = next.hiddenLast;
+  state.sortField = next.sortField;
+  state.sortOrder = next.sortOrder;
+  state.viewScale = m_listHeader.viewScale();
   tab.viewState.showHidden = next.showHidden;
   tab.viewState.foldersFirst = next.foldersFirst;
   tab.viewState.hiddenLast = next.hiddenLast;
-  tab.viewState.sortField = next.sortField;
-  tab.viewState.sortOrder = next.sortOrder;
-  tab.viewState.viewScale = m_listHeader.viewScale();
-  if (!m_settings.saveFileView(next, previous))
+  if (!m_settings.saveFileView(next, previous, tab.session.searchOpen()))
     setStatus("Unable to save file view preferences");
 }
 
@@ -2381,9 +2473,18 @@ void FileManager::restoreSelection(bool chooseFirst) {
     m_restoringSelection = false;
   };
   if (tab.selectedPath.has_value()) {
+    const auto index = m_grid->selectedIndex();
+    if (index && *index < session.entries().size() && session.entries()[*index].absPath == *tab.selectedPath) {
+      setGridSelection(index);
+      return;
+    }
     const auto selected = std::ranges::find(session.entries(), *tab.selectedPath, &FileEntry::absPath);
     if (selected != session.entries().end()) {
       setGridSelection(static_cast<std::size_t>(selected - session.entries().begin()));
+      return;
+    }
+    if (session.search().status() == filemanager::FileSearchSession::Status::Searching) {
+      setGridSelection(std::nullopt);
       return;
     }
     if (session.loading())
@@ -2717,6 +2818,8 @@ void FileManager::updateStatusBar() {
       if (tab.selectionInfoPendingPath() != path)
         querySelectionInfoAsync(path);
     }
+    if (session.search().active())
+      details += "  |  " + filemanager::sanitizeFilenameForDisplay(path.parent_path().string());
   } else if (!tab.selectedPaths.empty()) {
     cancelSelectionInfoQuery();
     std::size_t folders = 0, files = 0;
@@ -2742,6 +2845,8 @@ void FileManager::updateStatusBar() {
       out << std::fixed << std::setprecision(size.value == std::round(size.value) ? 0 : 1) << size.value;
       details += "  |  " + out.str() + " " + size.unit;
     }
+  } else if (session.search().active()) {
+    cancelSelectionInfoQuery();
   } else {
     cancelSelectionInfoQuery();
     std::size_t folders = 0, files = 0;
@@ -3136,6 +3241,7 @@ void FileManager::recordAdminTabUserActivity(filemanager::BrowserTab& tab) {
 }
 
 void FileManager::updateNavigationControls() {
+  syncSearchUi();
   const auto& session = activeSession();
   if (m_backButton != nullptr)
     m_backButton->setEnabled(!session.backHistory().empty());
@@ -3161,6 +3267,30 @@ void FileManager::setGridMode(bool gridMode) { m_listHeader.setGridMode(gridMode
 
 void FileManager::adjustViewScale(float value) { m_listHeader.adjustViewScale(value); }
 
+void FileManager::loadSearchView() {
+  auto& tab = activeTab();
+  tab.searchViewState = loadInitialTabViewState(m_settings, true);
+  tab.searchViewState.showHidden = tab.session.showHidden();
+  tab.searchViewState.foldersFirst = tab.session.foldersFirst();
+  tab.searchViewState.hiddenLast = tab.session.hiddenLast();
+  tab.searchScrollState = {};
+}
+
+void FileManager::applyActiveView() {
+  auto& tab = activeTab();
+  const auto& state = tab.displayedViewState();
+  const bool search = tab.session.searchOpen();
+  const bool geometryChanged = m_listHeader.gridMode() != state.gridMode
+      || m_listHeader.viewScale() != state.viewScale
+      || m_listHeader.searchView() != search;
+  m_listHeader.applyTabViewState(state, search);
+  if (m_grid) {
+    m_grid->bindScrollState(&tab.displayedScrollState());
+    if (geometryChanged)
+      applyViewScale();
+  }
+}
+
 void FileManager::applyViewScale() {
   if (!m_grid)
     return;
@@ -3170,7 +3300,11 @@ void FileManager::applyViewScale() {
   m_grid->setAdapter(m_adapter.get());
   m_grid->setColumns(m_listHeader.gridMode() ? 0 : 1);
   m_grid->setMinCellWidth(metrics.gridCellWidth);
-  m_grid->setCellHeight(m_listHeader.gridMode() ? metrics.gridCellHeight : metrics.listRowHeight);
+  m_grid->setCellHeight(
+      m_listHeader.gridMode()
+          ? metrics.gridCellHeight + (m_listHeader.searchView() ? 18.0F * m_listHeader.viewScale() : 0.0F)
+          : metrics.listRowHeight
+  );
   m_grid->setRowGap(m_listHeader.gridMode() ? 3.0F : 1.0F);
   restoreSelection();
   if (m_surface)
@@ -3315,7 +3449,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
       m_dispatcher.restoreTabFocus(snapshot);
   }
   Renderer& renderer = m_surface->renderTarget().renderer();
-  if (m_pickerThumbnails.uploadPending(renderer.textureManager()) && m_grid)
+  if (m_pickerThumbnails.uploadPending(renderer.textureManager()) && m_grid && !activeSession().search().active())
     m_grid->notifyDataChanged();
   m_adapter->setRenderer(&renderer);
   if (!m_root) {
@@ -3464,9 +3598,14 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_breadcrumbBar = static_cast<Flex*>(locationBar->addChild(std::move(crumb)));
     navigation->addChild(std::move(locationBar));
     navigation->addChild(makeButton("↻", [this] { activateContextMenuEntry({.id = 13}); }, &m_refreshButton));
+    auto searchButton = makeButton("", [this] { focusSearch(); }, &m_searchButton);
+    searchButton->setGlyph("search");
+    searchButton->setTooltip("Search (Ctrl+F)");
+    navigation->addChild(std::move(searchButton));
     mainPane->addChild(std::move(navigation));
 
     mainPane->addChild(m_tabBar.buildUi());
+    buildSearchBar(*mainPane);
 
     mainPane->addChild(m_listHeader.buildHeader());
     mainPane->addChild(
@@ -3498,9 +3637,13 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     const auto metrics = filemanager::fileViewMetrics(m_listHeader.viewScale());
     m_grid->setColumns(m_listHeader.gridMode() ? 0 : 1);
     m_grid->setMinCellWidth(metrics.gridCellWidth);
-    m_grid->setCellHeight(m_listHeader.gridMode() ? metrics.gridCellHeight : metrics.listRowHeight);
+    m_grid->setCellHeight(
+        m_listHeader.gridMode()
+            ? metrics.gridCellHeight + (m_listHeader.searchView() ? 18.0F * m_listHeader.viewScale() : 0.0F)
+            : metrics.listRowHeight
+    );
     m_grid->setRowGap(m_listHeader.gridMode() ? 3.0F : 1.0F);
-    m_grid->bindScrollState(&activeTab().scrollState);
+    m_grid->bindScrollState(&activeTab().displayedScrollState());
     m_listHeader.updateColumnHeaders();
     m_grid->setOnRubberBandSelection([this](const std::vector<std::size_t>& hits, bool finished, bool cancelled) {
       auto& tab = activeTab();
@@ -3712,6 +3855,11 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     finishPendingTransferReveal(renderer);
     m_listHeader.layoutVisibleMarkers(renderer);
     syncTooltipHover();
+  }
+  {
+    UiPhaseScope layoutPhase(UiPhase::Layout);
+    updateSearchThumbnails(renderer);
+    updateSearchFolderCounts();
   }
   if (m_transfers.refreshDropTargetAfterScroll() && (m_transfers.isDraggingFiles() || m_transfers.hasDragPreview())) {
     UiPhaseScope layoutPhase(UiPhase::Layout);
@@ -4579,6 +4727,10 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       m_transfers.cancelLocalDragState();
       return;
     }
+    if (activeSession().searchOpen()) {
+      closeSearch();
+      return;
+    }
     if (!activeTab().selectedPaths.empty())
       changeSelection(SelectionChange::None);
     m_transfers.cancelCutSelection();
@@ -4607,6 +4759,23 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
     if (m_renamePath)
       cancelRename();
     (void)activateRelativeTab(-1);
+    return;
+  }
+
+  if (!inInlineRename && mods == KeyMod::Ctrl && (event.sym == XKB_KEY_f || event.sym == XKB_KEY_F)) {
+    if (!event.repeat)
+      focusSearch();
+    return;
+  }
+
+  if (m_searchInput && focused == m_searchInput->inputArea()) {
+    if ((mods == 0U && event.sym == XKB_KEY_F5)
+        || (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_r || event.sym == XKB_KEY_R))) {
+      if (!event.repeat)
+        activateContextMenuEntry({.id = 13});
+      return;
+    }
+    m_dispatcher.keyEvent(event.sym, event.utf32, event.modifiers, true, event.preedit, event.repeat);
     return;
   }
 
