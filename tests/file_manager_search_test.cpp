@@ -887,7 +887,7 @@ class FileManagerTestAccess {
     TEST_CHECK(event(PointerEvent::Type::Button, finalEdge, true, 1000));
     TEST_CHECK(event(PointerEvent::Type::Motion, finalEdge - 300, false, 1010));
     TEST_CHECK(bounds(FileColumn::Modified).left == finalLeft);
-    TEST_CHECK(header.listColumns()[FileColumn::Modified] == kMinimumFileColumns[FileColumn::Modified]);
+    TEST_CHECK(header.listColumns()[FileColumn::Modified] == listColumnWidth(FileColumn::Modified, 0.0F));
     TEST_CHECK(event(PointerEvent::Type::Button, finalEdge - 300, false, 1020));
     TEST_CHECK(header.listColumns()[FileColumn::Size] == 144.0F);
 

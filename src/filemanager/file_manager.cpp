@@ -240,9 +240,9 @@ public:
     if (!m_owner.m_listHeader.gridMode() && m_owner.m_hoveredFileColumn && m_renderer) {
       const auto column = *m_owner.m_hoveredFileColumn;
       const auto value = m_owner.fileColumnText(entry, column);
-      const auto fontSize = column == FileColumn::Name ? Style::fontSizeBody : Style::fontSizeCaption;
       const auto width = m_owner.m_listHeader.listColumns()[column] - m_owner.m_listHeader.columnTextInset(column);
-      if (!value.empty() && m_renderer->measureText(value, fontSize).width > width)
+      if (!value.empty()
+          && filemanager::measureListColumnText(*m_renderer, column, session.search().active(), value) > width)
         return value;
     }
     auto found = session.trashOriginalPaths().find(entry.absPath.string());

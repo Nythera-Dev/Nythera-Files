@@ -68,7 +68,7 @@ namespace filemanager {
     strip->setGap(Style::spaceSm);
     strip->setPadding(5.0F, Style::spaceSm);
     m_strip = static_cast<Flex*>(m_viewport->addChild(std::move(strip)));
-    const auto styleHeader = [](Button& button, ButtonContentAlign alignment) {
+    const auto styleHeader = [](Button& button) {
       auto headerPalette = Button::defaultPalette(ButtonVariant::Ghost);
       headerPalette.normal = {clearColorSpec(), clearColorSpec(), colorSpecFromRole(ColorRole::OnSurfaceVariant)};
       headerPalette.hover = {
@@ -82,7 +82,8 @@ namespace filemanager {
       button.setFontSize(Style::fontSizeCaption);
       button.setControlHeight(26.0F);
       button.setPadding(0.0F);
-      button.setContentAlign(alignment);
+      button.setContentAlign(ButtonContentAlign::Start);
+      button.setMirrorInRtl(false);
     };
     for (auto column : kFileColumns) {
       const auto index = columnIndex(column);
@@ -94,12 +95,9 @@ namespace filemanager {
       header->label()->setFlexGrow(1.0F);
       header->label()->setMaxLines(1);
       m_headers[index] = header.get();
-      styleHeader(
-          *header,
-          column == FileColumn::Name || column == FileColumn::Type ? ButtonContentAlign::Start : ButtonContentAlign::End
-      );
-      header->setMinWidth(kMinimumFileColumns[column]);
-      header->setMaxWidth(std::max(kMinimumFileColumns[column], m_listColumns[column]));
+      styleHeader(*header);
+      header->setMinWidth(listColumnWidth(column, 0.0F));
+      header->setMaxWidth(listColumnWidth(column, m_listColumns[column]));
       m_strip->addChild(std::move(header));
     }
     const auto makeColumnMarker = [](ColorSpec color) {
@@ -237,11 +235,9 @@ namespace filemanager {
         auto text = std::string(columnLabel(column));
         if (selected)
           text += m_sortOrder == FileDialogSortOrder::Ascending ? "  ↑" : "  ↓";
-        const bool left =
-            column == FileColumn::Name || column == FileColumn::Type || (m_searchView && column == kSearchLocationSlot);
-        header->setContentAlign(left ? ButtonContentAlign::Start : ButtonContentAlign::End);
-        header->label()->setTextAlign(left ? TextAlign::Start : TextAlign::End);
+        header->label()->setTextAlign(Style::rtl() ? TextAlign::End : TextAlign::Start);
         header->setText(text);
+        header->setTooltip(std::string(columnLabel(column)));
         header->setSelected(selected);
       }
     }
@@ -401,13 +397,8 @@ namespace filemanager {
       auto* header = m_headers[columnIndex(column)];
       header->setMinWidth(widths[column]);
       header->setMaxWidth(widths[column]);
-      const bool name = column == FileColumn::Name;
       const float inset = columnTextInset(column);
-      const bool onLeft = name != Style::rtl();
-      const float left = onLeft ? inset : 0.0F;
-      const float right = onLeft ? 0.0F : inset;
-      if (header->paddingLeft() != left || header->paddingRight() != right)
-        header->setPadding(0.0F, right, 0.0F, left);
+      header->setPadding(0.0F, 0.0F, 0.0F, inset);
     }
     if (changed && m_grid)
       m_grid->notifyDataChanged();

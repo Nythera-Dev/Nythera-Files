@@ -17,11 +17,11 @@ std::string FileManager::fileColumnText(const FileEntry& entry, filemanager::Fil
 }
 
 float FileManager::measureFileColumn(Renderer& renderer, filemanager::FileColumn column) const {
-  const auto fontSize = column == filemanager::FileColumn::Name ? Style::fontSizeBody : Style::fontSizeCaption;
+  const bool searchView = activeSession().search().active();
   float width = 0;
   for (const auto& entry : activeSession().entries()) {
     const auto text = fileColumnText(entry, column);
-    width = std::max(width, renderer.measureText(text, fontSize).width);
+    width = std::max(width, filemanager::measureListColumnText(renderer, column, searchView, text));
   }
   return width;
 }
