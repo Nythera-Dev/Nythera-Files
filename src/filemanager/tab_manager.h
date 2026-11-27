@@ -32,12 +32,14 @@ namespace filemanager {
       std::function<void(BrowserTab& active, const TabViewState& previousViewState)> onActiveTabChanged;
       std::function<void()> onTabsChanged;
       std::function<void(TabId tabId)> onTabMetadataChanged;
+      std::function<void(TabId tabId)> onSearchActivityChanged;
       std::function<void()> onRequestCloseLastTab;
 
       std::function<bool()> isSizeColumnVisible;
       std::function<bool(TabId tabId)> isRenaming;
       std::function<void(TabId tabId)> onDeferRefreshDuringRename;
       std::function<void()> onCancelFileGesture;
+      std::function<void()> onReorderSearchResults;
 
       std::function<void(BrowserTab& active, const std::filesystem::path& targetPath, bool pathChanged)>
           onActiveBeforeNavigate;

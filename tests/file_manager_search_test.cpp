@@ -4,6 +4,7 @@
 #include "filemanager/custom_search_editor_state.h"
 #include "filemanager/file_list_columns.h"
 #include "filemanager/file_manager.h"
+#include "filemanager/file_sort.h"
 #include "filemanager/search_dropdown.h"
 #include "render/core/renderer.h"
 #include "render/core/texture_manager.h"
@@ -14,12 +15,14 @@
 #include "ui/controls/label.h"
 #include "ui/controls/scroll_view.h"
 #include "ui/controls/separator.h"
+#include "ui/controls/spinner.h"
 #include "ui/dialogs/file_entry_row.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <fstream>
+#include <ranges>
 #include <gio/gdesktopappinfo.h>
 #include <linux/input-event-codes.h>
 #include <memory>
@@ -62,6 +65,25 @@ namespace {
     TEST_CHECK(handler);
     TEST_CHECK(g_app_info_set_as_default_for_type(G_APP_INFO(handler), "text/plain", nullptr));
     TEST_CHECK(g_app_info_set_as_default_for_type(G_APP_INFO(handler), "application/octet-stream", nullptr));
+
+    const auto videoPlayer = apps / "nythera-video-test.desktop";
+    writeFile(
+        videoPlayer,
+        "[Desktop Entry]\nType=Application\nName=Isolated video player\nExec=/bin/sh "
+            + script.string()
+            + " %f\nMimeType=video/mp4;\n"
+    );
+    const auto alternate = apps / "nythera-video-alternate.desktop";
+    writeFile(
+        alternate,
+        "[Desktop Entry]\nType=Application\nName=Alternate video player\nExec=/bin/true %f\n"
+        "MimeType=video/mp4;\n"
+    );
+    g_autoptr(GDesktopAppInfo) videoHandler = g_desktop_app_info_new_from_filename(videoPlayer.c_str());
+    g_autoptr(GDesktopAppInfo) alternateHandler = g_desktop_app_info_new_from_filename(alternate.c_str());
+    TEST_CHECK(videoHandler && alternateHandler);
+    TEST_CHECK(g_app_info_set_as_default_for_type(G_APP_INFO(videoHandler), "video/mp4", nullptr));
+    TEST_CHECK(g_app_info_add_supports_type(G_APP_INFO(alternateHandler), "video/mp4", nullptr));
   }
 
   class ThumbnailTextures final : public TextureManager {
@@ -217,7 +239,7 @@ class FileManagerTestAccess {
     TEST_CHECK(session.entries().size() == 5);
 
     query(manager, "nEeDlE");
-    TEST_CHECK(manager.m_searchStatus->visible() && manager.m_searchStatus->text() == "Searching…");
+    TEST_CHECK(manager.m_searchStatus->visible() && manager.m_searchStatus->text() == "Searching… 0 found");
     finish(manager);
     TEST_CHECK(session.search().status() == Status::Finished);
     TEST_CHECK(session.entries().size() == 5);
@@ -228,9 +250,27 @@ class FileManagerTestAccess {
         find(session, root / "Needle Folder" / "needle.txt").absPath != find(session, root / "needle.txt").absPath
     );
     TEST_CHECK(session.search().skippedFolders() == (getuid() == 0 ? 0U : 1U));
-    TEST_CHECK(manager.m_searchStatus->text().starts_with("5 found"));
+    TEST_CHECK(!manager.m_searchSpinner->spinning());
+    TEST_CHECK(manager.m_statusLabel->text() == "2 folders");
+    TEST_CHECK(manager.m_statusDetailLabel->text().starts_with("  |  3 files"));
+    if (getuid() != 0) {
+      TEST_CHECK(manager.m_searchStatus->text() == "Partial results · 5 found");
+      const auto rows = std::get<std::vector<TooltipRow>>(manager.m_searchStatus->tooltipContent());
+      TEST_CHECK(std::ranges::any_of(rows, [](const TooltipRow& row) {
+        return row.key == "Folders skipped" && row.value == "1";
+      }));
+    } else {
+      TEST_CHECK(manager.m_searchStatus->text() == "5 found");
+    }
 
     const auto folder = root / "Needle Folder";
+    manager.activeTab().selectedPaths = {folder.string(), (folder / "needle.txt").string()};
+    manager.updateSelectionSummary();
+    TEST_CHECK(manager.m_statusLabel->text() == "2 selected");
+    TEST_CHECK(manager.m_searchStatus->text().ends_with("5 found"));
+    manager.activeTab().selectedPaths.clear();
+    manager.updateSelectionSummary();
+    TEST_CHECK(manager.m_statusLabel->text() == "2 folders");
     manager.activeTab().selectedPaths = {folder.string(), (folder / "needle.txt").string()};
     TEST_CHECK(manager.selectedPaths().size() == 2);
     TEST_CHECK(manager.selectedOperationPaths() == std::vector<std::string>{folder.string()});
@@ -277,7 +317,7 @@ class FileManagerTestAccess {
     query(manager, "unused needle from linked folder");
     finish(manager);
     TEST_CHECK(session.entries().empty());
-    TEST_CHECK(manager.m_searchStatus->text().starts_with("No matches"));
+    TEST_CHECK(manager.m_searchStatus->text().ends_with("No matches"));
     query(manager, "cafe\u0301");
     finish(manager);
     TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "CAFÉ.txt");
@@ -293,7 +333,7 @@ class FileManagerTestAccess {
     query(manager, "needle");
     finish(manager);
     TEST_CHECK(session.search().status() == Status::Failed);
-    TEST_CHECK(manager.m_searchStatus->text().starts_with("Search failed: "));
+    TEST_CHECK(manager.m_searchStatus->text() == "Search failed");
     key(manager, XKB_KEY_Escape);
     TEST_CHECK(!session.searchOpen() && session.entries().empty());
   }
@@ -378,7 +418,7 @@ class FileManagerTestAccess {
     TEST_CHECK(header.columnLayout().displayed() == defaults);
     TEST_CHECK(header.columnLabel(kSearchLocationSlot) == "Location");
     TEST_CHECK(header.columnSortField(kSearchLocationSlot) == FileDialogSortField::Location);
-    TEST_CHECK(manager.m_searchStatus->parent() == manager.m_searchInput->inputArea());
+    TEST_CHECK(manager.m_searchStatus->parent() == manager.m_searchStatusArea);
 
     finish(manager);
     manager.activateContextMenuEntry({.id = 63});
@@ -439,7 +479,7 @@ class FileManagerTestAccess {
     manager.m_settings.loadListColumnWidths(browsingWidths);
     TEST_CHECK(browsingWidths[kSearchLocationSlot] != 234.0F);
     TEST_CHECK(manager.m_settings.loadFileView().sortField == FileDialogSortField::Name);
-    key(manager, XKB_KEY_Escape);
+    manager.closeSearch();
     TEST_CHECK(!header.searchView() && !header.gridMode());
   }
 
@@ -974,6 +1014,218 @@ class FileManagerTestAccess {
     key(manager, XKB_KEY_Escape);
   }
 
+  static void testFiltersUi(FileManager& manager, const fs::path& root) {
+    const auto folder = root / "filters";
+    TEST_CHECK(fs::create_directory(folder));
+    writeFile(folder / "one.txt", "needle");
+    writeFile(folder / "two.txt", "other words");
+    manager.navigate(folder);
+    auto& session = manager.activeSession();
+    waitFor([&] { return !session.loading(); });
+    key(manager, XKB_KEY_f, KeyMod::Ctrl);
+
+    auto& ui = manager.m_searchFilterUi;
+    const auto click = [&](Button* button) {
+      manager.m_dispatcher.setFocus(button->inputArea());
+      key(manager, XKB_KEY_Return);
+    };
+    click(ui.toggle);
+    TEST_CHECK(ui.panel->visible());
+    auto* scene = static_cast<Flex*>(manager.m_searchTools->parent());
+    TestRenderer renderer;
+    const auto layout = [&](float width) {
+      scene->setSize(width, 500.0F);
+      manager.updateSearchFilterWidth(width, renderer);
+      scene->layout(renderer);
+    };
+    auto& draft = session.searchFilters();
+    TEST_CHECK(draft.sizeFirst.empty() && draft.sizeSecond.empty() && draft.dateAmount.empty());
+    TEST_CHECK(ui.toggle->label()->text() == "0" && !session.search().active());
+    TEST_CHECK(!ui.values[0]->invalid() && !ui.values[2]->invalid());
+    using namespace filemanager;
+    manager.changeSearchMetadata([](auto& filters) {
+      filters.sizeComparison = SizeComparison::Between;
+      filters.dateComparison = DateComparison::Between;
+    });
+    const auto labelsAligned = [&] {
+      float sizeX = 0, contentX = 0, y = 0;
+      Node::absolutePosition(ui.choices[0], sizeX, y);
+      Node::absolutePosition(ui.values.back(), contentX, y);
+      return sizeX == contentX;
+    };
+    for (float width : {1050.0F, 1600.0F}) {
+      layout(width);
+      TEST_CHECK(ui.metadata->direction() == FlexDirection::Horizontal && ui.separator->visible());
+      TEST_CHECK(ui.content->direction() == FlexDirection::Horizontal);
+      TEST_CHECK(ui.size->y() == ui.date->y() && ui.dates[0]->visible() && ui.dates[1]->visible());
+      TEST_CHECK(ui.values[0]->width() >= 80.0F && ui.values[1]->width() == ui.values[0]->width());
+      TEST_CHECK(ui.values.back()->width() > 140.0F && labelsAligned());
+      TEST_CHECK(ui.choices[0]->x() - ui.sizeCaption->width() == Style::spaceSm);
+      TEST_CHECK(ui.separator->x() - (ui.size->x() + ui.size->width()) == Style::spaceLg);
+      TEST_CHECK(ui.date->x() - (ui.separator->x() + ui.separator->width()) == Style::spaceLg);
+    }
+    layout(390.0F);
+    TEST_CHECK(labelsAligned());
+    TEST_CHECK(ui.metadata->direction() == FlexDirection::Vertical && !ui.separator->visible());
+    TEST_CHECK(ui.date->y() > ui.size->y() && ui.content->direction() == FlexDirection::Vertical);
+    TEST_CHECK(ui.clear->parent() == manager.m_searchBar);
+    const auto* sizeHeading = ui.choices[0]->parent();
+    const auto* firstBound = ui.values[0]->parent();
+    const auto* secondBound = ui.values[1]->parent();
+    TEST_CHECK(firstBound->y() > sizeHeading->y() || secondBound->y() > firstBound->y());
+    TEST_CHECK(firstBound->x() + firstBound->width() <= ui.size->width());
+    TEST_CHECK(secondBound->x() + secondBound->width() <= ui.size->width());
+    const auto* addressBar = scene->children().front().get();
+    float addressX = 0, addressY = 0, searchX = 0, searchY = 0;
+    Node::absolutePosition(addressBar, addressX, addressY);
+    Node::absolutePosition(manager.m_searchBar, searchX, searchY);
+    TEST_CHECK(searchX == addressX && searchY - (addressY + addressBar->height()) == Style::spaceSm);
+    const auto edit = [&](Input* input, std::string_view text) {
+      manager.m_dispatcher.setFocus(input->inputArea());
+      input->selectAll();
+      if (text.empty())
+        key(manager, XKB_KEY_BackSpace);
+      else
+        input->textInputApplyEdit({.commitText = std::string(text), .hasCommitText = true});
+    };
+    manager.changeSearchMetadata([](auto& filters) {
+      filters.sizeFirstUnit = SizeUnit::Bytes;
+      filters.sizeSecondUnit = SizeUnit::Bytes;
+    });
+    edit(ui.values[0], "6");
+    TEST_CHECK(ui.toggle->label()->text() == "0" && !session.search().active());
+    edit(ui.values[1], "invalid");
+    TEST_CHECK(ui.values[1]->invalid() && ui.toggle->label()->text() == "0");
+    edit(ui.values[1], "6");
+    TEST_CHECK(manager.m_searchSpinner->spinning());
+    finish(manager);
+    TEST_CHECK(manager.m_searchStatus->text() == "1 found" && !manager.m_searchSpinner->spinning());
+    TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "one.txt");
+    TEST_CHECK(ui.toggle->label()->text() == "1");
+    click(ui.toggle);
+    TEST_CHECK(!ui.panel->visible() && ui.toggle->label()->text() == "1");
+    TEST_CHECK(session.search().active());
+
+    click(ui.toggle);
+    click(ui.clear);
+    TEST_CHECK(!session.search().active() && session.entries().size() == 2);
+    TEST_CHECK(!manager.m_searchStatusArea->visible());
+    TEST_CHECK(ui.toggle->label()->text() == "0");
+
+    if (ui.backends.supports(ContentMode::Plain)) {
+      draft.content.mode = ContentMode::Plain;
+      manager.changeSearchMetadata([](auto& filters) {
+        filters.sizeComparison = SizeComparison::Larger;
+        filters.sizeFirstUnit = SizeUnit::Bytes;
+        filters.sizeFirst = "5";
+        filters.dateComparison = DateComparison::Between;
+        filters.dateFirst = {2000, 1, 1};
+      });
+      TEST_CHECK(ui.toggle->label()->text() == "1");
+      manager.changeSearchMetadata([](auto& filters) { filters.dateSecond = {1999, 1, 1}; });
+      TEST_CHECK(ui.toggle->label()->text() == "1");
+      manager.changeSearchMetadata([](auto& filters) { filters.dateSecond = {2099, 12, 31}; });
+      TEST_CHECK(ui.toggle->label()->text() == "2");
+      query(manager, "txt");
+      finish(manager);
+      TEST_CHECK(session.entries().size() == 2);
+
+      auto* content = ui.values.back();
+      edit(content, "needlex");
+      key(manager, XKB_KEY_BackSpace);
+      TEST_CHECK(session.path() == folder && content->value() == "needle");
+      TEST_CHECK(session.search().status() == Status::Finished && !draft.submitted && session.entries().size() == 2);
+      key(manager, XKB_KEY_Return);
+      TEST_CHECK(manager.m_searchSpinner->spinning());
+      finish(manager);
+      TEST_CHECK(manager.m_searchStatus->text() == "1 found" && !manager.m_searchSpinner->spinning());
+      TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "one.txt");
+      TEST_CHECK(draft.submitted && ui.toggle->label()->text() == "3");
+      edit(content, "other");
+      TEST_CHECK(session.search().status() == Status::Finished && session.entries().front().name == "one.txt");
+      click(ui.submit);
+      finish(manager);
+      TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "two.txt");
+
+      query(manager, "one");
+      finish(manager);
+      TEST_CHECK(session.entries().empty());
+      edit(content, "");
+      finish(manager);
+      TEST_CHECK(!draft.submitted && ui.toggle->label()->text() == "2");
+      TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "one.txt");
+      manager.changeSearchMetadata([](auto& filters) { filters.dateSecond = {}; });
+      TEST_CHECK(ui.toggle->label()->text() == "1");
+      edit(ui.values[0], "");
+      TEST_CHECK(ui.toggle->label()->text() == "0");
+      click(ui.clear);
+      TEST_CHECK(session.search().query() == "one" && !draft.dateFirst.year && draft.sizeFirst.empty());
+    }
+    manager.closeSearch();
+    TEST_CHECK(!ui.panel->visible() && !session.search().active());
+  }
+
+  static void testContentResultActions(FileManager& manager, const fs::path& root) {
+    g_autofree char* ffmpeg = g_find_program_in_path("ffmpeg");
+    if (!ffmpeg || !filemanager::findContentBackends().supports(filemanager::ContentMode::Extracted))
+      return;
+
+    g_auto(GStrv) savedMimeDirs = g_strdupv(const_cast<char**>(g_content_type_get_mime_dirs()));
+    const char* mimeDirs[] = {"/usr/share/mime", nullptr};
+    g_content_type_set_mime_dirs(mimeDirs);
+    auto restoreMimeDirs = nythera::test::makeScopeExit([&] { g_content_type_set_mime_dirs(savedMimeDirs); });
+
+    const auto folder = root / "content-actions";
+    TEST_CHECK(fs::create_directory(folder));
+    const auto video = folder / "metadata-fixture.mp4";
+    const char* args[] = {ffmpeg,        "-nostdin",
+                          "-v",          "error",
+                          "-f",          "lavfi",
+                          "-i",          "color=c=black:s=16x16:r=1",
+                          "-t",          "1",
+                          "-c:v",        "mpeg4",
+                          "-metadata",   "title=Tagged search fixture",
+                          video.c_str(), nullptr};
+    g_autoptr(GSubprocess) encoder = g_subprocess_newv(args, G_SUBPROCESS_FLAGS_NONE, nullptr);
+    TEST_CHECK(encoder && g_subprocess_wait_check(encoder, nullptr, nullptr));
+
+    manager.navigate(folder);
+    auto& session = manager.activeSession();
+    waitFor([&] { return !session.loading(); });
+    key(manager, XKB_KEY_f, KeyMod::Ctrl);
+    auto& draft = session.searchFilters();
+    draft.content = {"Tagged search fixture", filemanager::ContentMode::Extracted};
+    manager.submitSearchFilters();
+    finish(manager);
+    TEST_CHECK(session.entries().size() == 1);
+    const auto& entry = session.entries().front();
+    TEST_CHECK(entry.absPath == video && entry.type == "video/mp4" && entry.hasIdentity && !entry.isSymlink);
+    g_autoptr(GIcon) icon = g_content_type_get_icon(entry.type.c_str());
+    TEST_CHECK(icon && G_IS_THEMED_ICON(icon));
+    const auto* names = g_themed_icon_get_names(G_THEMED_ICON(icon));
+    TEST_CHECK(names && names[0] && std::string_view(names[0]) == "video-mp4");
+
+    std::vector<ContextMenuControlEntry> entries{{.id = 10, .label = "Open"}};
+    manager.m_menus.appendOpenWithEntries(entry, entries);
+    TEST_CHECK(entries.front().label == "Open with Isolated video player");
+    TEST_CHECK(entries.size() == 2 && entries.back().label == "Open With");
+    TEST_CHECK(std::ranges::any_of(entries.back().submenuEntries, [](const auto& item) {
+      return item.label == "Alternate video player";
+    }));
+    manager.m_menus.setContextMenuTarget(video);
+    manager.activateContextMenuEntry(entries.front());
+    const auto opened = fs::path(video.native() + ".opened");
+    waitFor([&] {
+      std::error_code error;
+      return fs::file_size(opened, error) == video.native().size() && !error;
+    });
+    std::ifstream launch(opened);
+    std::string openedPath;
+    std::getline(launch, openedPath);
+    TEST_CHECK(openedPath == video.native());
+    key(manager, XKB_KEY_Escape);
+  }
+
   static void testProgressAndCancellation(FileManager& manager, const fs::path& bulk) {
     manager.navigate(bulk);
     auto& session = manager.activeSession();
@@ -1003,6 +1255,8 @@ class FileManagerTestAccess {
     manager.m_listHeader.applyColumnWidths();
     TEST_CHECK(manager.m_listHeader.listColumns().widths == manuallySized.widths);
     TEST_CHECK(session.search().status() == Status::Searching);
+    TEST_CHECK(manager.m_searchSpinner->spinning());
+    TEST_CHECK(manager.m_searchStatus->text() != "Searching… 0 found");
     query(manager, "fixture-11");
     TEST_CHECK(session.entries().empty());
     query(manager, "replacement");
@@ -1014,8 +1268,17 @@ class FileManagerTestAccess {
     session.submitSearch();
     finish(manager);
     TEST_CHECK(session.entries().size() == 12000);
-    if (const char* locale = std::getenv("LC_ALL"); locale && std::string_view(locale) == "en_GB.utf8")
+    const char* locale = std::getenv("LC_ALL");
+    const bool grouped = locale && std::string_view(locale) == "en_GB.utf8";
+    if (grouped) {
       TEST_CHECK(manager.m_searchStatus->text() == "12,000 found");
+      TEST_CHECK(manager.m_statusDetailLabel->text().starts_with("  |  12,000 files"));
+      for (const auto& entry : session.entries() | std::views::take(1000))
+        manager.activeTab().selectedPaths.insert(entry.absPath.string());
+      manager.updateSelectionSummary();
+      TEST_CHECK(manager.m_statusLabel->text() == "1,000 selected");
+      TEST_CHECK(manager.m_statusDetailLabel->text().starts_with("  |  0 folders, 1,000 files"));
+    }
     TEST_CHECK(heartbeats - beatsBefore > 5);
     TEST_CHECK(session.entries().front().name == "fixture-0");
     TEST_CHECK(session.entries().back().name == "fixture-11999");
@@ -1023,8 +1286,15 @@ class FileManagerTestAccess {
     query(manager, "fixture");
     session.submitSearch();
     waitFor([&] { return !session.entries().empty(); });
+    const auto found = session.entries().size();
+    key(manager, XKB_KEY_Escape);
+    TEST_CHECK(session.searchOpen() && session.search().status() == Status::Cancelled);
+    TEST_CHECK(session.entries().size() == found && !manager.m_searchSpinner->spinning());
+    TEST_CHECK(manager.m_searchStatus->text().starts_with("Search cancelled"));
     key(manager, XKB_KEY_Escape);
     TEST_CHECK(!session.searchOpen() && !session.search().active());
+    TEST_CHECK(!manager.m_searchStatusArea->visible() && !manager.m_searchSpinner->spinning());
+    TEST_CHECK(manager.m_statusLabel->text() == "12 folders");
     TEST_CHECK(session.entries().size() == 12);
     // A replacement search following Escape must publish only its own results.
     key(manager, XKB_KEY_f, KeyMod::Ctrl);
@@ -1032,6 +1302,179 @@ class FileManagerTestAccess {
     finish(manager);
     TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "Replacement.txt");
     key(manager, XKB_KEY_Escape);
+
+    if (grouped) {
+      manager.navigate(bulk / "0");
+      waitFor([&] { return !session.loading(); });
+      TEST_CHECK(manager.m_statusDetailLabel->text().starts_with("  |  1,001 files"));
+    }
+  }
+
+  static void testBackgroundContentSearch(FileManager& manager, const fs::path& work) {
+    using namespace filemanager;
+    const auto folder = work / "lifecycle-files";
+    const auto other = work / "lifecycle-other";
+    const auto bin = work / "lifecycle-bin";
+    fs::create_directories(folder);
+    fs::create_directories(other);
+    fs::create_directories(bin);
+    for (int index = 0; index < 128; ++index)
+      writeFile(folder / ("fixture-" + std::to_string(index) + ".txt"), std::string((index * 53) % 128 + 1, 'x'));
+    writeFile(other / "other-result.txt", "other");
+    const auto rg = bin / "rg";
+    writeFile(rg, R"sh(#!/bin/sh
+while [ "$1" != -- ]; do
+  case "$1" in --regexp=*) query=${1#--regexp=} ;; esac
+  shift
+done
+shift
+gate="$NYTHERA_TEST_GATES/$query"
+if ! mkdir "$gate.first" 2>/dev/null; then
+  sleep 30 &
+  child=$!
+  printf '%s %s\n' "$$" "$child" > "$gate.pids"
+  while ! [ -f "$gate.release" ]; do sleep 0.01; done
+  kill "$child"
+  wait "$child" 2>/dev/null
+fi
+for path; do printf '%s\000' "$path"; done
+)sh");
+    fs::permissions(rg, fs::perms::owner_all);
+    const nythera::test::ScopedEnvVar gateEnv("NYTHERA_TEST_GATES", work.native());
+    const nythera::test::ScopedEnvVar pathEnv("PATH", bin.native() + ":" + g_getenv("PATH"));
+    auto release = nythera::test::makeScopeExit([&] {
+      for (auto name : {"continuation", "stop", "navigation", "close", "shutdown", "shutdown-other"})
+        std::ofstream(work / (std::string(name) + ".release"));
+    });
+
+    manager.navigate(folder);
+    auto& searching = manager.activeTab();
+    waitFor([&] { return !searching.session.loading(); });
+    const auto searchingId = searching.id;
+    const auto otherId = manager.openFolderInNewTab(other, false);
+    TEST_CHECK(otherId != kInvalidTabId);
+    manager.m_tabBar.rebuildIfDirty();
+    const auto searchingSpinner = [&] { return manager.m_tabBar.findSlot(searchingId)->searchSpinner; };
+
+    const auto begin = [&](BrowserTab& tab, std::string_view name) {
+      manager.focusSearch();
+      auto& draft = tab.session.searchFilters();
+      draft.content = {std::string(name), ContentMode::Plain};
+      manager.submitSearchFilters();
+      std::array<pid_t, 2> pids{};
+      waitFor([&] {
+        std::ifstream processes(work / (std::string(name) + ".pids"));
+        return static_cast<bool>(processes >> pids[0] >> pids[1]) && !tab.session.entries().empty();
+      });
+      TEST_CHECK(tab.session.search().status() == Status::Searching);
+      TEST_CHECK(manager.m_tabBar.findSlot(tab.id)->searchSpinner->spinning());
+      return pids;
+    };
+    const auto cleanedUp = [&](const auto& pids) {
+      waitFor([&] {
+        std::ifstream descendant("/proc/" + std::to_string(pids[1]) + "/stat");
+        std::string status;
+        const bool stopped = !std::getline(descendant, status) || status.substr(status.rfind(')') + 2).starts_with('Z');
+        return stopped && !fs::exists("/proc/" + std::to_string(pids[0]));
+      });
+    };
+
+    const auto orderMatches = [&](FileDialogSortField field, FileDialogSortOrder direction) {
+      return std::ranges::is_sorted(searching.session.entries(), [&](const FileEntry& a, const FileEntry& b) {
+        return fileEntryLess(a, b, field, direction, searching.session.foldersFirst(), searching.session.hiddenLast());
+      });
+    };
+    const auto browsingField = searching.viewState.sortField;
+    const auto browsingDirection = searching.viewState.sortOrder;
+    searching.searchViewState.sortField = FileDialogSortField::Name;
+    searching.searchViewState.sortOrder = FileDialogSortOrder::Ascending;
+    const auto continuation = begin(searching, "continuation");
+    TEST_CHECK(searching.session.entries().size() == 64);
+    TEST_CHECK(orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Ascending));
+    const auto firstBatch = searching.session.entries().front().absPath;
+
+    const auto clickHeader = [&](FileColumn column) {
+      manager.m_dispatcher.setFocus(manager.m_listHeader.m_headers[columnIndex(column)]->inputArea());
+      manager.m_dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    };
+    clickHeader(FileColumn::Name);
+    waitFor([&] { return orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Descending); });
+    TEST_CHECK(searching.session.entries().size() == 64 && searching.session.entries().back().absPath == firstBatch);
+    TEST_CHECK(searching.session.search().status() == Status::Searching);
+    clickHeader(FileColumn::Size);
+    waitFor([&] { return orderMatches(FileDialogSortField::Size, FileDialogSortOrder::Descending); });
+    clickHeader(FileColumn::Name);
+    waitFor([&] { return orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Descending); });
+    clickHeader(FileColumn::Name);
+    waitFor([&] { return orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Ascending); });
+    clickHeader(FileColumn::Name);
+    waitFor([&] { return orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Descending); });
+
+    TEST_CHECK(manager.activateTab(otherId));
+    manager.m_tabBar.rebuildIfDirty();
+    TEST_CHECK(searchingSpinner()->spinning() && !manager.m_searchSpinner->spinning());
+    manager.focusSearch();
+    query(manager, "other-result");
+    finish(manager);
+    TEST_CHECK(manager.activeSession().entries().size() == 1);
+    auto& otherTab = manager.activeTab();
+
+    // A monitor-dirty browsing listing used to restart the active content search on return.
+    searching.needsRefresh = true;
+    TEST_CHECK(manager.activateTab(searchingId));
+    TEST_CHECK(searching.session.entries().size() == 64);
+    TEST_CHECK(searching.session.search().status() == Status::Searching && manager.m_searchSpinner->spinning());
+    TEST_CHECK(manager.activateTab(otherId));
+    manager.m_tabBar.rebuildIfDirty();
+    TEST_CHECK(searchingSpinner()->spinning());
+    writeFile(work / "continuation.release");
+    waitFor([&] { return searching.session.search().status() == Status::Finished; });
+    cleanedUp(continuation);
+    TEST_CHECK(!searchingSpinner()->spinning() && !searchingSpinner()->visible());
+    TEST_CHECK(searching.session.entries().size() == 128);
+    TEST_CHECK(orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Descending));
+    TEST_CHECK(otherTab.session.search().query() == "other-result" && otherTab.session.entries().size() == 1);
+    TEST_CHECK(manager.activateTab(searchingId));
+    TEST_CHECK(manager.m_searchStatus->text() == "128 found");
+    clickHeader(FileColumn::Name);
+    waitFor([&] { return orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Ascending); });
+    TEST_CHECK(searching.session.search().status() == Status::Finished && searching.session.entries().size() == 128);
+    TEST_CHECK(searching.viewState.sortField == browsingField && searching.viewState.sortOrder == browsingDirection);
+
+    const auto stop = begin(searching, "stop");
+    key(manager, XKB_KEY_Escape);
+    TEST_CHECK(searching.session.search().status() == Status::Cancelled && searching.session.entries().size() == 64);
+    TEST_CHECK(!searchingSpinner()->spinning() && !manager.m_searchSpinner->spinning());
+    cleanedUp(stop);
+
+    const auto navigation = begin(searching, "navigation");
+    manager.navigate(other);
+    TEST_CHECK(!searching.session.searchOpen() && !searching.session.search().active());
+    cleanedUp(navigation);
+    manager.navigate(folder);
+    waitFor([&] { return !searching.session.loading(); });
+
+    const auto closingId = manager.openFolderInNewTab(folder, true);
+    manager.m_tabBar.rebuildIfDirty();
+    TEST_CHECK(closingId != kInvalidTabId && manager.activeTab().id == closingId);
+    waitFor([&] { return !manager.activeSession().loading(); });
+    const auto closing = begin(manager.activeTab(), "close");
+    TEST_CHECK(manager.activateTab(searchingId) && manager.closeTab(closingId));
+    cleanedUp(closing);
+
+    const auto shutdown = begin(searching, "shutdown");
+    const auto secondaryId = manager.openFolderInNewTab(folder, true);
+    TEST_CHECK(secondaryId != kInvalidTabId && manager.activeTab().id == secondaryId);
+    manager.m_tabBar.rebuildIfDirty();
+    auto& secondary = manager.activeTab();
+    waitFor([&] { return !secondary.session.loading(); });
+    const auto shutdownOther = begin(secondary, "shutdown-other");
+    TEST_CHECK(searching.session.search().status() == Status::Searching && searchingSpinner()->spinning());
+    // Exercise window shutdown with an owned process group in each of two tabs.
+    manager.m_tabs.shutdownAll();
+    TEST_CHECK(!searching.session.search().active() && !secondary.session.search().active());
+    cleanedUp(shutdown);
+    cleanedUp(shutdownOther);
   }
 
 public:
@@ -1068,14 +1511,25 @@ public:
     writeFile(bulk / "0" / "Replacement.txt");
     testDiscoveryCancellation(root);
 
-    Flex scene;
     Button searchButton;
     FileManager manager(root.string());
+    Flex scene;
+    scene.setDirection(FlexDirection::Vertical);
+    scene.setAlign(FlexAlign::Stretch);
+    scene.setGap(2.0F);
+    auto addressBar = std::make_unique<Flex>();
+    addressBar->setMinHeight(32.0F);
+    scene.addChild(std::move(addressBar));
     manager.m_searchButton = &searchButton;
-    manager.buildSearchBar(scene);
+    manager.buildSearchBar(scene, Style::spaceSm - scene.gap());
+    scene.addChild(manager.buildStatusRow(12.0F));
     scene.addChild(manager.m_listHeader.buildHeader());
+    scene.addChild(manager.m_tabBar.buildUi());
     manager.m_dispatcher.setSceneRoot(&scene);
-    auto detach = nythera::test::makeScopeExit([&] { manager.m_dispatcher.setSceneRoot(nullptr); });
+    auto detach = nythera::test::makeScopeExit([&] {
+      manager.m_dispatcher.setSceneRoot(nullptr);
+      manager.m_tabBar.detachUi();
+    });
     manager.enumerate(root);
     waitFor([&] { return !manager.activeSession().loading(); });
     testMatchesAndActions(manager, root, outside);
@@ -1089,6 +1543,9 @@ public:
     testRootLineEdits();
     testProfileDialogs(manager, root);
     testColumnInteractions(manager, root);
+    testFiltersUi(manager, root);
+    testContentResultActions(manager, root);
+    testBackgroundContentSearch(manager, work);
   }
 };
 

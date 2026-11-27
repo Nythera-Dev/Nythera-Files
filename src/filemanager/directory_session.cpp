@@ -399,7 +399,9 @@ namespace filemanager {
   void DirectorySession::setSearchQuery(std::string query) {
     if (!m_searchOpen || !canSearch())
       return;
-    if (query.empty())
+    g_autoptr(GDateTime) now = g_date_time_new_now_local();
+    auto filters = resolveSearchFilters(m_searchFilters, now);
+    if (query.empty() && !filters.active())
       m_selectedSearchMode = m_defaultSearchMode;
     const auto manual = m_fzfExecutable.empty() ? std::nullopt : manualSearchMode(query);
     const FzfSearch backend{m_fzfExecutable, manual.value_or(m_selectedSearchMode), manual.has_value()};
@@ -420,8 +422,8 @@ namespace filemanager {
         [this] {
           if (m_callbacks.isRenaming && m_callbacks.isRenaming())
             return false;
-          if (m_active && m_callbacks.onCancelFileGesture)
-            m_callbacks.onCancelFileGesture();
+          if (m_active && m_callbacks.onReorderSearchResults)
+            m_callbacks.onReorderSearchResults();
           return true;
         },
         backend,
@@ -431,7 +433,8 @@ namespace filemanager {
               selection, current, g_get_home_dir(), profile ? &*profile : nullptr, excluded, discoverSearchMounts(),
               options.followSymlinks
           );
-        }
+        },
+        std::move(filters)
     );
     if (m_callbacks.onEntriesChanged)
       m_callbacks.onEntriesChanged();
@@ -442,6 +445,8 @@ namespace filemanager {
       return;
     const bool wasActive = m_search.active();
     m_searchOpen = false;
+    m_searchFilters = {};
+    m_searchFiltersExpanded = false;
     m_searchSelection = {};
     m_searchProfile.reset();
     m_selectedSearchMode = m_defaultSearchMode;
@@ -452,12 +457,12 @@ namespace filemanager {
       m_callbacks.onEntriesChanged();
   }
 
-  void DirectorySession::refreshPreservingSelection() {
+  void DirectorySession::refreshPreservingSelection(bool refreshSearch) {
     m_chooseFirstAfterLoad = false;
-    enumerate(m_path);
+    enumerate(m_path, refreshSearch);
   }
 
-  void DirectorySession::enumerate(const std::filesystem::path& path) {
+  void DirectorySession::enumerate(const std::filesystem::path& path, bool refreshSearch) {
     if (m_active)
       FileIcon::invalidateDirectoryMetadata();
     if (m_active && m_callbacks.onCancelFileGesture)
@@ -469,7 +474,7 @@ namespace filemanager {
     }
     if (!canSearch() || path != m_path)
       closeSearch();
-    else if (m_search.active())
+    else if (refreshSearch && m_search.active() && m_search.status() != FileSearchSession::Status::Cancelled)
       setSearchQuery(m_search.query());
     closeMonitor();
     cancelEnumeration();

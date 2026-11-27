@@ -4,68 +4,35 @@
 #include "ui/controls/flex.h"
 #include "ui/controls/input.h"
 #include "ui/controls/label.h"
+#include "ui/controls/spinner.h"
 #include "ui/dialogs/file_entry_row.h"
 #include "ui/dialogs/file_entry_tile.h"
 #include "ui/style.h"
 
 #include <algorithm>
-#include <format>
-#include <locale>
-#include <stdexcept>
 
-namespace {
-  std::string formatCount(std::size_t count) {
-    static const auto locale = [] {
-      try {
-        return std::locale("");
-      } catch (const std::runtime_error&) {
-        return std::locale::classic();
-      }
-    }();
-    return std::format(locale, "{:L}", count);
-  }
-} // namespace
-
-void FileManager::buildSearchBar(Flex& pane) {
+void FileManager::buildSearchBar(Flex& pane, float extraTopSpacing) {
+  auto tools = std::make_unique<Flex>();
+  tools->setDirection(FlexDirection::Vertical);
+  tools->setAlign(FlexAlign::Stretch);
+  tools->setGap(Style::spaceXs);
+  tools->setPadding(extraTopSpacing, 0.0F, 0.0F, 0.0F);
+  m_searchTools = static_cast<Flex*>(pane.addChild(std::move(tools)));
   auto bar = std::make_unique<Flex>();
   bar->setAlign(FlexAlign::Center);
   bar->setGap(Style::spaceSm);
-  m_searchBar = static_cast<Flex*>(pane.addChild(std::move(bar)));
+  m_searchBar = static_cast<Flex*>(m_searchTools->addChild(std::move(bar)));
 
   auto input = std::make_unique<Input>();
   m_searchInput = input.get();
   input->setPlaceholder("Search this folder and subfolders");
   input->setFlexGrow(1.0F);
-  input->setOnChange([this](const std::string& query) {
-    if (!activeSession().searchOpen())
-      return;
-    auto& tab = activeTab();
-    if (!tab.session.search().active() && !query.empty()) {
-      tab.browsingSelection = filemanager::BrowserTab::BrowsingSelection{
-          std::move(tab.selectedPath), std::move(tab.selectedPaths), std::move(tab.selectionAnchor)
-      };
-      tab.searchScrollState = {};
-    }
-    if (tab.session.search().active() || !query.empty())
-      resetSearchSelection();
-    tab.session.setSearchQuery(query);
-    updateStatusBar();
-  });
+  input->setOnChange([this](const std::string& query) { refreshSearchQuery(query); });
   input->setOnSubmit([this](const std::string&) {
-    activeSession().submitSearch();
+    submitSearchFilters();
     if (m_grid)
       m_dispatcher.setFocus(m_grid->focusArea());
   });
-  auto status = std::make_unique<Label>();
-  m_searchStatus = status.get();
-  status->setFontSize(Style::fontSizeMini);
-  status->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
-  status->setMaxLines(1);
-  status->setMaxWidth(185.0F);
-  status->setEllipsize(TextEllipsize::End);
-  status->setVisible(false);
-  input->setTrailingLabel(std::move(status));
-
   m_searchBar->addChild(std::move(input));
 
   auto scope = std::make_unique<Button>();
@@ -92,15 +59,59 @@ void FileManager::buildSearchBar(Flex& pane) {
   mode->setOnClick([this] { openSearchModeMenu(); });
   m_searchBar->addChild(std::move(mode));
 
+  auto filter = std::make_unique<Button>();
+  m_searchFilterUi.toggle = filter.get();
+  filter->setVariant(ButtonVariant::Outline);
+  filter->setGlyph("adjustments-horizontal");
+  filter->setTooltip("Search filters");
+  filter->setOnClick([this] {
+    auto& session = activeSession();
+    session.setSearchFiltersExpanded(!session.searchFiltersExpanded());
+    syncSearchFilters();
+  });
+  m_searchBar->addChild(std::move(filter));
+
+  auto clear = std::make_unique<Button>();
+  clear->setVariant(ButtonVariant::Ghost);
+  clear->setGlyph("filter-x");
+  clear->setTooltip("Clear Filters");
+  clear->setOnClick([this] {
+    auto& session = activeSession();
+    session.searchFilters() = {};
+    refreshSearchQuery(session.search().query());
+  });
+  m_searchFilterUi.clear = static_cast<Button*>(m_searchBar->addChild(std::move(clear)));
+
   auto close = std::make_unique<Button>();
   close->setVariant(ButtonVariant::Ghost);
   close->setGlyph("x");
-  close->setTooltip("Close Search (Esc)");
+  close->setTooltip("Close Search");
   close->setOnClick([this] { closeSearch(); });
   m_searchBar->addChild(std::move(close));
+  buildSearchFilters(*m_searchTools);
 
   m_searchBar->setVisible(false);
-  m_searchBar->setParticipatesInLayout(false);
+  m_searchTools->setVisible(false);
+  m_searchTools->setParticipatesInLayout(false);
+}
+
+void FileManager::refreshSearchQuery(std::string query) {
+  auto& tab = activeTab();
+  if (!tab.session.searchOpen())
+    return;
+  g_autoptr(GDateTime) now = g_date_time_new_now_local();
+  const bool willSearch =
+      !query.empty() || filemanager::resolveSearchFilters(tab.session.searchFilters(), now).active();
+  if (!tab.session.search().active() && willSearch) {
+    tab.browsingSelection = filemanager::BrowserTab::BrowsingSelection{
+        std::move(tab.selectedPath), std::move(tab.selectedPaths), std::move(tab.selectionAnchor)
+    };
+    tab.searchScrollState = {};
+  }
+  if (tab.session.search().active() || willSearch)
+    resetSearchSelection();
+  tab.session.setSearchQuery(std::move(query));
+  updateStatusBar();
 }
 
 void FileManager::focusSearch() {
@@ -113,6 +124,7 @@ void FileManager::focusSearch() {
   if (m_editingLocation)
     setLocationEditMode(false);
   if (!activeSession().searchOpen()) {
+    m_searchFilterUi.backends = filemanager::findContentBackends();
     loadSearchView();
     configureSearchBackend(activeSession());
     const auto& settings = m_settings.searchSettings();
@@ -198,30 +210,31 @@ void FileManager::selectSearchMode(filemanager::SearchMode mode) {
 void FileManager::syncSearchUi() {
   if (m_listHeader.searchView() != activeSession().search().active())
     applyActiveView();
+  updateSearchStatus();
   if (!m_searchBar)
     return;
   const auto& session = activeSession();
   const bool open = session.searchOpen();
   m_searchButton->setEnabled(!activeTab().administratorBrowsing && session.canSearch());
   m_searchButton->setSelected(open);
-  if ((open != m_searchBar->visible() || m_searchUiTab != activeTab().id)) {
+  if ((open != m_searchTools->visible() || m_searchUiTab != activeTab().id)) {
     m_searchUiTab = activeTab().id;
     m_searchInput->setValue(session.search().query());
     m_searchBar->setVisible(open);
-    m_searchBar->setParticipatesInLayout(open);
+    m_searchTools->setVisible(open);
+    m_searchTools->setParticipatesInLayout(open);
     if (!open) {
       for (const Node* node = m_dispatcher.focusedArea(); node; node = node->parent()) {
-        if (node == m_searchBar) {
+        if (node == m_searchTools) {
           m_dispatcher.setFocus(m_grid ? m_grid->focusArea() : nullptr);
           break;
         }
       }
     }
   }
-  if (!open) {
-    m_searchStatus->setVisible(false);
+  syncSearchFilters();
+  if (!open)
     return;
-  }
 
   syncSearchScopeButton();
   m_searchInput->setPlaceholder(
@@ -234,32 +247,92 @@ void FileManager::syncSearchUi() {
   m_searchModeButton->setParticipatesInLayout(fzf);
   if (fzf)
     m_searchModeButton->setText(filemanager::kSearchModeLabels[static_cast<std::size_t>(session.searchMode())]);
+}
 
+void FileManager::updateSearchStatus() {
+  if (!m_searchStatusArea)
+    return;
   using Status = filemanager::FileSearchSession::Status;
-  const auto& search = session.search();
+  const auto& search = activeSession().search();
+  const auto& issues = search.contentIssues();
+  const bool searching = search.status() == Status::Searching;
+  const bool partial = search.skippedFolders() > 0 || issues.partial() || !search.contentNotice().empty();
   std::string status;
   switch (search.status()) {
   case Status::Idle:
     break;
   case Status::Searching:
-    status = "Searching…";
-    if (!search.entries().empty())
-      status += " " + formatCount(search.entries().size()) + " found";
+    status = "Searching… " + formatCount(search.entries().size()) + " found";
     break;
   case Status::Finished:
     status = search.entries().empty() ? "No matches" : formatCount(search.entries().size()) + " found";
-    if (const auto skipped = search.skippedFolders(); skipped > 0)
-      status += " · " + formatCount(skipped) + (skipped == 1 ? " folder skipped" : " folders skipped");
+    if (partial)
+      status = "Partial results · " + status;
+    break;
+  case Status::Cancelled:
+    status = "Search cancelled · " + formatCount(search.entries().size()) + " found";
     break;
   case Status::Failed:
-    status = "Search failed: " + search.error();
+    status = "Search failed";
     break;
   }
+
+  std::vector<TooltipRow> warnings;
+  const auto addCount = [&warnings](std::size_t count, std::string_view label) {
+    if (count)
+      warnings.push_back({std::string(label), formatCount(count)});
+  };
+  addCount(search.skippedFolders(), "Folders skipped");
+  addCount(issues.sizeRestricted, "Over extraction size limit");
+  addCount(issues.inaccessible, "Unreadable or changed");
+  addCount(issues.extractionFailed, "Extraction failures");
+  addCount(issues.extractionTimeouts, "Extraction timeouts");
+  addCount(issues.plainTimeouts, "Plain-text batch timeouts");
+  addCount(issues.archiveTruncated, "Archives at depth limit");
+  addCount(issues.unsupported, "Unsupported formats");
+  if (issues.backendError)
+    warnings.push_back({"Content backend", "Error"});
   if (search.usingFallback())
-    status += " · fzf unavailable";
-  m_searchStatus->setVisible(!status.empty());
+    warnings.push_back({"fzf", "Unavailable"});
+
   m_searchStatus->setText(status);
-  m_searchStatus->setTooltip(status);
+  const auto currentTooltip = m_searchStatus->tooltipContent();
+  if (status.empty()) {
+    if (m_searchStatus->hasTooltip())
+      m_searchStatus->clearTooltip();
+  } else if (warnings.empty() || search.status() == Status::Failed) {
+    std::string tooltip = status;
+    const auto& detail = search.status() == Status::Failed ? search.error() : search.contentNotice();
+    if (!detail.empty())
+      tooltip += "\n" + detail;
+    const auto* currentText = std::get_if<std::string>(&currentTooltip);
+    if (!currentText || *currentText != tooltip)
+      m_searchStatus->setTooltip(std::move(tooltip));
+  } else {
+    std::string_view notice = search.contentNotice();
+    constexpr std::string_view separator = " · ";
+    while (!notice.empty()) {
+      const auto end = notice.find(separator);
+      warnings.push_back({{}, std::string(notice.substr(0, end))});
+      if (end == std::string_view::npos)
+        break;
+      notice.remove_prefix(end + separator.size());
+    }
+    warnings.insert(warnings.begin(), {"Matches", formatCount(search.entries().size())});
+    const auto* currentRows = std::get_if<std::vector<TooltipRow>>(&currentTooltip);
+    if (!currentRows || !std::ranges::equal(*currentRows, warnings, [](const TooltipRow& a, const TooltipRow& b) {
+          return a.key == b.key && a.value == b.value;
+        })) {
+      m_searchStatus->setTooltip(std::move(warnings));
+    }
+  }
+  m_searchStatus->setVisible(!status.empty());
+  m_searchStatusArea->setVisible(!status.empty());
+  m_searchSpinner->setVisible(searching);
+  if (searching)
+    m_searchSpinner->start();
+  else
+    m_searchSpinner->stop();
 }
 
 // A directory operation already includes its descendants. Search can select both at once.

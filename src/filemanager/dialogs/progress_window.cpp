@@ -23,18 +23,6 @@ namespace filemanager {
   namespace {
     constexpr float kProgressSurfaceOpacity = 0.95F;
 
-    void applyNytheraBevel(Flex& panel, float radius) {
-      panel.setRadius(radius);
-      panel.setCornerShapes(
-          CornerShapes{
-              .tl = CornerShape::Chamfered,
-              .tr = CornerShape::Chamfered,
-              .br = CornerShape::Chamfered,
-              .bl = CornerShape::Chamfered,
-          }
-      );
-    }
-
     std::string progressSummary(const std::vector<FileOperationManager::Operation>& operations) {
       std::ostringstream summary;
       std::size_t active = 0;
@@ -176,7 +164,7 @@ namespace filemanager {
           ),
           Style::borderWidth
       );
-      applyNytheraBevel(*m_root, Style::scaledRadiusMd(1.0F));
+      m_root->setRadius(Style::scaledRadiusMd(1.0F));
       auto heading = std::make_unique<Label>();
       heading->setText("FILE OPERATIONS");
       heading->setFontWeight(FontWeight::SemiBold);

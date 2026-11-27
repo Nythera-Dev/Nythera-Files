@@ -435,12 +435,11 @@ public:
       std::filesystem::create_directory(trickyDir);
       writeFile(trickyFile, "exact");
 
-      Label statusPrimary, statusDetail, statusFree;
+      Label statusPrimary, statusDetail;
       Flex breadcrumbBar;
       FileManager manager(trickyDir.string());
       manager.m_statusLabel = &statusPrimary;
       manager.m_statusDetailLabel = &statusDetail;
-      manager.m_statusFreeLabel = &statusFree;
       manager.m_breadcrumbBar = &breadcrumbBar;
       auto& tab = manager.activeTab();
       auto& session = tab.session;
@@ -484,7 +483,6 @@ public:
 
       manager.m_statusLabel = nullptr;
       manager.m_statusDetailLabel = nullptr;
-      manager.m_statusFreeLabel = nullptr;
       manager.m_breadcrumbBar = nullptr;
     }
   }

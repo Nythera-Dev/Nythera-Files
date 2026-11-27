@@ -76,7 +76,7 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 
 Search starts in **Current folder & subfolders**. The scope menu also offers **Current folder only**, **Home**, **Local drives**, **All drives**, and named **Custom searches**. Local drives searches home and mounted local storage. All drives also searches mounted network storage such as SMB and NFS. For either drive scope, **Include system directories** adds the root filesystem. Files discovers storage that is already mounted and skips untriggered automounts.
 
-The results view opens when you enter a query. Clearing the query returns to browsing with the search bar still open. The scope menu saves **Show hidden items** and **Follow symbolic links** for standard scopes and separately for each custom search. Both options start off. Following links searches directory targets within their eligible source and lists descendants at their resolved locations. Exclusions and mount boundaries still apply.
+The results view opens when you enter a filename query or activate a valid filter. Clearing the query and all active filters returns to browsing with the search bar still open. The scope menu saves **Show hidden items** and **Follow symbolic links** for standard scopes and separately for each custom search. Both options start off. Following links searches directory targets within their eligible source and lists descendants at their resolved locations. Exclusions and mount boundaries still apply.
 
 Use **Define custom search…** to save included folders and optional additional exclusions, one absolute folder path per line. **Manage custom searches…** lets you edit, rename or delete these profiles. Entering `/` reveals **Include mounted filesystems**. Leave it unchecked to search the root filesystem only, or check it to add mounted local and network storage. Explicitly listed mount paths are searched independently.
 
@@ -103,6 +103,16 @@ search_default_mode = "contiguous"
 The default-mode values are `contiguous`, `fuzzy`, `starts_with`, `ends_with`, `exclude`, `exact` and `none`. If fzf cannot start or fails during search, Files runs the query again using conventional substring matching. Search results have their own saved list or grid view, column layout, and sort order. The default list shows Name, Location, Size, Modified and Type. The Location column and grid subtitles show the absolute containing-directory path. Hover over a result to see the full path. Files counts immediate items in visible matching folders when the Size column is shown.
 
 In either list view, drag a column's right divider to resize it, or double-click the divider to fit its displayed contents. Drag a heading to reorder columns. Right-click the header for visibility and sizing options. When columns extend beyond the viewport, scroll horizontally with the scrollbar, a touchpad, or Shift+wheel. Browsing and search remember their own column widths and order.
+
+### Search filters
+
+Open the sliders button in the search toolbar to filter by file size, modification date or contents. The button displays the number of active filters. Collapsing the panel keeps them active. **Clear Filters** beside the sliders removes them together. Empty metadata values leave that filter inactive, and Between requires both values. A filename query and any active filters must all match. Searches continue when you switch tabs. Press **Esc** during an active search to stop it and keep its current results. Press **Esc** again to close the search.
+
+- **File size** supports bytes and decimal or binary units. Between includes both endpoints. Fractional units must resolve to a whole number of bytes.
+- **Date modified** uses your local calendar. Before and After exclude the selected day. Between includes both days. Relative months and years use calendar arithmetic.
+- **File contents** applies the query and its options when you press **Search** or **Enter**. You can edit a nonempty draft while the last submitted content query remains active. Clearing the content field removes its filter. Plain text uses ripgrep (`rg`). Extracted text uses ripgrep-all (`rga` and `rga-preproc`) and its default extension-based adapters with available dependencies. For example, PDF needs `pdftotext`, several document formats need Pandoc, and media metadata needs FFmpeg. Mail extraction is disabled. If only ripgrep is available, **All supported files** searches plain text. Filename and metadata search work independently of these tools.
+
+Plain-text search runs with time and memory limits. Files larger than 128 MiB use a separate search lane. Extracted text has its own queue, a 128 MiB input limit, and a three-level archive limit. The search status reports access failures, extraction limits and failures, and timed-out batches. Files uses a separate ripgrep-all cache at `$XDG_CACHE_HOME/nythera-files/search-content/ripgrep-all-v2` (under `~/.cache` when the XDG cache variable is unset).
 
 ## Appearance & Theming
 

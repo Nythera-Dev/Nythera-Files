@@ -1,3 +1,4 @@
+#include "config/application_paths.h"
 #include "filemanager/file_manager.h"
 #include "filemanager/file_transfer_payload.h"
 #include "test_isolation.h"
@@ -43,16 +44,14 @@ public:
     return wait.matched;
   }
 
-  static void attachStatusLabels(FileManager& manager, Label& primary, Label& detail, Label& freeSpace) {
+  static void attachStatusLabels(FileManager& manager, Label& primary, Label& detail) {
     manager.m_statusLabel = &primary;
     manager.m_statusDetailLabel = &detail;
-    manager.m_statusFreeLabel = &freeSpace;
   }
 
   static void detachStatusLabels(FileManager& manager) {
     manager.m_statusLabel = nullptr;
     manager.m_statusDetailLabel = nullptr;
-    manager.m_statusFreeLabel = nullptr;
   }
 
   static void run(const nythera::test::ScopedTestEnv& env) {
@@ -104,9 +103,9 @@ public:
     // 1. Delayed free-space, writable, and selection-info queries: non-blocking UI, navigation away,
     //    stale completion rejection, and current completion application.
     {
-      Label primary, detail, freeLabel;
+      Label primary, detail;
       FileManager manager(dirA.string());
-      attachStatusLabels(manager, primary, detail, freeLabel);
+      attachStatusLabels(manager, primary, detail);
 
       std::vector<std::pair<std::filesystem::path, std::function<void(std::optional<std::uint64_t>)>>> freePending;
       std::vector<std::pair<std::filesystem::path, std::function<void(bool)>>> writablePending;
@@ -135,7 +134,7 @@ public:
       manager.updateStatusBar();
       TEST_CHECK(freePending.size() == 1 && freePending[0].first == dirA);
       TEST_CHECK(writablePending.size() == 1 && writablePending[0].first == dirA);
-      TEST_CHECK(freeLabel.text().empty());
+      TEST_CHECK(!primary.hasTooltip());
       TEST_CHECK(!manager.currentDirectoryWritable());
 
       // Navigate away to dirB while dirA queries are still unfinished.
@@ -149,13 +148,13 @@ public:
       // Deliver stale dirA completions AFTER navigating to dirB: must be ignored.
       freePending[0].second(999ULL * 1024ULL * 1024ULL * 1024ULL);
       writablePending[0].second(true);
-      TEST_CHECK(freeLabel.text().empty());
+      TEST_CHECK(!primary.hasTooltip());
       TEST_CHECK(!manager.currentDirectoryWritable());
 
       // Deliver current dirB completions: must update UI state.
       freePending[1].second(4ULL * 1024ULL * 1024ULL * 1024ULL);
       writablePending[1].second(true);
-      TEST_CHECK(freeLabel.text().find("free") != std::string::npos);
+      TEST_CHECK(std::get<std::string>(primary.tooltipContent()) == "4 GiB free");
       TEST_CHECK(manager.currentDirectoryWritable());
 
       // Single-selection metadata: immediate non-blocking fallback from m_entries, stale rejection, and update.
@@ -239,9 +238,9 @@ public:
 
     // 3. Real GIO async queries succeed and populate free space, writability, and symlink target.
     {
-      Label primary, detail, freeLabel;
+      Label primary, detail;
       FileManager manager(dirB.string());
-      attachStatusLabels(manager, primary, detail, freeLabel);
+      attachStatusLabels(manager, primary, detail);
       auto& tab = manager.activeTab();
       auto& session = tab.session;
       session.m_path = dirB;
@@ -251,7 +250,7 @@ public:
         return tab.m_statusFreeSpaceBytes.has_value() && session.m_directoryWritable.has_value();
       }));
       TEST_CHECK(manager.currentDirectoryWritable());
-      TEST_CHECK(freeLabel.text().find("free") != std::string::npos);
+      TEST_CHECK(std::get<std::string>(primary.tooltipContent()).ends_with(" free"));
 
       session.m_entries = {
           FileEntry{.name = "beta-link", .absPath = linkB, .isDir = false, .size = 0, .type = {}},
@@ -275,9 +274,9 @@ public:
       std::filesystem::create_directory(realDir);
       std::filesystem::create_directory_symlink(realDir, linkDir);
 
-      Label primary, detail, freeLabel;
+      Label primary, detail;
       FileManager manager(dirA.string());
-      attachStatusLabels(manager, primary, detail, freeLabel);
+      attachStatusLabels(manager, primary, detail);
 
       std::vector<std::pair<std::filesystem::path, std::function<void(FileManager::PlacePathResolution)>>> placePending;
       manager.m_places.m_placePathResolveHook = [&](const std::filesystem::path& p, auto done) {
@@ -301,11 +300,13 @@ public:
       );
       TEST_CHECK(manager.m_places.m_savedPlaces.size() == 1);
       {
-        const auto isolatedStateFile = env.state() / "nythera" / "state.toml";
-        TEST_CHECK(std::filesystem::is_regular_file(isolatedStateFile));
-        std::ifstream stateIn(isolatedStateFile);
-        const std::string stateText((std::istreambuf_iterator<char>(stateIn)), std::istreambuf_iterator<char>());
-        TEST_CHECK(stateText.find(realDir.string()) != std::string::npos);
+        const auto isolatedConfigFile =
+            std::filesystem::path(FileUtils::applicationConfigDir(FileUtils::Application::Files)) / "config.toml";
+        TEST_CHECK(nythera::test::isPathWithinRoot(isolatedConfigFile, env.config()));
+        TEST_CHECK(std::filesystem::is_regular_file(isolatedConfigFile));
+        std::ifstream configIn(isolatedConfigFile);
+        const std::string configText((std::istreambuf_iterator<char>(configIn)), std::istreambuf_iterator<char>());
+        TEST_CHECK(configText.find(realDir.string()) != std::string::npos);
         if (!realStateFile.empty()) {
           const StatSnapshot realStateAfter = snapshotStat(realStateFile);
           TEST_CHECK(realStateAfter.exists == realStateBefore.exists);

@@ -48,17 +48,6 @@ namespace filemanager {
   <path fill="white" d="M32 20 H40 L38 42 H34 Z M33 46 H39 V52 H33 Z"/>
 </svg>)SVG";
 
-    void applyNytheraBevel(Flex& panel, float radius) {
-      panel.setRadius(radius);
-      panel.setCornerShapes(
-          CornerShapes{
-              .tl = CornerShape::Chamfered,
-              .tr = CornerShape::Chamfered,
-              .br = CornerShape::Chamfered,
-              .bl = CornerShape::Chamfered,
-          }
-      );
-    }
   } // namespace
 
   ModalDialogHost::ModalDialogHost(
@@ -837,7 +826,7 @@ namespace filemanager {
     m_root->setPadding(16.0F);
     m_root->setFill(colorSpecFromRole(ColorRole::SurfaceContainerLow));
     m_root->setBorder(colorSpecFromRole(ColorRole::Primary), Style::borderWidth);
-    applyNytheraBevel(*m_root, Style::scaledRadiusMd(1.0F));
+    m_root->setRadius(Style::scaledRadiusMd(1.0F));
     if (m_warningStyle) {
       auto topAccent = std::make_unique<DialogBackgroundArtwork>("top-left-diagonals.svg", 126.0F, 78.27F);
       m_topAccent = topAccent.get();
@@ -939,7 +928,7 @@ namespace filemanager {
         card->setPadding(10.0F, 12.0F);
         card->setFill(colorSpecFromRole(ColorRole::SurfaceContainer));
         card->setBorder(colorSpecFromRole(ColorRole::OutlineVariant), Style::borderWidth);
-        applyNytheraBevel(*card, Style::scaledRadiusSm(1.0F));
+        card->setRadius(Style::scaledRadiusSm(1.0F));
         auto headingLabel = std::make_unique<Label>();
         headingLabel->setText(sectionTitle);
         headingLabel->setFontWeight(FontWeight::SemiBold);

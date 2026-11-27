@@ -938,6 +938,45 @@ namespace filemanager {
     return m_contextMenuPopup->isOpen();
   }
 
+  void
+  FileMenuController::appendOpenWithEntries(const FileEntry& target, std::vector<ContextMenuControlEntry>& entries) {
+    std::vector<ContextMenuControlEntry> alternatives;
+    std::string mimeStorage = target.type;
+    if (mimeStorage.empty()) {
+      if (gchar* guessed = g_content_type_guess(target.absPath.filename().c_str(), nullptr, 0, nullptr)) {
+        mimeStorage = guessed;
+        g_free(guessed);
+      }
+    }
+    if (!mimeStorage.empty()) {
+      const char* mime = mimeStorage.c_str();
+      std::shared_ptr<GAppInfo> defaultApp(g_app_info_get_default_for_type(mime, FALSE), g_object_unref);
+      if (defaultApp) {
+        entries.front() = applicationMenuEntry(10, defaultApp.get());
+        entries.front().label = "Open with " + applicationDisplayName(defaultApp.get());
+        entries.front().gutterIconNames = std::move(entries.front().iconNames);
+        entries.front().iconNames.clear();
+      }
+
+      GList* compatible = g_app_info_get_all_for_type(mime);
+      for (GList* item = compatible; item; item = item->next) {
+        auto* app = G_APP_INFO(item->data);
+        if (!g_app_info_get_id(app) || (defaultApp && g_app_info_equal(defaultApp.get(), app))) {
+          g_object_unref(app);
+          continue;
+        }
+        const auto appId = static_cast<std::int32_t>(20000 + m_openWithApplications.size());
+        alternatives.push_back(applicationMenuEntry(appId, app));
+        m_openWithApplications.emplace_back(app, g_object_unref);
+      }
+      g_list_free(compatible);
+    }
+    ContextMenuControlEntry openWith{.id = 80, .label = "Open With", .hasSubmenu = true};
+    openWith.submenuEntries = std::move(alternatives);
+    openWith.submenuEntries.push_back({.id = 81, .label = "Other Application…"});
+    entries.insert(entries.begin() + 1, std::move(openWith));
+  }
+
   void FileMenuController::openContextMenu(std::size_t index, float x, float y, bool highlightOnOpen) {
     const auto& tab = m_tabs.activeTab();
     const auto& session = tab.session;
@@ -1005,42 +1044,7 @@ namespace filemanager {
       };
     else {
       if (!targetIsDir && caps.canLaunchApps && canOpenTarget) {
-        std::vector<ContextMenuControlEntry> alternatives;
-        std::string mimeStorage = session.entries()[index].type;
-        if (mimeStorage.empty()) {
-          if (gchar* guessed =
-                  g_content_type_guess(session.entries()[index].absPath.filename().c_str(), nullptr, 0, nullptr)) {
-            mimeStorage = guessed;
-            g_free(guessed);
-          }
-        }
-        if (!mimeStorage.empty()) {
-          const char* mime = mimeStorage.c_str();
-          std::shared_ptr<GAppInfo> defaultApp(g_app_info_get_default_for_type(mime, FALSE), g_object_unref);
-          if (defaultApp) {
-            entries.front() = applicationMenuEntry(10, defaultApp.get());
-            entries.front().label = "Open with " + applicationDisplayName(defaultApp.get());
-            entries.front().gutterIconNames = std::move(entries.front().iconNames);
-            entries.front().iconNames.clear();
-          }
-
-          GList* compatible = g_app_info_get_all_for_type(mime);
-          for (GList* item = compatible; item; item = item->next) {
-            auto* app = G_APP_INFO(item->data);
-            if (!g_app_info_get_id(app) || (defaultApp && g_app_info_equal(defaultApp.get(), app))) {
-              g_object_unref(app);
-              continue;
-            }
-            const auto appId = static_cast<std::int32_t>(20000 + m_openWithApplications.size());
-            alternatives.push_back(applicationMenuEntry(appId, app));
-            m_openWithApplications.emplace_back(app, g_object_unref);
-          }
-          g_list_free(compatible);
-        }
-        ContextMenuControlEntry openWith{.id = 80, .label = "Open With", .hasSubmenu = true};
-        openWith.submenuEntries = std::move(alternatives);
-        openWith.submenuEntries.push_back({.id = 81, .label = "Other Application…"});
-        entries.insert(entries.begin() + 1, std::move(openWith));
+        appendOpenWithEntries(session.entries()[index], entries);
       } else if (!targetIsDir) {
         entries.insert(
             entries.begin() + 1,

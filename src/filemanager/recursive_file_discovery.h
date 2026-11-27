@@ -15,6 +15,8 @@ namespace filemanager {
   // Publication and completion run on the thread-default GLib context of start().
   class RecursiveFileDiscovery {
   public:
+    enum class Lane { Discovery, LargeContent, Extraction };
+
     struct Candidate {
       std::string name;
       GFileType type;
@@ -24,6 +26,8 @@ namespace filemanager {
       const std::filesystem::path& root;
       int rootFd;
       int folderFd;
+      std::function<int(const std::filesystem::path&)> openLink;
+      [[nodiscard]] int pinRegular(const std::filesystem::path& path, GFileType type) const;
       [[nodiscard]] int openFolder(const std::filesystem::path& parent) const;
     };
 
@@ -44,7 +48,10 @@ namespace filemanager {
     RecursiveFileDiscovery& operator=(const RecursiveFileDiscovery&) = delete;
 
     void start(const std::filesystem::path& root, bool showHidden, Batch batch, Complete complete, Flush flush = {});
-    void startPlan(std::shared_ptr<const SearchPlan> plan, bool showHidden, MakeConsumer consumer, Complete complete);
+    void startPlan(
+        std::shared_ptr<const SearchPlan> plan, bool showHidden, MakeConsumer consumer, Complete complete,
+        Lane lane = Lane::Discovery
+    );
     void cancel();
 
   private:

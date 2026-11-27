@@ -34,13 +34,7 @@ namespace filemanager {
       return normalized;
     }
 
-    struct CompactSize {
-      double value = 0.0;
-      std::string unit;
-      std::size_t unitIndex = 0;
-    };
-
-    CompactSize compactSize(std::uint64_t bytes) {
+    std::string compactFreeSpace(std::uint64_t bytes) {
       constexpr std::array<std::string_view, 7> units{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
       double value = static_cast<double>(bytes);
       std::size_t index = 0;
@@ -52,19 +46,15 @@ namespace filemanager {
         value = std::round(value);
       else
         value = std::round(value * 10.0) / 10.0;
-      return {value, std::string(units[index]), index};
-    }
-
-    std::string compactCapacity(std::uint64_t free, std::uint64_t total) {
-      const auto freeSize = compactSize(free), totalSize = compactSize(total);
-      auto number = [](double value) {
-        std::ostringstream out;
-        out << std::fixed << std::setprecision(value == std::round(value) ? 0 : 1) << value;
-        return out.str();
-      };
-      if (freeSize.unitIndex == totalSize.unitIndex)
-        return number(freeSize.value) + " free of " + number(totalSize.value) + " " + totalSize.unit;
-      return number(freeSize.value) + " " + freeSize.unit + " free / " + number(totalSize.value) + " " + totalSize.unit;
+      std::ostringstream out;
+      out
+          << std::fixed
+          << std::setprecision(value == std::round(value) ? 0 : 1)
+          << value
+          << ' '
+          << units[index]
+          << " free";
+      return out.str();
     }
 
     void useSubtleSelection(Button& button, bool muted = false) {
@@ -107,9 +97,7 @@ namespace filemanager {
   )
       : m_settings(settings), m_operations(operations), m_callbacks(std::move(callbacks)) {}
 
-  PlacesSidebarController::~PlacesSidebarController() {
-    shutdown();
-  }
+  PlacesSidebarController::~PlacesSidebarController() { shutdown(); }
 
   void PlacesSidebarController::attachUi(ScrollView* scroll, Flex* content) {
     m_scroll = scroll;
@@ -248,9 +236,8 @@ namespace filemanager {
     resolvePathAsync(normSecond, step, false);
   }
 
-  void PlacesSidebarController::cacheResolvedPath(
-      const std::filesystem::path& path, const PlacePathResolution& resolved
-  ) {
+  void
+  PlacesSidebarController::cacheResolvedPath(const std::filesystem::path& path, const PlacePathResolution& resolved) {
     m_placePathCache[normalizeDirectoryPath(path).string()] = resolved;
   }
 
@@ -366,8 +353,9 @@ namespace filemanager {
           m_callbacks.onStatus("This folder is unavailable");
         return;
       }
-      if (isPersonalPlaceSaved(path)
-          || std::ranges::any_of(m_savedPlaces, [&](const auto& saved) { return samePersonalPlace(saved.path, path); })) {
+      if (isPersonalPlaceSaved(path) || std::ranges::any_of(m_savedPlaces, [&](const auto& saved) {
+            return samePersonalPlace(saved.path, path);
+          })) {
         if (m_callbacks.onStatus)
           m_callbacks.onStatus("This folder is already saved in Places");
         return;
@@ -406,7 +394,8 @@ namespace filemanager {
         }
       if (!visible)
         continue;
-      const auto row = std::ranges::find_if(m_placeRows, [&](const auto& entry) { return entry.second.identity == id; });
+      const auto row =
+          std::ranges::find_if(m_placeRows, [&](const auto& entry) { return entry.second.identity == id; });
       if (id != "end:" + std::string(group) && (row == m_placeRows.end() || placeGroup(row->second) != group))
         continue;
       float lx = 0, ly = 0;
@@ -713,7 +702,9 @@ namespace filemanager {
         prompt, "ask-password",
         G_CALLBACK((+[](GMountOperation* op, const char*, const char* user, const char* domain, GAskPasswordFlags flags,
                         gpointer data) {
-          static_cast<PlacesSidebarController*>(data)->mountPassword(op, flags, user ? user : "", domain ? domain : "", 0);
+          static_cast<PlacesSidebarController*>(data)->mountPassword(
+              op, flags, user ? user : "", domain ? domain : "", 0
+          );
         })),
         this
     );
@@ -967,19 +958,29 @@ namespace filemanager {
           area->setTabFocusKey("place:" + place.identity);
         m_placeRows.emplace_back(rowPtr, place);
         if (place.mounted && !place.personal) {
-          auto bar = std::make_unique<ProgressBar>();
-          bar->setSize(std::max(80.0F, sidebarWidth - 28.0F), 4.0F);
-          bar->setFillColor(colorSpecFromRole(ColorRole::Primary, kStorageMeterFillOpacity));
-          bar->setTrackColor(colorSpecFromRole(ColorRole::SurfaceContainerHighest, kStorageMeterTrackOpacity));
-          bar->setVisible(false);
-          bar->setParticipatesInLayout(false);
-          auto* barPtr = static_cast<ProgressBar*>(group->addChild(std::move(bar)));
+          rowPtr->setClipChildren(true);
+          rowPtr->setMirrorInRtl(false);
+          rowPtr->label()->setFlexGrow(1.0F);
+          rowPtr->label()->setMaxLines(1);
+          rowPtr->label()->setEllipsize(TextEllipsize::End);
           auto label = std::make_unique<Label>();
           label->setFontSize(Style::fontSizeCaption);
           label->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
           label->setMaxLines(1);
           label->setEllipsize(TextEllipsize::End);
-          auto* labelPtr = static_cast<Label*>(group->addChild(std::move(label)));
+          label->setTextAlign(Style::rtl() ? TextAlign::Start : TextAlign::End);
+          auto* labelPtr = label.get();
+          // The button applies its state foreground to direct label children.
+          auto secondary = std::make_unique<Flex>();
+          secondary->addChild(std::move(label));
+          rowPtr->addChild(std::move(secondary));
+
+          auto bar = std::make_unique<ProgressBar>();
+          bar->setFillColor(colorSpecFromRole(ColorRole::Primary, kStorageMeterFillOpacity));
+          bar->setTrackColor(colorSpecFromRole(ColorRole::SurfaceContainerHighest, kStorageMeterTrackOpacity));
+          bar->setVisible(false);
+          bar->setParticipatesInLayout(false);
+          auto* barPtr = static_cast<ProgressBar*>(group->addChild(std::move(bar)));
           const std::string capacityKey = place.capacityIdentity.empty() ? place.identity : place.capacityIdentity;
           m_placeCapacities.push_back({place.identity, capacityKey, place.path, labelPtr, barPtr, rowPtr});
           requestPlaceCapacity(m_placeCapacities.back(), m_refreshCapacity);
@@ -995,6 +996,7 @@ namespace filemanager {
       }
       m_content->addChild(std::move(group));
     }
+    updateCapacityBarWidths(sidebarWidth);
     m_refreshCapacity = false;
     if (m_callbacks.onUpdateNavigationControls)
       m_callbacks.onUpdateNavigationControls();
@@ -1024,15 +1026,14 @@ namespace filemanager {
       if (entry != m_placeRows.end()) {
         const auto tooltip = placeTooltip(entry->second, info.filesystemType, info.free, info.total);
         place.row->setTooltip(tooltip);
-        place.freeSpaceLabel->setTooltip(tooltip);
       }
       if (info.total == 0) {
-        place.freeSpaceLabel->setText("Capacity unavailable");
+        place.freeSpaceLabel->setText("Unavailable");
         place.bar->setVisible(false);
         place.bar->setParticipatesInLayout(false);
         return;
       }
-      place.freeSpaceLabel->setText(compactCapacity(info.free, info.total));
+      place.freeSpaceLabel->setText(compactFreeSpace(info.free));
       place.bar->setProgress(
           static_cast<float>(info.total - std::min(info.free, info.total)) / static_cast<float>(info.total)
       );
@@ -1042,7 +1043,7 @@ namespace filemanager {
     if (cached != m_capacityCache.end())
       render(cached->second);
     else
-      place.freeSpaceLabel->setText("Checking capacity…");
+      place.freeSpaceLabel->setText("Checking…");
     if (!forceRefresh && fresh)
       return;
     if (m_capacityQueries.contains(place.capacityIdentity))
@@ -1075,9 +1076,12 @@ namespace filemanager {
   }
 
   void PlacesSidebarController::updateCapacityBarWidths(float sidebarWidth) {
-    for (const auto& capacity : m_placeCapacities)
-      if (capacity.bar)
-        capacity.bar->setSize(std::max(80.0F, sidebarWidth - 28.0F), 4.0F);
+    const float width = std::max(80.0F, sidebarWidth - 28.0F);
+    for (const auto& capacity : m_placeCapacities) {
+      capacity.bar->setSize(width, 4.0F);
+      // Reserve space for the icon and an ellipsis before constraining the capacity label.
+      capacity.freeSpaceLabel->setMaxWidth(width - 32.0F);
+    }
   }
 
   void PlacesSidebarController::updateActiveHighlight(const std::filesystem::path& currentPath, bool) {

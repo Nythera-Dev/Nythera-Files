@@ -6,7 +6,6 @@
 #include "render/core/renderer.h"
 #include "render/scene/input_area.h"
 #include "render/scene/input_dispatcher.h"
-#include "ui/tooltip/tooltip_manager.h"
 #include "ui/builders.h"
 #include "ui/controls/box.h"
 #include "ui/controls/button.h"
@@ -14,9 +13,11 @@
 #include "ui/controls/label.h"
 #include "ui/controls/scroll_view.h"
 #include "ui/controls/separator.h"
+#include "ui/controls/spinner.h"
 #include "ui/dialogs/file_icon.h"
 #include "ui/palette.h"
 #include "ui/style.h"
+#include "ui/tooltip/tooltip_manager.h"
 #include "wayland/wayland_connection.h"
 #include "wayland/wayland_seat.h"
 
@@ -53,10 +54,7 @@ namespace filemanager {
       TabManager& tabs, AnimationManager& animations, InputDispatcher& dispatcher, WaylandConnection& wayland,
       Callbacks callbacks
   )
-      : m_tabs(tabs),
-        m_animations(animations),
-        m_dispatcher(dispatcher),
-        m_wayland(wayland),
+      : m_tabs(tabs), m_animations(animations), m_dispatcher(dispatcher), m_wayland(wayland),
         m_callbacks(std::move(callbacks)) {}
 
   TabBarController::~TabBarController() { detachUi(); }
@@ -203,8 +201,8 @@ namespace filemanager {
       m_lastActiveTabId = activeId;
     }
 
-    const float initialWidth = m_lastTabWidth >= kMinTabWidth && m_lastTabWidth <= kMaxTabWidth ? m_lastTabWidth
-                                                                                                : kMaxTabWidth;
+    const float initialWidth =
+        m_lastTabWidth >= kMinTabWidth && m_lastTabWidth <= kMaxTabWidth ? m_lastTabWidth : kMaxTabWidth;
     for (const auto& tabPtr : m_tabs.tabs()) {
       const TabId tabId = tabPtr->id;
       const auto path = tabPtr->session.path();
@@ -234,6 +232,12 @@ namespace filemanager {
       else
         icon->setFile(path, true);
       auto* iconPtr = static_cast<FileIcon*>(slotNode->addChild(std::move(icon)));
+      auto spinner = std::make_unique<Spinner>();
+      spinner->setSpinnerSize(kIconSize);
+      spinner->setHitTestVisible(false);
+      spinner->setVisible(false);
+      auto* spinnerPtr = static_cast<Spinner*>(slotNode->addChild(std::move(spinner)));
+      spinnerPtr->setAnimationManager(&m_animations);
 
       auto label = std::make_unique<Label>();
       label->setText(tabDisplayLabel(path, home));
@@ -277,6 +281,7 @@ namespace filemanager {
           .container = slotPtr,
           .hitArea = hitAreaPtr,
           .icon = iconPtr,
+          .searchSpinner = spinnerPtr,
           .label = labelPtr,
           .closeButton = closeBtnPtr,
           .active = active,
@@ -285,6 +290,7 @@ namespace filemanager {
       };
       applySlotVisualState(slot);
       m_slots.push_back(slot);
+      syncSearchActivity(tabId);
 
       hitAreaPtr->setOnEnter([this, tabId](const InputArea::PointerData&) {
         if (auto* found = findSlot(tabId)) {
@@ -330,6 +336,23 @@ namespace filemanager {
       });
     }
     return true;
+  }
+
+  void TabBarController::syncSearchActivity(TabId tabId) {
+    auto* slot = findSlot(tabId);
+    const auto* tab = m_tabs.findTab(tabId);
+    if (!slot || !tab)
+      return;
+    // The spinner takes the place of the folder icon, so the label and close button stay in place.
+    const bool searching = tab->session.search().status() == FileSearchSession::Status::Searching;
+    if (slot->searchSpinner->spinning() == searching)
+      return;
+    slot->icon->setVisible(!searching);
+    slot->searchSpinner->setVisible(searching);
+    if (searching)
+      slot->searchSpinner->start();
+    else
+      slot->searchSpinner->stop();
   }
 
   void TabBarController::applySlotVisualState(TabSlot& slot) {
@@ -437,8 +460,7 @@ namespace filemanager {
             if (m_callbacks.onRequestRedraw)
               m_callbacks.onRequestRedraw();
           },
-          [this] { m_underlineAnimation = 0; },
-          this
+          [this] { m_underlineAnimation = 0; }, this
       );
       return;
     }
