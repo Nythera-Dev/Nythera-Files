@@ -38,6 +38,7 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 
 ### Browsing & Navigation
 
+- Drag the app bar branding or empty space to move the window, and drag an outer edge or corner to resize it.
 - List and grid views with adjustable scaling.
 - Multiple tabs, including tab reordering and reopening closed tabs.
 - Breadcrumb navigation and directory history.

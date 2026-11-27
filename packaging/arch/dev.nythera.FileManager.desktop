@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Nythera Files
+GenericName=File Manager
+Exec=nythera-file-manager %u
+Icon=dev.nythera.FileManager
+Terminal=false
+Categories=System;FileManager;
+MimeType=inode/directory;
