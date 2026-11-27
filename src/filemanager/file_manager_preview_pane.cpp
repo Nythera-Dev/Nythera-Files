@@ -9,20 +9,24 @@
 #include <cmath>
 #include <linux/input-event-codes.h>
 
-void FileManager::attachPreviewPane(float dividerWidth, const ColorSpec& fill) {
+void FileManager::attachPreviewPane(Flex& host, float dividerWidth, const ColorSpec& fill) {
   auto previewDivider = std::make_unique<Flex>();
   previewDivider->setMinWidth(dividerWidth);
   previewDivider->setMaxWidth(dividerWidth);
-  m_previewDivider = static_cast<Flex*>(m_root->addChild(std::move(previewDivider)));
-  auto previewPane = m_selectionPreview.build([this] { setPreviewMode(filemanager::PreviewMode::Hidden); });
-  previewPane->setPadding(Style::spaceMd);
+  m_previewDivider = static_cast<Flex*>(host.addChild(std::move(previewDivider)));
+  auto previewPane = m_selectionPreview.build(
+      [this] { setPreviewMode(filemanager::PreviewMode::Hidden); }, [this] { openPreviewed(false); },
+      [this] { openPreviewed(true); }, filemanager::kFileListHeaderHeight
+  );
+
+  previewPane->setPadding(0.0F, Style::spaceMd, Style::spaceMd, Style::spaceMd);
   previewPane->setFill(fill);
   previewPane->setRadius(Style::scaledRadiusMd(1.0F));
-  m_previewPane = static_cast<Flex*>(m_root->addChild(std::move(previewPane)));
+  m_previewPane = static_cast<Flex*>(host.addChild(std::move(previewPane)));
   m_previewWidth = m_settings.loadPreviewWidth();
 }
 
-float FileManager::layoutPreviewPane(float available, float dividerSpace) {
+void FileManager::layoutPreviewPane(float available, float dividerSpace) {
   const float previewBudget = std::min(800.0F, available - 440.0F - dividerSpace);
   const bool showPreview = m_settings.previewMode() != filemanager::PreviewMode::Hidden && previewBudget >= 208.0F;
   m_previewDivider->setVisible(showPreview);
@@ -37,24 +41,20 @@ float FileManager::layoutPreviewPane(float available, float dividerSpace) {
   } else {
     m_previewResize.reset();
   }
-  return showPreview ? previewSpace + dividerSpace : 0.0F;
 }
 
 void FileManager::renderPreviewPane(Renderer& renderer) {
   if (m_previewPane->visible()) {
     const auto mode = m_settings.previewMode();
     const float width = std::max(1.0F, m_previewPane->width() - 2.0F * Style::spaceMd);
-    const float height = mode == filemanager::PreviewMode::Information
-        ? std::min(160.0F, width)
-        : std::max(120.0F, std::min(width, 0.6F * m_previewPane->height()));
+    const float height = std::max(1.0F, m_previewPane->height() - 2.0F * Style::controlHeightSm);
     const int pixels = mode == filemanager::PreviewMode::Information
         ? ThumbnailService::kDefaultTargetPx
         : std::clamp(
               static_cast<int>(std::ceil(std::max(width, height) * renderer.renderScale() / 64.0F)) * 64, 128, 2048
           );
     syncFilePreview(m_selectionPreview, mode, pixels);
-    m_selectionPreview.render(renderer, width, height);
-    m_previewPane->layout(renderer);
+    m_selectionPreview.render(renderer, *m_previewPane);
   } else {
     syncFilePreview(m_selectionPreview, filemanager::PreviewMode::Hidden, 0);
   }

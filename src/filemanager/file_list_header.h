@@ -25,6 +25,7 @@ class VirtualGridView;
 class WaylandConnection;
 
 namespace filemanager {
+  inline constexpr float kFileListHeaderHeight = 36.0F;
 
   class FileManagerSettings;
 

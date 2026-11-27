@@ -1,5 +1,6 @@
 #pragma once
 
+#include "filemanager/preview/preview_content.h"
 #include "render/core/image_decoder.h"
 
 #include <cstddef>
@@ -15,6 +16,6 @@ namespace filemanager::preview {
       int fd, const std::string& path, std::size_t bytes, std::size_t sourceLimit, int side, bool browsing,
       const std::function<bool()>& canceled
   );
-  [[nodiscard]] std::string mediaDetails(int fd, std::string_view mime, const std::function<bool()>& canceled);
+  [[nodiscard]] std::vector<Detail> mediaDetails(int fd, std::string_view mime, const std::function<bool()>& canceled);
   int runImageWorker(const char* side, const char* output);
 } // namespace filemanager::preview

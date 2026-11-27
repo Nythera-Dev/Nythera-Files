@@ -75,6 +75,8 @@ namespace filemanager {
     if (hoverTooltipsEnabled())
       TooltipManager::instance().forceDestroy();
     savePendingDialogSize();
+    cancelInitialLayout();
+    m_dialogHeightAnimation.cancelAll();
     m_configuredDialogSize.reset();
     m_wayland.stopKeyRepeat();
     m_dispatcher.setTextInputContext(nullptr, nullptr);
@@ -94,6 +96,7 @@ namespace filemanager {
     m_conflictRequest.reset();
     m_root.reset();
     m_surface.reset();
+    m_modalHint.reset();
     m_alternativeNameInput = nullptr;
     m_alternativeNameError = nullptr;
     m_symlinkDialogActive = false;
@@ -109,6 +112,22 @@ namespace filemanager {
   void ModalDialogHost::requestLayout() {
     if (m_surface)
       m_surface->requestLayout();
+    else if (m_pendingPresentation && !m_closeQueued && m_initialLayoutSource == 0)
+      m_initialLayoutSource = g_idle_add(
+          [](gpointer data) -> gboolean {
+            auto& host = *static_cast<ModalDialogHost*>(data);
+            host.m_initialLayoutSource = 0;
+            host.prepareInitialLayout();
+            return G_SOURCE_REMOVE;
+          },
+          this
+      );
+  }
+
+  void ModalDialogHost::cancelInitialLayout() {
+    if (const auto source = std::exchange(m_initialLayoutSource, 0U))
+      g_source_remove(source);
+    m_pendingPresentation.reset();
   }
 
   void ModalDialogHost::setFocus(InputArea* area) { m_dispatcher.setFocus(area); }
@@ -451,10 +470,52 @@ namespace filemanager {
       return;
     const DialogSize size{width, height};
     const auto previous = std::exchange(m_configuredDialogSize, size);
+    if (m_normalDialogSize) {
+      if (m_applyingDialogSize || m_compactDialogHeight || m_dialogHeightAnimation.hasActive())
+        return;
+      if (std::exchange(*m_normalDialogSize, size) == size)
+        return;
+    }
     if (m_customContent && !m_customContent->sizeStateKey.empty() && previous && *previous != size) {
       m_pendingDialogSize = size;
       m_dialogSizeSave.start(std::chrono::milliseconds(250), [this] { savePendingDialogSize(); });
     }
+  }
+
+  std::uint32_t ModalDialogHost::normalHeight() const noexcept {
+    return m_normalDialogSize ? m_normalDialogSize->second : 0U;
+  }
+
+  std::optional<std::uint32_t> ModalDialogHost::compactExtent(std::optional<float> height) const {
+    const auto normal = normalHeight();
+    return height
+        ? std::optional{static_cast<std::uint32_t>(std::ceil(
+              std::clamp(*height, static_cast<float>(std::min(m_dialogMinHeight, normal)), static_cast<float>(normal))
+          ))}
+        : std::nullopt;
+  }
+
+  void ModalDialogHost::setCompactHeight(std::optional<float> height) {
+    if (!m_surface || !m_normalDialogSize || m_closeQueued)
+      return;
+    const auto [width, normalHeight] = *m_normalDialogSize;
+    const auto compact = compactExtent(height);
+    if (compact == m_compactDialogHeight)
+      return;
+    m_compactDialogHeight = compact;
+    m_dialogHeightAnimation.cancelAll();
+    const auto target = compact.value_or(normalHeight);
+    if (m_surface->height() == target && m_surface->width() == width)
+      return;
+    m_dialogHeightAnimation.animate(
+        static_cast<float>(m_surface->height()), static_cast<float>(target), 175.0F, Easing::EaseInOutCubic,
+        [this, width](float value) {
+          m_applyingDialogSize = true;
+          m_surface->resizeClient(width, static_cast<std::uint32_t>(std::lround(value)));
+          m_applyingDialogSize = false;
+        }
+    );
+    m_surface->requestFrameTick();
   }
 
   void ModalDialogHost::savePendingDialogSize() {
@@ -472,7 +533,7 @@ namespace filemanager {
   ) {
     if (!alternativeName || m_textPrompt)
       m_conflict.reset();
-    if (m_surface || (!m_wayland.isConnected() && !m_presentToplevelForTest)) {
+    if (isOpen() || (!m_wayland.isConnected() && !m_presentToplevelForTest)) {
       m_conflict.reset();
       if (response)
         response(-1);
@@ -482,17 +543,21 @@ namespace filemanager {
     if (parent == nullptr && m_callbacks.defaultParent)
       parent = m_callbacks.defaultParent();
     m_title = std::move(title);
-    m_warningStyle = m_title == "Permanently delete?" || m_title == "Empty Wastebin?";
+    m_warningStyle = !(m_customContent && m_customContent->headerCloseButton)
+        && (m_title == "Permanently delete?" || m_title == "Empty Wastebin?");
     m_resizable = true;
     m_resizeEdges.fill(nullptr);
     m_moveHandle = nullptr;
     m_titleRow = nullptr;
+    m_titleLabel = nullptr;
     m_spacer = nullptr;
     m_footer = nullptr;
     m_divider = nullptr;
     m_preferredWidth = 0;
     m_preferredHeight = 0;
     m_configuredDialogSize.reset();
+    m_normalDialogSize.reset();
+    m_compactDialogHeight.reset();
     m_sizeStateKey = m_customContent && !m_customContent->sizeStateKey.empty()
         ? m_customContent->sizeStateKey
         : FileManagerSettings::dialogSizeStateKey(m_title, alternativeName && !m_textPrompt);
@@ -512,15 +577,6 @@ namespace filemanager {
     m_alternativeNameError = nullptr;
     m_response = std::move(response);
     m_closeQueued = false;
-    auto surface = std::make_unique<ToplevelSurface>(m_wayland);
-    surface->setRenderContext(&m_renderContext);
-    surface->setConfigureCallback([this](std::uint32_t width, std::uint32_t height) {
-      recordConfiguredSize(width, height);
-      if (m_surface)
-        m_surface->requestLayout();
-    });
-    surface->setClosedCallback([this] { closeDialog(-1); });
-    surface->setPrepareFrameCallback([this](bool update, bool layout) { prepareFrame(update, layout); });
     const bool usePreferredInitialHeight = m_customContent && m_customContent->usePreferredInitialHeight;
     const auto& outputs = m_wayland.outputs();
     const auto* parentOutput = parent ? m_wayland.outputForSurface(parent->wlSurface()) : nullptr;
@@ -550,10 +606,26 @@ namespace filemanager {
     const auto preferredHeight = usePreferredInitialHeight
         ? initialExtent(m_preferredHeight, m_customContent->preferredHeight, requestedMinHeight, maxHeight)
         : 0U;
+    if (m_customContent && m_customContent->compactHeightMode) {
+      m_normalDialogSize = DialogSize{width, preferredHeight};
+      m_dialogMinHeight = std::min(requestedMinHeight, maxHeight);
+    }
     buildDialog(static_cast<float>(width));
+    if (m_customContent && m_customContent->onInitialLayout) {
+      m_pendingPresentation = PendingPresentation{
+          parent,
+          ToplevelSurfaceConfig{
+              .width = width,
+              .height = preferredHeight,
+              .minWidth = minWidth,
+              .minHeight = std::min(requestedMinHeight, maxHeight)
+          }
+      };
+      requestLayout();
+      return;
+    }
     if (m_presentToplevelForTest) {
-      m_surface = std::move(surface);
-      m_presentToplevelForTest(*m_surface, parent, {width, preferredHeight});
+      presentDialog(parent, ToplevelSurfaceConfig{.width = width, .height = preferredHeight});
       return;
     }
     ScaledRenderer measureRenderer(m_renderContext, outputInfo == nullptr ? 1.0F : outputInfo->configuredScale());
@@ -617,22 +689,87 @@ namespace filemanager {
         .minHeight = minHeight,
         .maxWidth = m_resizable ? 0U : width,
         .maxHeight = m_resizable ? 0U : height,
-        .parent = parent == nullptr ? nullptr : parent->xdgToplevel(),
-        .title = m_title,
-        .appId = "dev.nythera.FileManager.Dialog"
     };
-    wl_output* output = outputInfo == nullptr ? nullptr : outputInfo->output;
+    presentDialog(parent, config);
+  }
+
+  void ModalDialogHost::prepareInitialLayout() {
+    if (!m_pendingPresentation || m_closeQueued)
+      return;
+    auto [parent, config] = *m_pendingPresentation;
+    auto* renderer = m_initialLayoutRendererForTest;
+    if (!renderer) {
+      if (!parent || !m_renderContext.makeCurrent(parent->renderTarget())) {
+        closeDialog(-1);
+        return;
+      }
+      renderer = &parent->renderTarget().renderer();
+    }
+    std::optional<float> compactHeight;
+    {
+      UiPhaseScope layoutPhase(UiPhase::Layout);
+      m_root->setSize(static_cast<float>(config.width), static_cast<float>(config.height));
+      m_root->layout(*renderer);
+      if (!m_customContent->onInitialLayout(*renderer, static_cast<float>(config.height), compactHeight))
+        return;
+    }
+    m_compactDialogHeight = compactExtent(compactHeight);
+    config.height = m_compactDialogHeight.value_or(config.height);
+    m_pendingPresentation.reset();
+    presentDialog(parent, config);
+  }
+
+  void ModalDialogHost::presentDialog(ToplevelSurface* parent, const ToplevelSurfaceConfig& requested) {
+    auto surface = std::make_unique<ToplevelSurface>(m_wayland);
+    surface->setRenderContext(&m_renderContext);
+    surface->setConfigureCallback([this](std::uint32_t width, std::uint32_t height) {
+      recordConfiguredSize(width, height);
+      if (m_surface)
+        m_surface->requestLayout();
+    });
+    surface->setClosedCallback([this] { closeDialog(-1); });
+    surface->setPrepareFrameCallback([this](bool update, bool layout) { prepareFrame(update, layout); });
+    if (m_normalDialogSize)
+      surface->setAnimationManager(&m_dialogHeightAnimation);
+    if (m_presentToplevelForTest) {
+      m_surface = std::move(surface);
+      m_presentToplevelForTest(*m_surface, parent, {requested.width, requested.height});
+      return;
+    }
+    auto config = requested;
+    config.parent = parent ? parent->xdgToplevel() : nullptr;
+    config.title = m_title;
+    config.appId = "dev.nythera.FileManager.Dialog";
+    auto* output = parent ? m_wayland.outputForSurface(parent->wlSurface()) : nullptr;
+    if (!output && !m_wayland.outputs().empty())
+      output = m_wayland.outputs().front().output;
     if (surface->initialize(output, config)) {
+      if (m_normalDialogSize && config.parent) {
+        if (!m_modalManager)
+          m_modalManager = ToplevelSurface::bindModalManager(m_wayland);
+        m_modalHint = surface->createModalHint(m_modalManager->get());
+      }
       m_wayland.stopKeyRepeat();
       m_surface = std::move(surface);
       m_surface->setSceneRoot(m_root.get());
       m_dispatcher.setTextInputContext(m_surface->wlSurface(), m_wayland.textInputService());
     } else {
-      m_customContent.reset();
       auto failed = std::move(m_response);
+      forceCloseImmediate();
       if (failed)
         failed(-1);
     }
+  }
+
+  void ModalDialogHost::setTitle(std::string title) {
+    if (title == m_title)
+      return;
+    m_title = std::move(title);
+    if (m_titleLabel)
+      m_titleLabel->setText(m_title);
+    if (m_surface)
+      m_surface->setTitle(m_title);
+    requestLayout();
   }
 
   void ModalDialogHost::closeDialog(int response) {
@@ -679,6 +816,7 @@ namespace filemanager {
           if (!locked || !*locked)
             return G_SOURCE_REMOVE;
           auto* self = request->self;
+          self->cancelInitialLayout();
           auto callback = std::move(self->m_response);
           self->m_alternativeName =
               self->m_alternativeNameInput == nullptr ? std::string{} : self->m_alternativeNameInput->value();
@@ -689,6 +827,7 @@ namespace filemanager {
                      ? 10
                      : 0);
           self->savePendingDialogSize();
+          self->m_dialogHeightAnimation.cancelAll();
           if (self->m_resizable
               && (!self->m_customContent || self->m_customContent->sizeStateKey.empty())
               && self->m_surface
@@ -716,6 +855,7 @@ namespace filemanager {
           self->m_conflict.reset();
           self->m_root.reset();
           self->m_surface.reset();
+          self->m_modalHint.reset();
           self->m_alternativeNameInput = nullptr;
           self->m_alternativeNameError = nullptr;
           self->m_symlinkDialogActive = false;
@@ -776,7 +916,17 @@ namespace filemanager {
   }
 
   void ModalDialogHost::handleKeyboard(const KeyboardEvent& event) {
-    if (!m_surface || m_closeQueued)
+    if (m_closeQueued)
+      return;
+    if (m_pendingPresentation) {
+      if (event.pressed
+          && !event.repeat
+          && event.modifiers == 0
+          && (event.sym == XKB_KEY_Escape || event.sym == XKB_KEY_space))
+        closeDialog(0);
+      return;
+    }
+    if (!m_surface)
       return;
     if (!event.pressed) {
       m_dispatcher.keyEvent(event.sym, event.utf32, event.modifiers, false, event.preedit, false);
@@ -825,8 +975,12 @@ namespace filemanager {
     m_root->setGap(10.0F);
     m_root->setPadding(16.0F);
     m_root->setFill(colorSpecFromRole(ColorRole::SurfaceContainerLow));
-    m_root->setBorder(colorSpecFromRole(ColorRole::Primary), Style::borderWidth);
+    const bool compositorBorder = m_customContent && m_customContent->compositorBorder;
+    if (!compositorBorder)
+      m_root->setBorder(colorSpecFromRole(ColorRole::Primary), Style::borderWidth);
     m_root->setRadius(Style::scaledRadiusMd(1.0F));
+    if (compositorBorder)
+      m_root->setClipChildren(true);
     if (m_warningStyle) {
       auto topAccent = std::make_unique<DialogBackgroundArtwork>("top-left-diagonals.svg", 126.0F, 78.27F);
       m_topAccent = topAccent.get();
@@ -886,27 +1040,44 @@ namespace filemanager {
       m_cornerAccent = cornerAccent.get();
       m_root->addChild(std::move(cornerAccent));
       auto heading = std::make_unique<Label>();
+      const bool headerClose = m_customContent && m_customContent->headerCloseButton;
+      m_titleLabel = heading.get();
       heading->setText(m_title);
-      heading->setMaxWidth(dialogWidth - 48.0F);
-      heading->setMaxLines(2);
+      heading->setUseMarkup(false);
+      heading->setMaxWidth(dialogWidth - (headerClose ? 80.0F : 48.0F));
+      heading->setMaxLines(headerClose ? 1 : 2);
+      if (headerClose)
+        heading->setEllipsize(TextEllipsize::End);
       heading->setFontWeight(FontWeight::SemiBold);
       heading->setColor(colorSpecFromRole(ColorRole::Primary));
-      if (m_resizable) {
+      if (m_resizable || headerClose) {
         auto titleRow = std::make_unique<Flex>();
         titleRow->setDirection(FlexDirection::Horizontal);
         titleRow->setAlign(FlexAlign::Center);
         heading->setFlexGrow(1.0F);
         titleRow->addChild(std::move(heading));
-        auto moveHandle = std::make_unique<InputArea>();
-        moveHandle->setParticipatesInLayout(false);
-        moveHandle->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
-        moveHandle->setCursorShape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE);
-        moveHandle->setOnPress([this](const InputArea::PointerData& data) {
-          if (data.pressed && m_surface)
-            xdg_toplevel_move(m_surface->xdgToplevel(), m_wayland.seat(), data.serial);
-        });
-        m_moveHandle = moveHandle.get();
-        titleRow->addChild(std::move(moveHandle));
+        if (m_resizable) {
+          auto moveHandle = std::make_unique<InputArea>();
+          moveHandle->setParticipatesInLayout(false);
+          moveHandle->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
+          moveHandle->setCursorShape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE);
+          moveHandle->setOnPress([this](const InputArea::PointerData& data) {
+            if (data.pressed && m_surface)
+              xdg_toplevel_move(m_surface->xdgToplevel(), m_wayland.seat(), data.serial);
+          });
+          m_moveHandle = moveHandle.get();
+          titleRow->addChild(std::move(moveHandle));
+        }
+        if (headerClose) {
+          titleRow->setGap(Style::spaceSm);
+          auto close = std::make_unique<Button>();
+          close->setGlyph("x");
+          close->setVariant(ButtonVariant::Ghost);
+          close->setControlHeight(Style::controlHeightSm);
+          close->setTooltip("Close Quick Look");
+          close->setOnClick([this] { closeDialog(0); });
+          titleRow->addChild(std::move(close));
+        }
         m_titleRow = titleRow.get();
         m_root->addChild(std::move(titleRow));
       } else
@@ -1212,7 +1383,7 @@ namespace filemanager {
         edge->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
         edge->setCursorShape(cursors[i]);
         edge->setOnPress([this, side = edges[i]](const InputArea::PointerData& data) {
-          if (data.pressed && m_surface)
+          if (data.pressed && m_surface && !m_compactDialogHeight && !m_dialogHeightAnimation.hasActive())
             xdg_toplevel_resize(m_surface->xdgToplevel(), m_wayland.seat(), data.serial, side);
         });
         m_resizeEdges[i] = edge.get();
@@ -1259,11 +1430,17 @@ namespace filemanager {
     auto& renderer = m_surface->renderTarget().renderer();
     if (needsLayout) {
       UiPhaseScope layoutPhase(UiPhase::Layout);
+      if (m_customContent && m_customContent->compositorBorder)
+        m_root->setRadius(Style::scaledRadiusMd(1.0F));
+      m_root->setPosition(0.0F, 0.0F);
       m_root->setSize(static_cast<float>(m_surface->width()), static_cast<float>(m_surface->height()));
       m_root->layout(renderer);
       if (m_moveHandle && m_titleRow) {
         m_moveHandle->setPosition(0.0F, 0.0F);
-        m_moveHandle->setSize(m_titleRow->width(), m_titleRow->height());
+        const bool headerClose = m_customContent && m_customContent->headerCloseButton;
+        m_moveHandle->setSize(
+            headerClose && m_titleLabel ? m_titleLabel->width() : m_titleRow->width(), m_titleRow->height()
+        );
         m_moveHandle->layout(renderer);
       }
       if (m_warningStyle)
@@ -1276,7 +1453,7 @@ namespace filemanager {
       float dividerX = 0.0F;
       float dividerY = 0.0F;
       Node::absolutePosition(m_divider, dividerX, dividerY);
-      const float cornerY = dividerY - m_cornerAccent->height() - 5.0F;
+      const float cornerY = dividerY - m_root->y() - m_cornerAccent->height() - 5.0F;
       m_cornerAccent->setVisible(cornerX >= 2.0F && cornerY >= 2.0F);
       m_cornerAccent->setPosition(cornerX, cornerY);
       m_cornerAccent->load(renderer);

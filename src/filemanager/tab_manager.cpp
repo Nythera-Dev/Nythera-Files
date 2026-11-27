@@ -429,6 +429,7 @@ namespace filemanager {
               if (tab == nullptr)
                 return;
               tab->operationResultAfterRefresh.reset();
+              tab->linkTargetToReveal.reset();
               tab->needsRefresh = false;
               tab->lastStatusMessage.clear();
               if (tabId == m_activeTabId && m_callbacks.onActiveBeforeNavigate)

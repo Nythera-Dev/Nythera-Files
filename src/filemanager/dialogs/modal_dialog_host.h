@@ -2,6 +2,7 @@
 
 #include "core/timer_manager.h"
 #include "filemanager/file_operation_manager.h"
+#include "render/animation/animation_manager.h"
 #include "render/scene/input_dispatcher.h"
 #include "wayland/toplevel_surface.h"
 #include "wayland/wayland_seat.h"
@@ -69,6 +70,8 @@ namespace filemanager {
       std::function<InputArea*()> initialFocus;
       std::function<void()> onThemeUpdated;
       std::function<void(Renderer&)> onPrepareLayout;
+      // Return false while the initial content is still loading.
+      std::function<bool(Renderer&, float normalHeight, std::optional<float>& compactHeight)> onInitialLayout;
       std::function<bool(const KeyboardEvent&)> onKeyEvent;
       std::function<bool(int response)> interceptResponse;
       std::function<void()> onBeforeClose;
@@ -77,6 +80,9 @@ namespace filemanager {
       bool fillContent = false;
       bool usePreferredInitialHeight = false;
       bool hoverTooltips = false;
+      bool headerCloseButton = false;
+      bool compositorBorder = false;
+      bool compactHeightMode = false;
       std::uint32_t preferredWidth = 0;
       std::uint32_t preferredHeight = 0;
       std::uint32_t minWidth = 0;
@@ -123,6 +129,9 @@ namespace filemanager {
     void handlePointer(const PointerEvent& event);
     void handleKeyboard(const KeyboardEvent& event);
     void requestLayout();
+    void setTitle(std::string title);
+    [[nodiscard]] std::uint32_t normalHeight() const noexcept;
+    void setCompactHeight(std::optional<float> height);
     void setFocus(InputArea* area);
     void registerCard(Flex* card);
 
@@ -130,7 +139,7 @@ namespace filemanager {
     makeConflictResolver(ConflictPathAccess pathAccess = ConflictPathAccess::Local);
     [[nodiscard]] static std::string sanitizeConflictDisplayText(std::string_view text);
 
-    [[nodiscard]] bool isOpen() const noexcept { return m_surface != nullptr; }
+    [[nodiscard]] bool isOpen() const noexcept { return m_surface != nullptr || m_pendingPresentation.has_value(); }
     [[nodiscard]] bool hoverTooltipsEnabled() const noexcept {
       return m_surface && !m_closeQueued && m_customContent && m_customContent->hoverTooltips;
     }
@@ -148,6 +157,10 @@ namespace filemanager {
 
     void recordConfiguredSize(std::uint32_t width, std::uint32_t height);
     void savePendingDialogSize();
+    [[nodiscard]] std::optional<std::uint32_t> compactExtent(std::optional<float> height) const;
+    void prepareInitialLayout();
+    void cancelInitialLayout();
+    void presentDialog(ToplevelSurface* parent, const ToplevelSurfaceConfig& config);
     using DialogSize = std::pair<std::uint32_t, std::uint32_t>;
     static std::uint32_t
     initialExtent(std::uint32_t saved, std::uint32_t fallback, std::uint32_t minimum, std::uint32_t available);
@@ -161,6 +174,14 @@ namespace filemanager {
     Callbacks m_callbacks;
 
     std::unique_ptr<ToplevelSurface> m_surface;
+    struct PendingPresentation {
+      ToplevelSurface* parent;
+      ToplevelSurfaceConfig config;
+    };
+    std::optional<PendingPresentation> m_pendingPresentation;
+    unsigned int m_initialLayoutSource = 0;
+    std::optional<ToplevelSurface::ModalManager> m_modalManager;
+    ToplevelSurface::ModalHint m_modalHint;
     InputDispatcher m_dispatcher;
     std::unique_ptr<Flex> m_root;
     std::vector<Flex*> m_cards;
@@ -174,10 +195,16 @@ namespace filemanager {
     std::uint32_t m_preferredHeight = 0;
     std::optional<DialogSize> m_configuredDialogSize;
     std::optional<DialogSize> m_pendingDialogSize;
+    std::optional<DialogSize> m_normalDialogSize;
+    std::optional<std::uint32_t> m_compactDialogHeight;
+    std::uint32_t m_dialogMinHeight = 0;
+    bool m_applyingDialogSize = false;
+    AnimationManager m_dialogHeightAnimation;
     Timer m_dialogSizeSave;
     std::array<InputArea*, 8> m_resizeEdges{};
     InputArea* m_moveHandle = nullptr;
     Flex* m_titleRow = nullptr;
+    Label* m_titleLabel = nullptr;
     Flex* m_spacer = nullptr;
     Flex* m_footer = nullptr;
     Node* m_divider = nullptr;
@@ -189,6 +216,7 @@ namespace filemanager {
     std::shared_ptr<std::timed_mutex> m_conflictMutex = std::make_shared<std::timed_mutex>();
     // Allows headless tests to exercise dialog contents, parenting and responses.
     std::function<void(ToplevelSurface&, ToplevelSurface*, DialogSize)> m_presentToplevelForTest;
+    Renderer* m_initialLayoutRendererForTest = nullptr;
     std::function<bool(const ConflictDialogData&, bool hasRemaining, std::function<void(int, std::string)>)>
         m_conflictDialogHook;
     std::vector<std::pair<std::string, int>> m_choices;

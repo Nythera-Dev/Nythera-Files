@@ -90,14 +90,14 @@ private:
   [[nodiscard]] const filemanager::BrowserTab& activeTab() const noexcept { return m_tabs.activeTab(); }
   [[nodiscard]] filemanager::DirectorySession& activeSession() noexcept { return activeTab().session; }
   [[nodiscard]] const filemanager::DirectorySession& activeSession() const noexcept { return activeTab().session; }
-  void navigate(const std::filesystem::path& path, bool recordHistory = true) {
+  void navigate(const std::filesystem::path& path, bool recordHistory = true, std::string_view revealName = {}) {
     auto& tab = activeTab();
     if (tab.hasActiveAdminSession() && filemanager::isTrashTabPath(path)) {
       setStatus("Wastebin is unavailable in Administrator Mode");
       return;
     }
     tab.session.setNextEnumerateUserInitiated(tab.hasActiveAdminSession());
-    tab.session.navigate(path, recordHistory);
+    tab.session.navigate(path, recordHistory, revealName);
   }
   void enumerate(const std::filesystem::path& path) {
     auto& tab = activeTab();
@@ -152,6 +152,7 @@ private:
   void changeSelection(SelectionChange change);
   void activateSelected();
   void openProperties(const std::filesystem::path& path);
+  void goToLinkTarget(const std::filesystem::path& link);
   void activatePath(const std::filesystem::path& path);
   void activatePointerItem(std::size_t index);
   void activatePointerMiddleItem(std::size_t index);
@@ -286,8 +287,10 @@ private:
   void inspectThumbnailCache(bool clear);
   void setThumbnailPolicy(filemanager::ThumbnailPolicy policy);
   [[nodiscard]] bool openQuickLook();
-  void attachPreviewPane(float dividerWidth, const ColorSpec& fill);
-  [[nodiscard]] float layoutPreviewPane(float available, float dividerSpace);
+  void attachPreviewPane(Flex& host, float dividerWidth, const ColorSpec& fill);
+  [[nodiscard]] bool canOpenPreviewed(const FileEntry* entry, bool with);
+  void openPreviewed(bool with);
+  void layoutPreviewPane(float available, float dividerSpace);
   void renderPreviewPane(Renderer& renderer);
   [[nodiscard]] bool handlePreviewDivider(const PointerEvent& event, float x, float y);
   [[nodiscard]] bool navigateFileViewByKeyboard(std::uint32_t sym, std::uint32_t mods);

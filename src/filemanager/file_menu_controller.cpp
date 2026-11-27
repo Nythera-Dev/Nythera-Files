@@ -1094,6 +1094,14 @@ namespace filemanager {
             ContextMenuControlEntry{.id = 80, .label = "Open With", .enabled = false, .hasSubmenu = true}
         );
       }
+      if (session.entries()[index].isSymlink) {
+        entries.push_back(
+            {.id = kGoToLinkTargetMenuId,
+             .label = "Go to Link Target",
+             .enabled = resolveLinkTarget(*m_contextMenuTarget).has_value(),
+             .actionGlyph = "link"}
+        );
+      }
       if (targetIsDir)
         entries.push_back(
             {.id = menu_id::kOpenFolderInNewTab,
@@ -1134,9 +1142,7 @@ namespace filemanager {
       if (m_callbacks.selectedPaths().size() == 1
           && caps.canGenerateThumbnails
           && std::filesystem::path(path).is_absolute())
-        entries.push_back(
-            {.id = menu_id::kQuickLook, .label = "Quick Look", .shortcut = "Space", .actionGlyph = "eye"}
-        );
+        entries.push_back({.id = kQuickLookMenuId, .label = "Quick Look", .shortcut = "Space", .actionGlyph = "eye"});
       if (!m_callbacks.selectedPaths().empty())
         entries.push_back(
             {.id = 22,
@@ -1170,15 +1176,8 @@ namespace filemanager {
                                                              : ChecksumDialogController::menuEntries(false);
       entries.insert(entries.end(), checksums.begin(), checksums.end());
     }
-    filemanager::groupFileMenuEntries(
-        entries,
-        session.browsingTrash()              ? filemanager::FileMenuContext::Trash
-            : session.entries()[index].isDir ? filemanager::FileMenuContext::Folder
-                                             : filemanager::FileMenuContext::File
-    );
     if (!session.browsingTrash()) {
-      entries.insert(
-          std::ranges::find(entries, 4, &ContextMenuControlEntry::id),
+      entries.push_back(
           {.id = menu_id::kDuplicate,
            .label = "Duplicate",
            .enabled =
@@ -1186,6 +1185,12 @@ namespace filemanager {
            .actionGlyph = "copy"}
       );
     }
+    filemanager::groupFileMenuEntries(
+        entries,
+        session.browsingTrash()              ? filemanager::FileMenuContext::Trash
+            : session.entries()[index].isDir ? filemanager::FileMenuContext::Folder
+                                             : filemanager::FileMenuContext::File
+    );
     if (session.search().active())
       entries.insert(
           std::next(entries.begin()),

@@ -1,3 +1,4 @@
+#include "core/files/display_text.h"
 #include "core/input/key_symbols.h"
 #include "filemanager/file_manager.h"
 #include "render/core/renderer.h"
@@ -9,12 +10,33 @@
 #include <cmath>
 
 bool FileManager::openQuickLook() {
-  if (!m_surface || !m_grid || m_modalDialog.isOpen() || !selectedPreviewEntry())
+  const auto* entry = selectedPreviewEntry();
+  if (!m_surface || !m_grid || m_modalDialog.isOpen() || !entry)
     return false;
   using filemanager::ModalDialogHost;
+  const auto layoutPreview = [this](Renderer& renderer, float dialogHeight, bool initialLayout) {
+    const float width = m_quickLookContent->width();
+    const float height = static_cast<float>(m_modalDialog.normalHeight());
+    const int pixels = std::clamp(
+        static_cast<int>(std::ceil(std::max(width, height) * renderer.renderScale() / 128.0F)) * 128, 256, 2048
+    );
+    syncFilePreview(m_quickLook, filemanager::PreviewMode::Full, pixels);
+    (void)m_pickerThumbnails.uploadPending(renderer.textureManager());
+    const auto* selected = selectedPreviewEntry();
+    m_modalDialog.setTitle(selected ? filemanager::sanitizeFilenameForDisplay(selected->name) : "Quick Look");
+    auto layout = m_quickLook.render(renderer, *m_quickLookContent, initialLayout);
+    if (layout.compactHeight)
+      *layout.compactHeight += dialogHeight - m_quickLookContent->height();
+    return layout;
+  };
   m_quickLookOpen = true;
   m_modalDialog.showDialog(
-      "Quick Look", "", {{"Close", 0}}, [](int) {}, m_surface.get(), false, false,
+      filemanager::sanitizeFilenameForDisplay(entry->name), "", {{"Open With…", 2}, {"Open", 1}},
+      [this](int result) {
+        if (result == 1 || result == 2)
+          openPreviewed(result == 2);
+      },
+      m_surface.get(), false, false,
       ModalDialogHost::CustomContent{
           .buildFields =
               [this](Flex& root, float) {
@@ -22,18 +44,19 @@ bool FileManager::openQuickLook() {
                 content->setFlexGrow(1.0F);
                 m_quickLookContent = static_cast<Flex*>(root.addChild(std::move(content)));
               },
+          .bindChoiceButton = [this](int result, Button* button) { m_quickLook.bindOpenAction(result == 2, button); },
           .onPrepareLayout =
-              [this](Renderer& renderer) {
-                const float width = m_quickLookContent->width();
-                const float height = std::max(96.0F, m_quickLookContent->height() - 95.0F);
-                const int pixels = std::clamp(
-                    static_cast<int>(std::ceil(std::max(width, height) * renderer.renderScale() / 128.0F)) * 128, 256,
-                    2048
-                );
-                syncFilePreview(m_quickLook, filemanager::PreviewMode::Full, pixels);
-                (void)m_pickerThumbnails.uploadPending(renderer.textureManager());
-                m_quickLook.render(renderer, width, height);
-                m_quickLookContent->layout(renderer);
+              [this, layoutPreview](Renderer& renderer) {
+                const auto layout =
+                    layoutPreview(renderer, static_cast<float>(m_modalDialog.surface()->height()), false);
+                if (!layout.pending)
+                  m_modalDialog.setCompactHeight(layout.compactHeight);
+              },
+          .onInitialLayout =
+              [layoutPreview](Renderer& renderer, float height, std::optional<float>& compactHeight) {
+                const auto layout = layoutPreview(renderer, height, true);
+                compactHeight = layout.compactHeight;
+                return !layout.pending;
               },
           .onKeyEvent =
               [this](const KeyboardEvent& event) {
@@ -72,10 +95,15 @@ bool FileManager::openQuickLook() {
               },
           .fillContent = true,
           .usePreferredInitialHeight = true,
+          .hoverTooltips = true,
+          .headerCloseButton = true,
+          .compositorBorder = true,
+          .compactHeightMode = true,
           .preferredWidth = 780,
           .preferredHeight = 620,
           .minWidth = 360,
           .minHeight = 300,
+          .sizeStateKey = "quick_look",
       }
   );
   if (!m_modalDialog.isOpen())

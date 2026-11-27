@@ -90,7 +90,9 @@ namespace filemanager {
     closeMonitor();
   }
 
-  void DirectorySession::navigate(const std::filesystem::path& requestedPath, bool recordHistory) {
+  void DirectorySession::navigate(
+      const std::filesystem::path& requestedPath, bool recordHistory, std::string_view revealName
+  ) {
     if (m_active && m_callbacks.onCancelFileGesture)
       m_callbacks.onCancelFileGesture();
     std::error_code ec;
@@ -119,6 +121,7 @@ namespace filemanager {
         m_callbacks.onBeforePathChange(path);
     }
     m_path = std::move(path);
+    m_revealedHiddenName = revealName.starts_with('.') ? std::string(revealName) : std::string{};
     m_browsingTrash = trash;
     m_trashUris.clear();
     m_trashOriginalPaths.clear();
@@ -506,7 +509,7 @@ namespace filemanager {
             if (!locked || !*locked || generation != m_enumerationGeneration || m_path != enumPath)
               return;
             for (const auto& rec : batch) {
-              if (rec.name.empty() || (!m_showHidden && rec.name[0] == '.'))
+              if (rec.name.empty() || hideEntry(rec.name))
                 continue;
               m_loadingEntries.push_back(makeFileEntryFromAdminRecord(rec, enumPath));
             }
@@ -644,7 +647,7 @@ namespace filemanager {
           for (GList* node = infos; node != nullptr; node = node->next) {
             auto* info = G_FILE_INFO(node->data);
             const char* name = g_file_info_get_name(info);
-            if (name == nullptr || (!self->m_showHidden && name[0] == '.'))
+            if (name == nullptr || self->hideEntry(name))
               continue;
             auto entry = makeFileEntry(info, self->m_path / name);
             if (self->m_browsingTrash) {
@@ -961,7 +964,7 @@ namespace filemanager {
           }
           g_clear_error(&error);
           const char* name = g_file_info_get_name(info);
-          if (name == nullptr || (!self->m_showHidden && name[0] == '.')) {
+          if (name == nullptr || self->hideEntry(name)) {
             g_object_unref(info);
             self->removeMonitoredFile(query->replacedPath.empty() ? query->path : query->replacedPath);
             return;

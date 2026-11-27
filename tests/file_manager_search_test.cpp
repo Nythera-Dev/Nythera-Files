@@ -5,6 +5,7 @@
 #include "filemanager/file_list_columns.h"
 #include "filemanager/file_manager.h"
 #include "filemanager/file_sort.h"
+#include "filemanager/file_view_menu.h"
 #include "filemanager/search_dropdown.h"
 #include "render/core/renderer.h"
 #include "render/core/texture_manager.h"
@@ -16,6 +17,7 @@
 #include "ui/controls/scroll_view.h"
 #include "ui/controls/separator.h"
 #include "ui/controls/spinner.h"
+#include "ui/controls/virtual_grid_view.h"
 #include "ui/dialogs/file_entry_row.h"
 
 #include <algorithm>
@@ -657,6 +659,73 @@ class FileManagerTestAccess {
     state.load("\n/var");
     state.edit("/\n/var", 1);
     TEST_CHECK(!state.hasCompletedRoot());
+  }
+
+  static void testQuickLook(FileManager& manager, const fs::path& selected) {
+    using namespace filemanager;
+    VirtualGridView grid;
+    manager.m_grid = &grid;
+    manager.m_surface = std::make_unique<ToplevelSurface>(manager.m_wayland);
+    auto& tab = manager.activeTab();
+    // Ctrl+Space can leave the keyboard cursor on an unselected item.
+    tab.selectedPath = selected.parent_path() / "Needle Folder";
+    tab.selectedPaths = {selected.string()};
+    auto& dialog = manager.m_modalDialog;
+    TestRenderer renderer;
+    dialog.m_initialLayoutRendererForTest = &renderer;
+    ModalDialogHost::DialogSize presented;
+    dialog.m_presentToplevelForTest = [&](auto&, auto*, auto size) { presented = size; };
+    auto cleanup = nythera::test::makeScopeExit([&] {
+      dialog.forceCloseImmediate();
+      dialog.m_presentToplevelForTest = {};
+      dialog.m_initialLayoutRendererForTest = nullptr;
+      manager.m_surface.reset();
+      manager.m_grid = nullptr;
+      tab.selectedPath.reset();
+      tab.selectedPaths.clear();
+    });
+
+    manager.activateContextMenuEntry({.id = kQuickLookMenuId});
+    TEST_CHECK(dialog.isOpen() && dialog.m_title == selected.filename().string());
+    TEST_CHECK(!dialog.surface());
+    waitFor([&] { return dialog.surface() != nullptr; });
+    TEST_CHECK(presented == ModalDialogHost::DialogSize{780, 620});
+    TEST_CHECK(!dialog.m_dialogHeightAnimation.hasActive());
+    dialog.recordConfiguredSize(780, 620);
+    dialog.recordConfiguredSize(810, 660);
+    dialog.setCompactHeight(325.0F);
+    TEST_CHECK(dialog.m_dialogHeightAnimation.hasActive());
+    dialog.recordConfiguredSize(810, 325);
+    TEST_CHECK(dialog.normalHeight() == 660);
+    TEST_CHECK(dialog.m_compactDialogHeight == 325);
+    dialog.setCompactHeight(std::nullopt);
+    TEST_CHECK(dialog.m_normalDialogSize == ModalDialogHost::DialogSize{810, 660});
+    dialog.forceCloseImmediate();
+    TEST_CHECK(manager.m_settings.loadDialogSize("quick_look") == ModalDialogHost::DialogSize{810, 660});
+
+    key(manager, XKB_KEY_space);
+    TEST_CHECK(dialog.isOpen() && !dialog.surface());
+    dialog.handleKeyboard({.sym = XKB_KEY_Escape, .pressed = true});
+    waitFor([&] { return !dialog.isOpen(); });
+
+    key(manager, XKB_KEY_space);
+    TEST_CHECK(dialog.isOpen() && dialog.m_title == selected.filename().string());
+    waitFor([&] { return dialog.surface() != nullptr; });
+    TEST_CHECK(presented == ModalDialogHost::DialogSize{810, 660});
+
+    dialog.forceCloseImmediate();
+    const auto folder = selected.parent_path() / "Needle Folder";
+    tab.selectedPaths = {folder.string()};
+    key(manager, XKB_KEY_space);
+    TEST_CHECK(dialog.isOpen() && !dialog.surface());
+    waitFor([&] { return dialog.surface() != nullptr; });
+    TEST_CHECK(presented.first == 810 && presented.second < 660);
+    TEST_CHECK(dialog.m_compactDialogHeight == presented.second);
+    TEST_CHECK(!dialog.m_dialogHeightAnimation.hasActive());
+    dialog.recordConfiguredSize(presented.first, presented.second);
+    TEST_CHECK(dialog.normalHeight() == 660);
+    dialog.forceCloseImmediate();
+    TEST_CHECK(manager.m_settings.loadDialogSize("quick_look") == ModalDialogHost::DialogSize{810, 660});
   }
 
   static void testProfileDialogs(FileManager& manager, const fs::path& folder) {
@@ -1495,7 +1564,7 @@ public:
     fs::create_directory(root / "locked");
     fs::create_directory(outside);
     fs::create_directory(bulk);
-    writeFile(root / "needle.txt");
+    writeFile(root / "needle.txt", "Quick Look fixture\n");
     writeFile(root / "CAFÉ.txt");
     writeFile(root / ".needle-hidden");
     writeFile(root / "Needle Folder" / "needle.txt");
@@ -1541,6 +1610,7 @@ public:
     });
     manager.enumerate(root);
     waitFor([&] { return !manager.activeSession().loading(); });
+    testQuickLook(manager, root / "needle.txt");
     testMatchesAndActions(manager, root, outside);
     testProgressAndCancellation(manager, bulk);
     testMetadataAndHiddenEntries(manager, root);

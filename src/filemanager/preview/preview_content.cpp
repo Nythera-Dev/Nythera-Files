@@ -40,16 +40,16 @@ namespace filemanager::preview {
                 || mime == "application/x-shellscript"));
   }
 
-  std::string previewText(std::string_view bytes, bool truncated) {
+  TextPreview previewText(std::string_view bytes, bool truncated) {
     if (bytes.starts_with("\xEF\xBB\xBF"))
       bytes.remove_prefix(3);
     if (bytes.empty())
-      return {};
+      return {{}, "Empty file"};
     const char* end = nullptr;
     if (!g_utf8_validate(bytes.data(), static_cast<gssize>(bytes.size()), &end)) {
       const auto remainder = bytes.data() + bytes.size() - end;
       if (!truncated || remainder > 3 || g_utf8_get_char_validated(end, remainder) != static_cast<gunichar>(-2))
-        return {};
+        return {{}, "This file is not UTF-8 text."};
       bytes = bytes.substr(0, static_cast<std::size_t>(end - bytes.data()));
     }
 
@@ -76,9 +76,7 @@ namespace filemanager::preview {
         truncated = true;
       }
     }
-    if (truncated)
-      text += "\n…";
-    return text;
+    return {std::move(text), truncated ? "Preview truncated. Open the file to see the rest." : ""};
   }
 
   Content collect(const Request& request, GCancellable* cancel) {
@@ -106,8 +104,15 @@ namespace filemanager::preview {
           file, G_FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancel, nullptr
       );
       if (info) {
-        if (const char* target = g_file_info_get_symlink_target(info))
-          content.details = "Link target  " + sanitizeFilenameForDisplay(target);
+        if (const char* target = g_file_info_get_symlink_target(info)) {
+          content.details.push_back({"Link Target", sanitizeFilenameForDisplay(target)});
+          std::error_code error;
+          const auto resolved = std::filesystem::canonical(entry.absPath, error);
+          if (error)
+            content.details.push_back({"Target Status", sanitizeFilenameForDisplay(error.message())});
+          else
+            content.details.push_back({"Resolved Target", sanitizeFilenameForDisplay(resolved.string())});
+        }
       }
       return content;
     }
@@ -119,9 +124,8 @@ namespace filemanager::preview {
         });
         if (!result.failed && !result.cancelled) {
           g_autofree char* size = g_format_size(result.bytes);
-          content.details = std::format(
-              "{}{}\n{} files · {} folders", result.partial() ? "≥ " : "", size, result.files, result.folders
-          );
+          content.details.push_back({"Contents", std::format("{} files · {} folders", result.files, result.folders)});
+          content.details.push_back({"Total Size", std::format("{}{}", result.partial() ? "≥ " : "", size)});
         }
       }
       return content;
@@ -145,6 +149,8 @@ namespace filemanager::preview {
         || !S_ISREG(before.st_mode)
         || (entry.hasIdentity && (entry.device != before.st_dev || entry.inode != before.st_ino))) {
       content.imageAllowed = false;
+      if (knownText)
+        content.notice = "Could not read this file.";
       return content;
     }
 
@@ -164,8 +170,11 @@ namespace filemanager::preview {
       const auto count = ::read(source.fd, buffer.data(), std::min(buffer.size(), limit - bytes.size()));
       if (count < 0 && errno == EINTR)
         continue;
-      if (count < 0)
+      if (count < 0) {
+        if (knownText)
+          content.notice = "Could not read this file.";
         return content;
+      }
       if (count == 0)
         break;
       bytes.append(buffer.data(), static_cast<std::size_t>(count));
@@ -181,7 +190,7 @@ namespace filemanager::preview {
     if (content.imageAllowed && !bytes.empty()) {
       const auto dimensions = probeRasterImageExtent(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size());
       if (dimensions)
-        content.details = std::format("{} × {} px", dimensions->width, dimensions->height);
+        content.details.push_back({"Dimensions", std::format("{} × {} px", dimensions->width, dimensions->height)});
     }
     if (!knownText && sniff && !bytes.empty()) {
       g_autofree char* mime =
@@ -190,7 +199,9 @@ namespace filemanager::preview {
         return content;
     }
     if (knownText || sniff) {
-      content.text = previewText(bytes, static_cast<std::uintmax_t>(before.st_size) > bytes.size());
+      auto text = previewText(bytes, static_cast<std::uintmax_t>(before.st_size) > bytes.size());
+      content.text = std::move(text.text);
+      content.notice = std::move(text.notice);
       if (entry.type == "application/x-desktop") {
         g_autoptr(GKeyFile) desktop = g_key_file_new();
         if (g_key_file_load_from_data(desktop, bytes.data(), bytes.size(), G_KEY_FILE_NONE, nullptr)) {
@@ -198,9 +209,9 @@ namespace filemanager::preview {
           g_autofree char* comment =
               g_key_file_get_locale_string(desktop, "Desktop Entry", "Comment", nullptr, nullptr);
           if (name)
-            content.details = sanitizeFilenameForDisplay(name);
+            content.details.push_back({"Name", sanitizeFilenameForDisplay(name)});
           if (comment)
-            content.details += (content.details.empty() ? "" : "\n") + sanitizeFilenameForDisplay(comment);
+            content.details.push_back({"Description", sanitizeFilenameForDisplay(comment)});
         }
       }
     }

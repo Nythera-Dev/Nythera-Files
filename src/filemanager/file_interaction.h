@@ -7,11 +7,31 @@
 #include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace filemanager {
   inline bool userCanReadPath(const std::filesystem::path& path, bool directory = false) {
     return ::access(path.c_str(), directory ? R_OK | X_OK : R_OK) == 0;
+  }
+
+  struct LinkTarget {
+    std::filesystem::path path;
+    bool directory = false;
+  };
+
+  // Follow only the explicitly requested link, as the current user.
+  inline std::optional<LinkTarget> resolveLinkTarget(const std::filesystem::path& link) {
+    std::error_code error;
+    if (!link.is_absolute() || !std::filesystem::is_symlink(link, error) || error)
+      return std::nullopt;
+    auto target = std::filesystem::canonical(link, error);
+    if (error)
+      return std::nullopt;
+    const auto status = std::filesystem::status(target, error);
+    if (error || !std::filesystem::exists(status))
+      return std::nullopt;
+    return LinkTarget{std::move(target), std::filesystem::is_directory(status)};
   }
 
   inline std::string expandHomePath(std::string_view path, std::string_view home) {

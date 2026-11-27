@@ -1893,7 +1893,7 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
   case kCloseTab:
     (void)closeTab(tab.id);
     return;
-  case kQuickLook:
+  case filemanager::kQuickLookMenuId:
     (void)openQuickLook();
     return;
   case kPreviewHidden:
@@ -1919,6 +1919,10 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     return;
   case kClearThumbnailCache:
     inspectThumbnailCache(true);
+    return;
+  case filemanager::kGoToLinkTargetMenuId:
+    if (m_menus.contextMenuTarget())
+      goToLinkTarget(*m_menus.contextMenuTarget());
     return;
   case kOpenContainingFolder:
     if (const auto& target = m_menus.contextMenuTarget(); session.search().active()
@@ -2564,10 +2568,14 @@ void FileManager::restoreSelection(bool chooseFirst) {
     m_restoringSelection = true;
     // Metadata/monitor refreshes before the next layout must not cancel the
     // paste's pending reveal in VirtualGridView.
-    const bool reveal = index
-        && tab.pendingPasteRevealPath
-        && tab.selectedPath == tab.pendingPasteRevealPath
-        && !tab.pendingDropScrollGeneration;
+    const bool revealLink = index && tab.linkTargetToReveal && tab.selectedPath == tab.linkTargetToReveal;
+    if (revealLink || !tab.session.loading())
+      tab.linkTargetToReveal.reset();
+    const bool reveal = revealLink
+        || (index
+            && tab.pendingPasteRevealPath
+            && tab.selectedPath == tab.pendingPasteRevealPath
+            && !tab.pendingDropScrollGeneration);
     m_grid->setSelectedIndex(index, reveal);
     m_restoringSelection = false;
   };
@@ -2779,6 +2787,32 @@ void FileManager::saveProtectedChanges(const std::filesystem::path& path) {
           origin->lastStatusMessage = result.detail;
       }
   );
+}
+
+void FileManager::goToLinkTarget(const std::filesystem::path& link) {
+  auto& tab = activeTab();
+  if (tab.session.browsingTrash())
+    return;
+  const auto& entries = tab.session.entries();
+  const auto entry = std::ranges::find(entries, link, &FileEntry::absPath);
+  if (entry == entries.end() || !entry->isSymlink)
+    return;
+  const auto target = filemanager::resolveLinkTarget(link);
+  if (!target) {
+    setStatus("The link target is unavailable");
+    return;
+  }
+  if (target->directory) {
+    navigate(target->path);
+    return;
+  }
+
+  // Navigation clears the prior selection before its asynchronous listing.
+  navigate(target->path.parent_path(), true, target->path.filename().native());
+  tab.selectedPath = target->path;
+  tab.selectedPaths = {target->path.string()};
+  tab.selectionAnchor = target->path;
+  tab.linkTargetToReveal = target->path;
 }
 
 void FileManager::activatePath(const std::filesystem::path& path) {
@@ -3776,8 +3810,17 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     mainPane->addChild(m_tabBar.buildUi());
     buildSearchBar(*mainPane, toolbarGap - paneGap);
 
-    mainPane->addChild(m_listHeader.buildHeader());
-    mainPane->addChild(
+    auto fileViewRow = std::make_unique<Flex>();
+    fileViewRow->setAlign(FlexAlign::Stretch);
+    fileViewRow->setGap(kPaneGap);
+    fileViewRow->setFlexGrow(1.0F);
+    auto fileView = std::make_unique<Flex>();
+    fileView->setDirection(FlexDirection::Vertical);
+    fileView->setAlign(FlexAlign::Stretch);
+    fileView->setGap(paneGap);
+    fileView->setFlexGrow(1.0F);
+    fileView->addChild(m_listHeader.buildHeader());
+    fileView->addChild(
         ui::separator({
             .color = colorSpecFromRole(
                 ColorRole::OutlineVariant, 0.45F /* palette-alpha-exception: The list divider is deliberately softer
@@ -3922,8 +3965,11 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
       }
       updateSelectionSummary();
     });
-    mainPane->addChild(std::move(grid));
-    mainPane->addChild(m_listHeader.buildHorizontalScrollbar());
+    fileView->addChild(std::move(grid));
+    fileView->addChild(m_listHeader.buildHorizontalScrollbar());
+    fileViewRow->addChild(std::move(fileView));
+    attachPreviewPane(*fileViewRow, kSidebarDividerWidth, colorSpecFromRole(ColorRole::Surface, kFilesGridOpacity));
+    mainPane->addChild(std::move(fileViewRow));
 
     const float statusFontSize =
         12.0F + (m_statusHeight - kStatusMinHeight) * (10.0F / (kStatusMaxHeight - kStatusMinHeight));
@@ -3954,7 +4000,6 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_statusStrip->setPadding(std::clamp((m_statusHeight - statusFontSize) * 0.5F, 2.0F, 7.0F), 10.0F);
     mainColumn->addChild(std::move(mainPane));
     m_root->addChild(std::move(mainColumn));
-    attachPreviewPane(kSidebarDividerWidth, colorSpecFromRole(ColorRole::Surface, kFilesGridOpacity));
     m_dispatcher.setSceneRoot(m_root.get());
     m_dispatcher.setFocus(m_grid->focusArea());
     m_surface->setSceneRoot(m_root.get());
@@ -3988,8 +4033,8 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_sidebarDivider->setParticipatesInLayout(showSidebar);
     const float sidebarSpace = showSidebar ? effectiveSidebar + kSidebarDividerWidth + 2.0F * kPaneGap : 0.0F;
     const float available = static_cast<float>(m_surface->width()) - 2.0F * kWindowPadding - sidebarSpace;
-    const int headerWidth =
-        static_cast<int>(available - layoutPreviewPane(available, kSidebarDividerWidth + 2.0F * kPaneGap));
+    layoutPreviewPane(available, kSidebarDividerWidth + 2.0F * kPaneGap);
+    const int headerWidth = static_cast<int>(available);
     m_menus.syncResponsiveMenuBar(headerWidth);
     updateSearchFilterWidth(static_cast<float>(headerWidth), renderer);
     updateAdminHeaderUi(headerWidth);
