@@ -41,6 +41,26 @@ int main() {
     TEST_CHECK(textFileWithExtension && *textFileWithExtension == creationRoot / "readme.txt" && !creationError);
     TEST_CHECK(!filemanager::creationDestination(creationRoot, "../escape", false, creationError) && creationError);
 
+    const auto targetDirectory = creationRoot / "folder";
+    const auto directoryLink = creationRoot / "folder-link";
+    const auto fileLink = creationRoot / "notes-link";
+    const auto chainedLink = creationRoot / "chained";
+    const auto brokenLink = creationRoot / "missing-link";
+    const auto loopingLink = creationRoot / "loop";
+    std::filesystem::create_directory(targetDirectory);
+    std::filesystem::create_directory_symlink("folder", directoryLink);
+    std::filesystem::create_symlink("notes", fileLink);
+    std::filesystem::create_symlink("notes-link", chainedLink);
+    std::filesystem::create_symlink("missing", brokenLink);
+    std::filesystem::create_symlink("loop", loopingLink);
+    const auto resolvedFile = filemanager::resolveLinkTarget(chainedLink);
+    TEST_CHECK(resolvedFile && resolvedFile->path == *emptyFile && !resolvedFile->directory);
+    const auto resolvedDirectory = filemanager::resolveLinkTarget(directoryLink);
+    TEST_CHECK(resolvedDirectory && resolvedDirectory->path == targetDirectory && resolvedDirectory->directory);
+    TEST_CHECK(!filemanager::resolveLinkTarget(brokenLink));
+    TEST_CHECK(!filemanager::resolveLinkTarget(loopingLink));
+    TEST_CHECK(!filemanager::resolveLinkTarget(*emptyFile));
+
     const auto verifyMenuGroups = [](std::vector<ContextMenuControlEntry> entries, filemanager::FileMenuContext context,
                                      const std::vector<int>& expectedIds) {
       filemanager::groupFileMenuEntries(entries, context);
@@ -69,14 +89,24 @@ int main() {
          {.id = 3},
          {.id = 110},
          {.id = 10},
+         {.id = 80},
+         {.id = filemanager::kQuickLookMenuId},
+         {.id = filemanager::kGoToLinkTargetMenuId},
          {.id = 4},
          {.id = 1},
          {.id = 5},
          {.id = 2},
          {.id = 59},
          {.id = 60},
-         {.id = 31}},
-        filemanager::FileMenuContext::File, {10, 60, 2, 1, 3, 59, 110, 4, 5, 6, 20, 31, 100, 22}
+         {.id = 31},
+         {.id = 39000}},
+        filemanager::FileMenuContext::File,
+        {10, 80, filemanager::kQuickLookMenuId, filemanager::kGoToLinkTargetMenuId, 60, 2, 1, 3, 59, 110, 4, 5, 6, 20,
+         31, 100, 39000, 22}
+    );
+    verifyMenuGroups(
+        {{.id = 22}, {.id = 39000}, {.id = filemanager::kQuickLookMenuId}, {.id = 119}, {.id = 10}},
+        filemanager::FileMenuContext::Folder, {10, filemanager::kQuickLookMenuId, 119, 39000, 22}
     );
     verifyMenuGroups(
         {{.id = 22}, {.id = 30152}, {.id = 100}, {.id = 30104}, {.id = 30105}}, filemanager::FileMenuContext::File,

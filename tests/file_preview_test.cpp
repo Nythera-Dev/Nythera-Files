@@ -3,6 +3,7 @@
 #include "render/core/image_encoder.h"
 #include "test_isolation.h"
 
+#include <algorithm>
 #include <array>
 #include <fcntl.h>
 #include <filesystem>
@@ -61,10 +62,15 @@ int main() {
     const nythera::test::ScopedTestEnv env({.prefix = "nythera-files-preview"});
     using namespace filemanager;
     using namespace filemanager::preview;
-    TEST_CHECK(previewText("\xEF\xBB\xBFline\tfirst\r\nline two", false) == "line    first\nline two");
-    TEST_CHECK(previewText("hi\xE2\x80", true) == "hi\n…");
-    TEST_CHECK(previewText("hi\xE2\x80", false).empty());
-    TEST_CHECK(previewText(std::string(400, 'a'), false).ends_with("…\n…"));
+    const auto complete = previewText("\xEF\xBB\xBFline\tfirst\r\nline two", false);
+    TEST_CHECK(complete.text == "line    first\nline two" && complete.notice.empty());
+    const auto splitUtf8 = previewText("hi\xE2\x80", true);
+    TEST_CHECK(splitUtf8.text == "hi" && splitUtf8.notice.starts_with("Preview truncated."));
+    const auto invalidUtf8 = previewText("hi\xE2\x80", false);
+    TEST_CHECK(invalidUtf8.text.empty() && invalidUtf8.notice.find("UTF-8") != std::string::npos);
+    const auto longLine = previewText(std::string(400, 'a'), false);
+    TEST_CHECK(longLine.text.ends_with("…") && longLine.notice.starts_with("Preview truncated."));
+    TEST_CHECK(!previewText({}, false).notice.empty());
     TEST_CHECK(textMime("application/yaml") && textMime("application/x-desktop"));
     TEST_CHECK(!textMime("image/svg+xml") && !textMime("application/zip"));
 
@@ -78,6 +84,10 @@ int main() {
     };
     g_autoptr(GCancellable) cancel = g_cancellable_new();
     TEST_CHECK(collect(request, cancel).text == yaml);
+    const std::string longText(65 * 1024, 'a');
+    write(document, longText);
+    const auto truncated = collect(request, cancel);
+    TEST_CHECK(!truncated.text.empty() && truncated.notice.starts_with("Preview truncated."));
     request.mode = PreviewMode::Information;
     TEST_CHECK(collect(request, cancel).text.empty());
     request.mode = PreviewMode::Full;
@@ -103,7 +113,7 @@ int main() {
     }
     g_autofree char* pdfinfo = g_find_program_in_path("pdfinfo");
     if (pdfinfo)
-      TEST_CHECK(mediaDetails(fd, "application/pdf", neverCanceled) == "1 page");
+      TEST_CHECK(std::ranges::contains(mediaDetails(fd, "application/pdf", neverCanceled), Detail{"Pages", "1"}));
 
     g_autofree char* ffmpeg = g_find_program_in_path("ffmpeg");
     if (ffmpeg) {
@@ -123,7 +133,11 @@ int main() {
       TEST_CHECK(frame->pixels[0] > frame->pixels[1] + 100);
       g_autofree char* ffprobe = g_find_program_in_path("ffprobe");
       if (ffprobe)
-        TEST_CHECK(mediaDetails(videoFd, "video/x-msvideo", neverCanceled).starts_with("48 × 32 px"));
+        TEST_CHECK(
+            std::ranges::contains(
+                mediaDetails(videoFd, "video/x-msvideo", neverCanceled), Detail{"Frame Size", "48 × 32 px"}
+            )
+        );
 
       const auto cover = env.work() / "cover.png";
       const std::vector<std::uint8_t> rgba(24 * 24 * 4, 255);

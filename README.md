@@ -116,9 +116,11 @@ Plain-text search runs with time and memory limits. Files larger than 128 MiB us
 
 ## File previews
 
-Select one item and press **Space** or choose **Quick Look** from its context menu. Use **Left** or **Right** to step one item. **Up** and **Down** step one list item or one grid row. Press **Space** or **Escape** to close Quick Look.
+Select one item and press **Space** or choose **Quick Look** from its context menu. Use **Left** or **Right** to step one item. **Up** and **Down** step one list item or one grid row. Press **Space** or **Escape** to close Quick Look. The title follows the selected filename. Quick Look and the preview pane keep **Open** and **Open With…** available while the content scrolls.
 
-Under **View → Preview Pane**, choose **Full Preview**, **Information Only**, or **Hidden**. **F8** toggles the pane. Drag the divider to resize it. Full Preview can show scrollable UTF-8 text, images, video stills, embedded audio artwork, and the first page of a PDF. Information Only shows a static thumbnail and file details. The pane collapses when the window is too narrow.
+Under **View → Preview Pane**, choose **Full Preview**, **Information Only**, or **Hidden**. **F8** toggles the pane. Drag the divider to resize it. Full Preview can show scrollable UTF-8 text, images, video stills, embedded audio artwork, and the first page of a PDF. Text previews show details first and indicate when the preview is truncated. Information Only shows a static thumbnail and file details. The pane collapses when the window is too narrow.
+
+Use **Go to Link Target** in a symbolic link’s context menu to go to its target folder or reveal its target file.
 
 List, grid, and search results generate thumbnails for visible items according to **View → Thumbnails**. The default is **Local Locations**. Video stills and audio artwork use FFmpeg. PDF previews use Poppler utilities. Optional GdkPixbuf loaders extend the image formats supported by NytheraLib, and `ffmpegthumbnailer` can add filmstrip borders to browsing thumbnails.
 

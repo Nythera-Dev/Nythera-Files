@@ -8,11 +8,14 @@
 #include <gio/gio.h>
 #include <memory>
 #include <optional>
+#include <vector>
 
+class Button;
 class FileIcon;
 class Flex;
 class Image;
 class Label;
+class Node;
 class Renderer;
 class ScrollView;
 
@@ -20,6 +23,7 @@ namespace filemanager {
   namespace preview {
     struct Request;
     struct Content;
+    struct Detail;
   } // namespace preview
 
   class FilePreview {
@@ -29,18 +33,28 @@ namespace filemanager {
     FilePreview(const FilePreview&) = delete;
     FilePreview& operator=(const FilePreview&) = delete;
 
-    std::unique_ptr<Flex> build(std::function<void()> close = {});
+    std::unique_ptr<Flex> build(
+        std::function<void()> close = {}, std::function<void()> open = {}, std::function<void()> openWith = {},
+        float headerHeight = 0.0F
+    );
+    void bindOpenAction(bool with, Button* button);
+    void setActionsEnabled(bool open, bool openWith);
     void select(
         const FileEntry* entry, std::string source, bool protectedCopy, PreviewMode mode, ThumbnailPolicy policy,
         int side
     );
-    void render(Renderer& renderer, float width, float imageHeight);
+    struct Layout {
+      bool pending = false;
+      std::optional<float> compactHeight;
+    };
+    Layout render(Renderer& renderer, Flex& root, bool initialLayout = false);
     void detach();
     void clear();
 
   private:
     void start();
     void releaseImage();
+    void layoutDetails(const std::vector<preview::Detail>& fields, float width);
 
     ThumbnailService& m_thumbnails;
     std::function<void()> m_redraw;
@@ -56,11 +70,18 @@ namespace filemanager {
     int m_previousImageSide = 0;
     bool m_diskCache = false;
     Label* m_name = nullptr;
-    Label* m_details = nullptr;
+    Flex* m_details = nullptr;
+    std::vector<preview::Detail> m_fields;
+    float m_fieldsWidth = 0.0F;
+    Button* m_open = nullptr;
+    Button* m_openWith = nullptr;
     ScrollView* m_scroll = nullptr;
     Flex* m_imageFrame = nullptr;
     Image* m_image = nullptr;
     FileIcon* m_icon = nullptr;
+    Label* m_empty = nullptr;
+    Label* m_notice = nullptr;
     Label* m_text = nullptr;
+    Node* m_textDivider = nullptr;
   };
 } // namespace filemanager

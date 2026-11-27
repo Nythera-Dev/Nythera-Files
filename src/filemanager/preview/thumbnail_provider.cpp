@@ -2,6 +2,7 @@
 #include "filemanager/preview/thumbnail_provider.h"
 
 #include "core/files/directory_scanner.h"
+#include "core/files/display_text.h"
 #include "filemanager/preview/provider_process.h"
 #include "render/core/image_encoder.h"
 #include "render/core/thumbnail_service.h"
@@ -327,7 +328,7 @@ namespace filemanager::preview {
     return decoded ? std::optional(std::move(*decoded)) : std::nullopt;
   }
 
-  std::string mediaDetails(int fd, std::string_view mime, const std::function<bool()>& canceled) {
+  std::vector<Detail> mediaDetails(int fd, std::string_view mime, const std::function<bool()>& canceled) {
     const bool pdf = mime == "application/pdf";
     Fd output(::memfd_create("nythera-preview-metadata", MFD_CLOEXEC));
     if (!output.valid())
@@ -340,7 +341,8 @@ namespace filemanager::preview {
                                      "-protocol_whitelist",
                                      "file,pipe",
                                      "-show_entries",
-                                     "format=duration:stream=width,height,sample_rate",
+                                     "format=duration,format_long_name:format_tags=title,artist,album:stream=width,"
+                                     "height,sample_rate,channels",
                                      "-of",
                                      "default=noprint_wrappers=1",
                                      "/proc/self/fd/3"
@@ -374,21 +376,33 @@ namespace filemanager::preview {
         (void)std::from_chars(text.data(), text.data() + text.size(), number);
       return number;
     };
+    std::vector<Detail> details;
+    const auto add = [&](std::string label, std::string_view text) {
+      if (!text.empty() && text != "N/A")
+        details.push_back({std::move(label), sanitizeFilenameForDisplay(text)});
+    };
     if (pdf) {
-      const int pages = numeric("Pages:");
-      return pages > 0 ? std::format("{} {}", pages, pages == 1 ? "page" : "pages") : std::string{};
+      add("Pages", value("Pages:"));
+      add("Page Size", value("Page size:"));
+      return details;
     }
-    std::string details;
     const int width = numeric("width=");
     const int height = numeric("height=");
     const int sampleRate = numeric("sample_rate=");
+    const int channels = numeric("channels=");
     const int duration = numeric("duration=");
+    add("Format", value("format_long_name="));
     if (width > 0 && height > 0)
-      details = std::format("{} × {} px", width, height);
+      add("Frame Size", std::format("{} × {} px", width, height));
     if (sampleRate > 0)
-      details += std::format("{}{} Hz", details.empty() ? "" : "\n", sampleRate);
+      add("Sample Rate", std::format("{} Hz", sampleRate));
+    if (channels > 0)
+      add("Channels", std::to_string(channels));
     if (duration > 0)
-      details += std::format("{}{}:{:02}", details.empty() ? "" : "\n", duration / 60, duration % 60);
+      add("Duration", std::format("{}:{:02}", duration / 60, duration % 60));
+    add("Title", value("TAG:title="));
+    add("Artist", value("TAG:artist="));
+    add("Album", value("TAG:album="));
     return details;
   }
 

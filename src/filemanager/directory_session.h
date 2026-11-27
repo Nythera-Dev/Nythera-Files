@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -83,7 +84,8 @@ namespace filemanager {
     }
     void setNextEnumerateUserInitiated(bool userInitiated) noexcept { m_nextEnumerateUserInitiated = userInitiated; }
 
-    void navigate(const std::filesystem::path& requestedPath, bool recordHistory = true);
+    void
+    navigate(const std::filesystem::path& requestedPath, bool recordHistory = true, std::string_view revealName = {});
     void navigateTrash();
     void enumerate(const std::filesystem::path& path, bool refreshSearch = true);
     void refreshPreservingSelection(bool refreshSearch = true);
@@ -171,7 +173,11 @@ namespace filemanager {
     [[nodiscard]] bool hasPendingMonitorChanges() const noexcept { return !m_pendingMonitorChanges.empty(); }
 
     [[nodiscard]] bool showHidden() const noexcept { return m_showHidden; }
-    void setShowHidden(bool value) noexcept { m_showHidden = value; }
+    void setShowHidden(bool value) noexcept {
+      if (value != m_showHidden)
+        m_revealedHiddenName.clear();
+      m_showHidden = value;
+    }
     [[nodiscard]] bool foldersFirst() const noexcept { return m_foldersFirst; }
     void setFoldersFirst(bool value) noexcept { m_foldersFirst = value; }
     [[nodiscard]] bool hiddenLast() const noexcept { return m_hiddenLast; }
@@ -243,6 +249,10 @@ namespace filemanager {
 
     bool m_active = true;
     bool m_showHidden = false;
+    std::string m_revealedHiddenName;
+    [[nodiscard]] bool hideEntry(std::string_view name) const noexcept {
+      return !m_showHidden && name.starts_with('.') && name != m_revealedHiddenName;
+    }
     bool m_foldersFirst = true;
     bool m_hiddenLast = true;
     bool m_loading = false;

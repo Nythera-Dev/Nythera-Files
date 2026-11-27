@@ -694,6 +694,46 @@ public:
       manager.applyPendingPasteSelection();
       TEST_CHECK(tab.selectedPaths.empty());
     }
+    // Link navigation uses the resolved target, and reveals only the selected
+    // hidden entry without changing the current Show Hidden preference.
+    {
+      const auto hiddenTarget = dirB / ".selected.txt";
+      const auto otherHidden = dirB / ".unrelated";
+      const auto fileLink = dirA / "to-file";
+      const auto folderLink = dirA / "to-folder";
+      const auto brokenLink = dirA / "dangling";
+      std::ofstream(hiddenTarget) << "target";
+      std::ofstream(otherHidden) << "other";
+      std::filesystem::create_symlink("../dir-b/.selected.txt", fileLink);
+      std::filesystem::create_directory_symlink("../dir-b", folderLink);
+      std::filesystem::create_symlink("missing", brokenLink);
+
+      FileManager manager(dirA.string());
+      auto& tab = manager.activeTab();
+      auto& session = tab.session;
+      manager.enumerate(dirA);
+      TEST_CHECK(waitFor([&] { return !session.loading() && session.entries().size() == 4; }));
+      const auto fileEntry = std::ranges::find(session.entries(), fileLink, &FileEntry::absPath);
+      TEST_CHECK(fileEntry != session.entries().end() && manager.canOpenPreviewed(&*fileEntry, true));
+      const auto folderEntry = std::ranges::find(session.entries(), folderLink, &FileEntry::absPath);
+      TEST_CHECK(folderEntry != session.entries().end() && !manager.canOpenPreviewed(&*folderEntry, true));
+      manager.goToLinkTarget(brokenLink);
+      TEST_CHECK(session.path() == dirA && !session.loading());
+
+      manager.goToLinkTarget(fileLink);
+      TEST_CHECK(waitFor([&] { return session.path() == dirB && !session.loading(); }));
+      TEST_CHECK(tab.selectedPath == hiddenTarget && tab.selectedPaths == std::unordered_set{hiddenTarget.string()});
+      TEST_CHECK(std::ranges::find(session.entries(), hiddenTarget, &FileEntry::absPath) != session.entries().end());
+      TEST_CHECK(std::ranges::find(session.entries(), otherHidden, &FileEntry::absPath) == session.entries().end());
+      TEST_CHECK(!session.showHidden());
+
+      manager.navigate(dirA);
+      TEST_CHECK(waitFor([&] { return session.path() == dirA && !session.loading(); }));
+      manager.goToLinkTarget(folderLink);
+      TEST_CHECK(waitFor([&] { return session.path() == dirB && !session.loading(); }));
+      TEST_CHECK(!tab.selectedPath && tab.selectedPaths.empty());
+      TEST_CHECK(std::ranges::find(session.entries(), hiddenTarget, &FileEntry::absPath) == session.entries().end());
+    }
   }
 };
 

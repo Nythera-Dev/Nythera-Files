@@ -8,19 +8,18 @@
 
 const FileEntry* FileManager::selectedPreviewEntry() {
   auto& tab = activeTab();
-  if (!tab.capabilities().canGenerateThumbnails
-      || !tab.selectedPath
-      || tab.selectedPaths.size() != 1
-      || !tab.selectedPaths.contains(tab.selectedPath->string())
-      || !tab.selectedPath->is_absolute())
+  if (!tab.capabilities().canGenerateThumbnails || tab.selectedPaths.size() != 1)
+    return nullptr;
+  const std::filesystem::path selected(*tab.selectedPaths.begin());
+  if (!selected.is_absolute())
     return nullptr;
   const auto& entries = tab.session.entries();
   if (m_grid) {
     const auto index = m_grid->selectedIndex();
-    if (index && *index < entries.size() && entries[*index].absPath == *tab.selectedPath)
+    if (index && *index < entries.size() && entries[*index].absPath == selected)
       return &entries[*index];
   }
-  const auto found = std::ranges::find(entries, *tab.selectedPath, &FileEntry::absPath);
+  const auto found = std::ranges::find(entries, selected, &FileEntry::absPath);
   return found == entries.end() ? nullptr : &*found;
 }
 
@@ -43,9 +42,27 @@ void FileManager::togglePreviewPane() {
   }
 }
 
+bool FileManager::canOpenPreviewed(const FileEntry* entry, bool with) {
+  return entry && activeTab().capabilities().canLaunchApps && (!with || !entry->isDir);
+}
+
+void FileManager::openPreviewed(bool with) {
+  const auto* entry = selectedPreviewEntry();
+  if (!canOpenPreviewed(entry, with))
+    return;
+  const auto path = entry->absPath;
+  if (with) {
+    m_menus.setContextMenuTarget(path);
+    m_menus.openApplicationChooser();
+  } else {
+    activatePath(path);
+  }
+}
+
 void FileManager::syncFilePreview(filemanager::FilePreview& preview, filemanager::PreviewMode mode, int side) {
   auto& tab = activeTab();
   const auto* entry = selectedPreviewEntry();
+  preview.setActionsEnabled(canOpenPreviewed(entry, false), canOpenPreviewed(entry, true));
   std::string source;
   bool protectedCopy = false;
   const auto policy = m_settings.thumbnailPolicy();

@@ -4,9 +4,12 @@
 #include "ui/controls/context_menu.h"
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 
 namespace filemanager {
+  inline constexpr int kQuickLookMenuId = 30400;
+  inline constexpr int kGoToLinkTargetMenuId = 30411;
   enum class FileMenuContext {
     Toolbar,
     File,
@@ -21,9 +24,17 @@ namespace filemanager {
   inline void groupFileMenuEntries(std::vector<ContextMenuControlEntry>& entries, FileMenuContext context) {
     using Group = std::vector<int>;
     std::vector<Group> groups;
-    if (context == FileMenuContext::File || context == FileMenuContext::Folder) {
+    const bool fileOrFolder = context == FileMenuContext::File || context == FileMenuContext::Folder;
+    constexpr int propertiesId = 22;
+    if (fileOrFolder) {
       groups = {
-          {10, 80, 30013, 60, 30151}, {2, 1, 3, 59}, {110}, {4, 5, 6}, {20, 31, 100}, {30152}, {30104, 30105}, {22},
+          {10, 80, kQuickLookMenuId, kGoToLinkTargetMenuId, 30013, 60, 30151},
+          {2, 1, 3, 59},
+          {110},
+          {119, 4, 5, 6},
+          {20, 31, 100},
+          {30152},
+          {30104, 30105},
       };
     } else if (context == FileMenuContext::Empty) {
       groups = {{3}, {110}, {14, 50, 100}, {21}};
@@ -56,9 +67,19 @@ namespace filemanager {
       if (hasGroupAction && !ordered.empty())
         ordered.push_back({.separator = true});
     }
+    std::optional<ContextMenuControlEntry> properties;
     for (std::size_t i = 0; i < actions.size(); ++i) {
-      if (!used[i])
+      if (used[i])
+        continue;
+      if (fileOrFolder && actions[i].id == propertiesId)
+        properties = std::move(actions[i]);
+      else
         ordered.push_back(std::move(actions[i]));
+    }
+    if (properties) {
+      if (!ordered.empty() && !ordered.back().separator)
+        ordered.push_back({.separator = true});
+      ordered.push_back(std::move(*properties));
     }
     while (!ordered.empty() && ordered.back().separator)
       ordered.pop_back();

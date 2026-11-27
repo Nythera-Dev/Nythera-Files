@@ -56,7 +56,7 @@ namespace filemanager {
     fileHeader->setVisible(!m_gridMode);
     fileHeader->setParticipatesInLayout(!m_gridMode);
     fileHeader->setExcludeSubtreeFromTabOrder(m_gridMode);
-    fileHeader->setMinHeight(36.0F);
+    fileHeader->setMinHeight(kFileListHeaderHeight);
     auto viewport = std::make_unique<Flex>();
     viewport->setParticipatesInLayout(false);
     viewport->setClipChildren(true);

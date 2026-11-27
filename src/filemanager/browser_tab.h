@@ -98,6 +98,7 @@ namespace filemanager {
     }
     std::optional<float> pendingScrollOffsetAfterRefresh;
 
+    std::optional<std::filesystem::path> linkTargetToReveal;
     std::optional<std::filesystem::path> selectedPath;
     std::unordered_set<std::string> selectedPaths;
     std::optional<std::filesystem::path> selectionAnchor;
