@@ -214,6 +214,38 @@ file_operation_engine_dep = declare_dependency(
   dependencies: file_operation_engine_deps,
 )
 
+archives_opt = get_option('archives')
+archive_codec_deps = [
+  dependency('libarchive', version: '>=3.4.0', method: 'pkg-config', required: archives_opt),
+  dependency('zlib', version: '>=1.2.3', method: 'pkg-config', required: archives_opt),
+  dependency('liblzma', version: '>=5.0.0', method: 'pkg-config', required: archives_opt),
+]
+build_archives = not archives_opt.disabled()
+foreach codec : archive_codec_deps
+  build_archives = build_archives and codec.found()
+endforeach
+archive_files_deps = []
+if build_archives
+  archive_backend_lib = static_library('nythera_archive_backend',
+    sources: files(
+      'src/filemanager/archive/archive_capabilities.cpp',
+      'src/filemanager/archive/archive_publication.cpp',
+      'src/filemanager/archive/archive_rar_input.cpp',
+      'src/filemanager/archive/archive_reader.cpp',
+      'src/filemanager/archive/archive_safety.cpp',
+      'src/filemanager/archive/archive_writer.cpp',
+      'src/filemanager/archive/archive_xz_input.cpp',
+    ),
+    dependencies: archive_codec_deps + [file_operation_engine_dep],
+    include_directories: include_directories('src'),
+    cpp_args: _nythera_cpp_args,
+  )
+  archive_files_deps += declare_dependency(
+    link_whole: archive_backend_lib,
+    dependencies: archive_codec_deps + [file_operation_engine_dep],
+  )
+endif
+
 app_build_info = static_library('nythera_app_build_info',
   sources: files('src/core/build_info.cpp') + [_git_revision_h],
   include_directories: _nythera_inc,
@@ -278,7 +310,7 @@ subdir('files-assets')
 
 executable('nythera-file-manager',
   sources: files('src/filemanager/main.cpp'),
-  dependencies: _nythera_files_dependencies + [file_operation_engine_dep],
+  dependencies: _nythera_files_dependencies + [file_operation_engine_dep] + archive_files_deps,
   include_directories: _nythera_inc,
   cpp_args: _nythera_cpp_args,
   link_with: [app_build_info, nythera_files_lib],
@@ -288,6 +320,21 @@ executable('nythera-file-manager',
 )
 
 if build_tests
+  if build_archives
+    archive_test_syscall_suffix = is_glibc ? '64' : ''
+    archive_backend_test_exe = executable('archive_backend_test',
+      sources: files('tests/archive_backend_test.cpp'),
+      dependencies: archive_files_deps,
+      include_directories: include_directories('src'),
+      link_args: [
+        '-Wl,--wrap=pread' + archive_test_syscall_suffix,
+        '-Wl,--wrap=pwrite' + archive_test_syscall_suffix,
+        '-Wl,--wrap=fstatvfs' + archive_test_syscall_suffix,
+      ],
+      override_options: ['b_ndebug=false'])
+    test('archive_backend', archive_backend_test_exe, timeout: 90)
+  endif
+
   dbus_run_session = find_program('dbus-run-session', required: false)
 
   file_inline_rename_test_exe = executable('file_inline_rename_test',

@@ -1,3 +1,4 @@
+option('archives', type: 'feature', value: 'auto', description: 'Build the native Files archive backend')
 option('tests', type: 'feature', value: 'auto', description: 'Build unit tests (auto: on for unsanitized debug builds)')
 option('jemalloc', type: 'feature', value: 'auto', description: 'Use jemalloc on glibc builds')
 option(
