@@ -65,8 +65,8 @@
 #include <format>
 #include <future>
 #include <iomanip>
-#include <locale>
 #include <linux/input-event-codes.h>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -198,7 +198,9 @@ public:
       icon->setThemedIconNames(std::move(names));
       icon->setSymlinkState(entry.isSymlink, broken);
     };
-    const auto protectedThumbnail = m_owner.protectedThumbnailPath(tab, entry, index);
+    const bool manageThumbnail =
+        tab.hasActiveAdminSession() && m_owner.m_settings.thumbnailPolicy() != filemanager::ThumbnailPolicy::Never;
+    const auto protectedThumbnail = manageThumbnail ? m_owner.protectedThumbnailPath(tab, entry, index) : std::nullopt;
     const bool cut =
         !session.browsingTrash() && tab.capabilities().canMutate && m_owner.m_transfers.isPathCut(entry.absPath);
     const bool gridFocused =
@@ -207,6 +209,7 @@ public:
     if (m_owner.m_listHeader.gridMode()) {
       auto& tileNode = static_cast<FileEntryTile&>(tile);
       tileNode.setAllowThumbnailsAndMetadata(allowThumbnails);
+      tileNode.setManageThumbnail(manageThumbnail);
       tileNode.bind(
           *m_renderer, entry, index, tile.width(), tile.height(), selected,
           hovered || m_owner.m_transfers.dropIndex() == index, false, cut, protectedThumbnail, itemFocused
@@ -217,6 +220,7 @@ public:
     } else {
       auto& row = static_cast<FileEntryRow&>(tile);
       row.setAllowThumbnailsAndMetadata(allowThumbnails);
+      row.setManageThumbnail(manageThumbnail);
       row.setColumns(m_owner.m_listHeader.visibleColumns(), m_owner.m_listHeader.listColumns());
       row.bind(
           *m_renderer, entry, index, tile.width(), selected, hovered || m_owner.m_transfers.dropIndex() == index, false,
@@ -508,6 +512,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
           },
       .onActiveEntriesLoaded =
           [this](filemanager::BrowserTab& active, bool chooseFirst) {
+            m_searchThumbnails.clear();
             syncSearchUi();
             if (m_grid != nullptr) {
               m_grid->notifyDataChanged();
@@ -1389,6 +1394,7 @@ FileManager::~FileManager() {
     m_surface->setSceneRoot(nullptr);
   m_selectionTimer.stop();
   releaseSearchThumbnails();
+  m_selectionPreview.detach();
   TooltipManager::instance().shutdown();
   m_renderContext.cleanup();
   m_sharedContext.cleanup();
@@ -1422,6 +1428,7 @@ int FileManager::run() {
       "file-manager-theme"
   );
   m_settings.setReloadCallback([this](const toml::table& previous) { applyFilesPreferences(previous); });
+  applyThumbnailLimits();
   m_themeService.apply();
   m_wayland.setNativeDataTransfer(&m_transfer);
   m_wayland.setTextInputService(&m_textInputService);
@@ -1510,6 +1517,9 @@ int FileManager::run() {
           auto* self = request->self;
           self->m_dispatcher.setSceneRoot(nullptr);
           self->releaseSearchThumbnails();
+          self->m_selectionPreview.detach();
+          self->m_previewPane = self->m_previewDivider = nullptr;
+          self->m_previewResize.reset();
           if (self->m_surface) {
             self->m_surface->setSceneRoot(nullptr);
             self->m_surface.reset();
@@ -1570,6 +1580,8 @@ int FileManager::run() {
   m_thumbnailPendingSub = m_pickerThumbnails.subscribePendingUpload([this] {
     if (m_surface)
       m_surface->requestUpdate();
+    if (m_quickLookOpen)
+      m_modalDialog.requestLayout();
   });
 
   m_pickerHosts.registerHost(
@@ -1880,6 +1892,33 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     return;
   case kCloseTab:
     (void)closeTab(tab.id);
+    return;
+  case kQuickLook:
+    (void)openQuickLook();
+    return;
+  case kPreviewHidden:
+    setPreviewMode(filemanager::PreviewMode::Hidden);
+    return;
+  case kPreviewInformation:
+    setPreviewMode(filemanager::PreviewMode::Information);
+    return;
+  case kPreviewFull:
+    setPreviewMode(filemanager::PreviewMode::Full);
+    return;
+  case kThumbnailsNever:
+    setThumbnailPolicy(filemanager::ThumbnailPolicy::Never);
+    return;
+  case kThumbnailsLocal:
+    setThumbnailPolicy(filemanager::ThumbnailPolicy::Local);
+    return;
+  case kThumbnailsAll:
+    setThumbnailPolicy(filemanager::ThumbnailPolicy::All);
+    return;
+  case kInspectThumbnailCache:
+    inspectThumbnailCache(false);
+    return;
+  case kClearThumbnailCache:
+    inspectThumbnailCache(true);
     return;
   case kOpenContainingFolder:
     if (const auto& target = m_menus.contextMenuTarget(); session.search().active()
@@ -2365,6 +2404,22 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
     m_menus.loadInitialPreference();
     m_menus.syncResponsiveMenuBar(m_lastHeaderWidth);
   }
+  if (changed("thumbnail_max_file_mib") || changed("thumbnail_cache_mib"))
+    applyThumbnailLimits();
+  if (changed("preview_mode") || changed("thumbnail_policy") || changed("thumbnail_max_file_mib")) {
+    const auto mode = m_settings.previewMode();
+    if (mode != filemanager::PreviewMode::Hidden)
+      m_lastVisiblePreviewMode = mode;
+    if (changed("thumbnail_policy") || changed("thumbnail_max_file_mib")) {
+      m_searchThumbnails.clear();
+      if (m_grid)
+        m_grid->notifyDataChanged();
+    }
+    if (m_surface)
+      m_surface->requestLayout();
+    if (m_quickLookOpen)
+      m_modalDialog.requestLayout();
+  }
   if (changed("open_tabs_in_background"))
     m_openTabsInBackground = m_settings.openTabsInBackground();
   if (changed("always_show_tab_bar")) {
@@ -2816,7 +2871,13 @@ void FileManager::setStatus(std::string text) {
     });
 }
 
-void FileManager::updateSelectionSummary() { updateStatusBar(); }
+void FileManager::updateSelectionSummary() {
+  updateStatusBar();
+  if (m_surface && m_previewPane && m_previewPane->visible())
+    m_surface->requestLayout();
+  if (m_quickLookOpen)
+    m_modalDialog.requestLayout();
+}
 
 std::string FileManager::formatCount(std::size_t count) {
   static const auto locale = [] {
@@ -3189,6 +3250,8 @@ void FileManager::finishAdministratorMode(filemanager::TabId tabId, std::string 
   if (m_propertiesWindow && m_propertiesWindow->usesAdministratorTab(*tab))
     m_propertiesWindow->close();
   if (tabId == m_tabs.activeTabId()) {
+    if (m_quickLookOpen)
+      m_modalDialog.closeDialog(0);
     m_pendingInlineRenamePath.reset();
     if (m_renamePath) {
       m_refreshAfterRename = false;
@@ -3555,7 +3618,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
       m_dispatcher.restoreTabFocus(snapshot);
   }
   Renderer& renderer = m_surface->renderTarget().renderer();
-  if (m_pickerThumbnails.uploadPending(renderer.textureManager()) && m_grid && !activeSession().search().active())
+  if (m_pickerThumbnails.uploadPending(renderer.textureManager()) && m_grid && activeTab().hasActiveAdminSession())
     m_grid->notifyDataChanged();
   m_adapter->setRenderer(&renderer);
   if (!m_root) {
@@ -3891,6 +3954,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_statusStrip->setPadding(std::clamp((m_statusHeight - statusFontSize) * 0.5F, 2.0F, 7.0F), 10.0F);
     mainColumn->addChild(std::move(mainPane));
     m_root->addChild(std::move(mainColumn));
+    attachPreviewPane(kSidebarDividerWidth, colorSpecFromRole(ColorRole::Surface, kFilesGridOpacity));
     m_dispatcher.setSceneRoot(m_root.get());
     m_dispatcher.setFocus(m_grid->focusArea());
     m_surface->setSceneRoot(m_root.get());
@@ -3923,8 +3987,9 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_sidebarDivider->setVisible(showSidebar);
     m_sidebarDivider->setParticipatesInLayout(showSidebar);
     const float sidebarSpace = showSidebar ? effectiveSidebar + kSidebarDividerWidth + 2.0F * kPaneGap : 0.0F;
+    const float available = static_cast<float>(m_surface->width()) - 2.0F * kWindowPadding - sidebarSpace;
     const int headerWidth =
-        static_cast<int>(static_cast<float>(m_surface->width()) - 2.0F * kWindowPadding - sidebarSpace);
+        static_cast<int>(available - layoutPreviewPane(available, kSidebarDividerWidth + 2.0F * kPaneGap));
     m_menus.syncResponsiveMenuBar(headerWidth);
     updateSearchFilterWidth(static_cast<float>(headerWidth), renderer);
     updateAdminHeaderUi(headerWidth);
@@ -3959,6 +4024,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     UiPhaseScope layoutPhase(UiPhase::Layout);
     updateSearchThumbnails(renderer);
     updateSearchFolderCounts();
+    renderPreviewPane(renderer);
   }
   if (m_transfers.refreshDropTargetAfterScroll() && (m_transfers.isDraggingFiles() || m_transfers.hasDragPreview())) {
     UiPhaseScope layoutPhase(UiPhase::Layout);
@@ -4134,6 +4200,14 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
   if (event.type == PointerEvent::Type::Button && event.pressed)
     m_lastInputSerial = event.serial;
   if (m_modalDialog.isOpen()) {
+    if (m_quickLookOpen
+        && m_surface
+        && event.surface == m_surface->wlSurface()
+        && event.type == PointerEvent::Type::Button
+        && event.pressed) {
+      closeDialog(0);
+      return;
+    }
     activeModalDialog().handlePointer(event);
     return;
   }
@@ -4331,6 +4405,8 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
     return;
   }
   if (m_transfers.handleFileDragPointer(event, x, y))
+    return;
+  if (!m_resizingSidebar && handlePreviewDivider(event, x, y))
     return;
   if (m_sidebarDivider != nullptr && m_sidebar != nullptr && m_sidebarDivider->visible()) {
     float dividerX = 0, dividerY = 0;
@@ -4836,6 +4912,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
         || m_listHeader.gestureActive()
         || m_tabBar.gestureActive()
         || m_resizingSidebar
+        || m_previewResize
         || m_resizingStatus
         || (m_grid && m_grid->rubberBandActive())) {
       if (m_grid)
@@ -4849,6 +4926,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
         m_tabBar.cancelGesture();
       }
       m_reordering = m_resizingSidebar = m_resizingStatus = false;
+      m_previewResize.reset();
       m_reorderId.reset();
       m_reorderBefore.reset();
       m_transfers.cancelLocalDragState();
@@ -4873,6 +4951,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       || m_listHeader.gestureActive()
       || m_tabBar.gestureActive()
       || m_resizingSidebar
+      || m_previewResize
       || (m_grid && m_grid->rubberBandActive()))
     return;
 
@@ -4985,6 +5064,12 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       else if (index < m_tabs.tabs().size())
         (void)activateTab(m_tabs.tabs()[index]->id);
     }
+    return;
+  }
+
+  if (mods == 0U && event.sym == XKB_KEY_F8 && !m_menus.isContextMenuOpen()) {
+    if (!event.repeat)
+      togglePreviewPane();
     return;
   }
 
@@ -5257,7 +5342,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
           && !m_typeaheadQuery.empty()
           && (std::chrono::steady_clock::now() - m_typeaheadLastTime <= kTypeaheadTimeout)) {
         (void)handleFileViewTypeahead(' ');
-      } else {
+      } else if (mods != 0U || !openQuickLook()) {
         (void)handleFileViewSpaceSelection(mods);
       }
     }

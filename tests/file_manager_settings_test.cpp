@@ -80,6 +80,19 @@ namespace {
     TEST_CHECK(config["files"]["show_hidden"].value<bool>() == true);
     TEST_CHECK(config["files"].as_table()->size() == 1);
     TEST_CHECK(!config["files"]["sidebar_width"]);
+    TEST_CHECK(settings.previewMode() == filemanager::PreviewMode::Full);
+    TEST_CHECK(settings.thumbnailPolicy() == filemanager::ThumbnailPolicy::Local);
+    TEST_CHECK(settings.thumbnailMaxFileMiB() == 64 && settings.thumbnailCacheMiB() == 1024);
+    TEST_CHECK(settings.setPreviewMode(filemanager::PreviewMode::Information));
+    TEST_CHECK(settings.setThumbnailPolicy(filemanager::ThumbnailPolicy::Never));
+    TEST_CHECK(settings.savePreviewWidth(355));
+    TEST_CHECK(settings.previewMode() == filemanager::PreviewMode::Information);
+    TEST_CHECK(settings.thumbnailPolicy() == filemanager::ThumbnailPolicy::Never);
+    TEST_CHECK(settings.loadPreviewWidth() == 355);
+    const auto previewState = toml::parse_file((stateDir / "files/state.toml").string());
+    TEST_CHECK(previewState["files"]["preview_width"].value<std::string>() == "355.000000");
+    TEST_CHECK(!previewState["files"]["preview_mode"]);
+
     TEST_CHECK(read(legacyState) == existingState);
 
     write(shellDir / "shell.toml", "[shell]\nreadline_shortcuts = true\n[shell.panel]\ntransparency_mode = 'glass'\n");

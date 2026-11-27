@@ -21,6 +21,8 @@
 #include "filemanager/gio_poll_source.h"
 #include "filemanager/places_model.h"
 #include "filemanager/places_sidebar.h"
+#include "filemanager/preview/file_preview.h"
+#include "filemanager/preview/thumbnail_provider.h"
 #include "filemanager/properties_window.h"
 #include "filemanager/search_thumbnails.h"
 #include "filemanager/tab_bar_controller.h"
@@ -276,6 +278,18 @@ private:
   void syncTooltipHover();
   void handleKeyboard(const KeyboardEvent& event);
   void handleWindowKeyEvent(const KeyboardEvent& event);
+  [[nodiscard]] const FileEntry* selectedPreviewEntry();
+  void syncFilePreview(filemanager::FilePreview& preview, filemanager::PreviewMode mode, int side);
+  void setPreviewMode(filemanager::PreviewMode mode);
+  void togglePreviewPane();
+  void applyThumbnailLimits();
+  void inspectThumbnailCache(bool clear);
+  void setThumbnailPolicy(filemanager::ThumbnailPolicy policy);
+  [[nodiscard]] bool openQuickLook();
+  void attachPreviewPane(float dividerWidth, const ColorSpec& fill);
+  [[nodiscard]] float layoutPreviewPane(float available, float dividerSpace);
+  void renderPreviewPane(Renderer& renderer);
+  [[nodiscard]] bool handlePreviewDivider(const PointerEvent& event, float x, float y);
   [[nodiscard]] bool navigateFileViewByKeyboard(std::uint32_t sym, std::uint32_t mods);
   [[nodiscard]] bool handleFileViewSpaceSelection(std::uint32_t mods);
   [[nodiscard]] bool handleFileViewTypeahead(std::uint32_t utf32);
@@ -348,11 +362,18 @@ private:
   AnimationManager m_menuAnimations;
   GioPollSource m_gioPollSource;
   FileOperationManager m_operations;
-  ThumbnailService m_pickerThumbnails;
+  ThumbnailService m_pickerThumbnails{
+      ThumbnailService::CacheBackend::FreedesktopPng, filemanager::preview::provideThumbnail, "Nythera Files"
+  };
   filemanager::SearchThumbnails m_searchThumbnails{m_pickerThumbnails, [this] {
                                                      if (m_surface)
                                                        m_surface->requestUpdate();
                                                    }};
+  filemanager::FilePreview m_selectionPreview{m_pickerThumbnails, [this] {
+                                                if (m_surface)
+                                                  m_surface->requestLayout();
+                                              }};
+  filemanager::FilePreview m_quickLook{m_pickerThumbnails, [this] { m_modalDialog.requestLayout(); }};
   ThumbnailService::Subscription m_thumbnailPendingSub;
   LayerPopupHostRegistry m_pickerHosts;
   std::unique_ptr<FileDialogPopup> m_destinationPicker;
@@ -526,6 +547,14 @@ private:
   Flex* m_breadcrumbBar = nullptr;
   Flex* m_sidebar = nullptr;
   Flex* m_sidebarDivider = nullptr;
+  Flex* m_previewPane = nullptr;
+  Flex* m_previewDivider = nullptr;
+  Flex* m_quickLookContent = nullptr;
+  filemanager::PreviewMode m_lastVisiblePreviewMode = filemanager::PreviewMode::Full;
+  float m_previewWidth = 320.0F;
+  float m_previewWidthLimit = 800.0F;
+  std::optional<float> m_previewResize;
+  bool m_quickLookOpen = false;
   Flex* m_statusDivider = nullptr;
   Flex* m_statusStrip = nullptr;
   bool m_resizingStatus = false;

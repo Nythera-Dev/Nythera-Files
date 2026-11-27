@@ -652,6 +652,8 @@ namespace filemanager {
     const auto& session = m_tabs.activeTab().session;
     const bool renaming = m_callbacks.isRenaming && m_callbacks.isRenaming();
     const bool gridMode = m_listHeader.gridMode();
+    const auto previewMode = m_settings.previewMode();
+    const auto thumbnailPolicy = m_settings.thumbnailPolicy();
     std::vector<ContextMenuControlEntry> entries{
         {.id = menu_id::kListView,
          .label = "List View",
@@ -686,6 +688,47 @@ namespace filemanager {
              .checkmark = true,
              .toggleState = session.displayedHiddenItems() ? 1 : 0,
              .shortcut = "Ctrl+H"},
+            {.separator = true},
+            {.id = menu_id::kPreviewMode,
+             .label = "Preview Pane",
+             .hasSubmenu = true,
+             .shortcut = "F8",
+             .submenuEntries =
+                 {
+                     {.id = menu_id::kPreviewFull,
+                      .label = "Full Preview",
+                      .radio = true,
+                      .toggleState = previewMode == PreviewMode::Full ? 1 : 0},
+                     {.id = menu_id::kPreviewInformation,
+                      .label = "Information Only",
+                      .radio = true,
+                      .toggleState = previewMode == PreviewMode::Information ? 1 : 0},
+                     {.id = menu_id::kPreviewHidden,
+                      .label = "Hidden",
+                      .radio = true,
+                      .toggleState = previewMode == PreviewMode::Hidden ? 1 : 0},
+                 }},
+            {.id = menu_id::kThumbnailSettings,
+             .label = "Thumbnails",
+             .hasSubmenu = true,
+             .submenuEntries =
+                 {
+                     {.id = menu_id::kThumbnailsNever,
+                      .label = "Never",
+                      .radio = true,
+                      .toggleState = thumbnailPolicy == ThumbnailPolicy::Never ? 1 : 0},
+                     {.id = menu_id::kThumbnailsLocal,
+                      .label = "Local Locations",
+                      .radio = true,
+                      .toggleState = thumbnailPolicy == ThumbnailPolicy::Local ? 1 : 0},
+                     {.id = menu_id::kThumbnailsAll,
+                      .label = "All Locations",
+                      .radio = true,
+                      .toggleState = thumbnailPolicy == ThumbnailPolicy::All ? 1 : 0},
+                     {.separator = true},
+                     {.id = menu_id::kInspectThumbnailCache, .label = "Inspect Cache"},
+                     {.id = menu_id::kClearThumbnailCache, .label = "Clear Files Thumbnails…"},
+                 }},
             {.separator = true},
             {.id = menu_id::kZoomIn,
              .label = "Zoom In",
@@ -1088,6 +1131,12 @@ namespace filemanager {
            .actionIconNames = {"insert-link-symbolic", "insert-link"},
            .actionGlyph = "link"}
       );
+      if (m_callbacks.selectedPaths().size() == 1
+          && caps.canGenerateThumbnails
+          && std::filesystem::path(path).is_absolute())
+        entries.push_back(
+            {.id = menu_id::kQuickLook, .label = "Quick Look", .shortcut = "Space", .actionGlyph = "eye"}
+        );
       if (!m_callbacks.selectedPaths().empty())
         entries.push_back(
             {.id = 22,

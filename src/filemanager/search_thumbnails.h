@@ -1,5 +1,6 @@
 #pragma once
 
+#include "filemanager/preview/preview_options.h"
 #include "render/core/thumbnail_service.h"
 
 #include <functional>
@@ -15,7 +16,7 @@ struct FileEntry;
 
 namespace filemanager {
 
-  // Owns only the current viewport's search previews. Filesystem policy and the
+  // Owns only the current viewport's thumbnails. Filesystem policy and the
   // shared service's source inspection both run off the UI thread.
   class SearchThumbnails {
   public:
@@ -25,7 +26,8 @@ namespace filemanager {
     [[nodiscard]] static bool eligible(const FileEntry& entry);
     [[nodiscard]] static bool permitsAutomaticPreview(GFileInfo* filesystem);
 
-    void updateVisible(std::span<const std::string> paths, int targetPx);
+    void
+    updateVisible(std::span<const std::string> paths, int targetPx, ThumbnailPolicy policy = ThumbnailPolicy::Local);
     [[nodiscard]] TextureHandle peek(const std::string& path) const;
 
     // Cancel outstanding work immediately. Ready textures are released with
@@ -51,6 +53,7 @@ namespace filemanager {
     std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
     std::vector<std::pair<std::string, int>> m_retired;
     int m_targetPx = 0;
+    ThumbnailPolicy m_policy = ThumbnailPolicy::Local;
   };
 
 } // namespace filemanager

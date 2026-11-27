@@ -377,7 +377,7 @@ void FileManager::updateSearchFolderCounts() {
 }
 
 void FileManager::updateSearchThumbnails(Renderer& renderer) {
-  if (!m_grid || !activeSession().search().active() || !activeTab().capabilities().canGenerateThumbnails) {
+  if (!m_grid || activeTab().hasActiveAdminSession() || !activeTab().capabilities().canGenerateThumbnails) {
     m_searchThumbnails.clear();
     m_searchThumbnails.releaseRetired();
     return;
@@ -390,7 +390,9 @@ void FileManager::updateSearchThumbnails(Renderer& renderer) {
     if (index < entries.size() && filemanager::SearchThumbnails::eligible(entries[index]))
       eligiblePaths.push_back(entries[index].absPath.string());
   });
-  m_searchThumbnails.updateVisible(eligiblePaths, gridMode ? ThumbnailService::kDefaultTargetPx : 64);
+  m_searchThumbnails.updateVisible(
+      eligiblePaths, gridMode ? ThumbnailService::kDefaultTargetPx : 64, m_settings.thumbnailPolicy()
+  );
   m_grid->visitVisibleTiles([&](Node& tile, std::size_t index) {
     const auto handle =
         index < entries.size() ? m_searchThumbnails.peek(entries[index].absPath.string()) : TextureHandle{};

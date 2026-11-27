@@ -94,6 +94,17 @@ namespace filemanager {
     inline constexpr int kReportBug = HelpDialogController::kReportBugMenuId;
     inline constexpr int kGitHub = HelpDialogController::kGitHubMenuId;
     inline constexpr int kAboutFiles = HelpDialogController::kAboutMenuId;
+    inline constexpr int kQuickLook = 30300;
+    inline constexpr int kPreviewMode = 30301;
+    inline constexpr int kPreviewHidden = 30302;
+    inline constexpr int kPreviewInformation = 30303;
+    inline constexpr int kPreviewFull = 30304;
+    inline constexpr int kThumbnailSettings = 30305;
+    inline constexpr int kThumbnailsNever = 30306;
+    inline constexpr int kThumbnailsLocal = 30307;
+    inline constexpr int kThumbnailsAll = 30308;
+    inline constexpr int kInspectThumbnailCache = 30309;
+    inline constexpr int kClearThumbnailCache = 30310;
     inline constexpr int kFirstExternalToolApp = 40000;
     inline constexpr std::size_t kToolsMenuIndex = 3;
     inline constexpr std::size_t kHelpMenuIndex = 4;

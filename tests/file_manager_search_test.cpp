@@ -22,10 +22,10 @@
 #include <array>
 #include <chrono>
 #include <fstream>
-#include <ranges>
 #include <gio/gdesktopappinfo.h>
 #include <linux/input-event-codes.h>
 #include <memory>
+#include <ranges>
 #include <thread>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -168,6 +168,15 @@ namespace {
     TEST_CHECK(!SearchThumbnails::eligible(entry));
     entry.isSymlink = false;
     entry.type = "application/octet-stream";
+    TEST_CHECK(!SearchThumbnails::eligible(entry));
+    entry.type = "video/mp4";
+    entry.size = ThumbnailService::kMaxSourceFileBytes + 1;
+    TEST_CHECK(SearchThumbnails::eligible(entry));
+    entry.type = "application/pdf";
+    TEST_CHECK(!SearchThumbnails::eligible(entry));
+    entry.size = 1000;
+    TEST_CHECK(SearchThumbnails::eligible(entry));
+    entry.absPath = "archive:/preview.pdf";
     TEST_CHECK(!SearchThumbnails::eligible(entry));
 
     ThumbnailTextures textures;

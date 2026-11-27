@@ -7,12 +7,15 @@ arch=(x86_64 aarch64)
 url='https://github.com/Nythera-Dev/Nythera-Files'
 license=(MIT)
 depends=('nythera-lib>=0.1.0' 'nythera-lib<0.2.0' libnythera_lib.so
-         glib2 jemalloc libarchive libgcc libstdc++ libxkbcommon polkit tomlplusplus wayland xz zlib)
+         gdk-pixbuf2 glib2 jemalloc libarchive libgcc libstdc++ libxkbcommon polkit tomlplusplus wayland xz zlib)
 optdepends=(
   'gvfs: Wastebin (trash://), removable media mounting, and remote filesystem support'
   'gvfs-smb: SMB/CIFS network share browsing'
   'gvfs-mtp: MTP device browsing'
   'gvfs-nfs: NFS network share browsing'
+  'ffmpeg: video stills and embedded audio artwork'
+  'ffmpegthumbnailer: filmstrip borders for video thumbnails'
+  'poppler: first-page PDF thumbnails'
   'ripgrep: search plain-text file contents'
   'ripgrep-all: search extracted document and archive contents'
 )

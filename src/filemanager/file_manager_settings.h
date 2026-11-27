@@ -7,6 +7,7 @@
 #include "core/inotify/inotify.h"
 #include "filemanager/configuration_notice.h"
 #include "filemanager/file_columns.h"
+#include "filemanager/preview/preview_options.h"
 #include "filemanager/search_scope.h"
 
 #include <cstdint>
@@ -98,6 +99,15 @@ namespace filemanager {
 
     [[nodiscard]] float loadViewScale(float defaultScale = 1.0F, bool search = false) const;
     [[nodiscard]] bool saveViewScale(float scale, bool search = false);
+
+    [[nodiscard]] PreviewMode previewMode() const;
+    [[nodiscard]] bool setPreviewMode(PreviewMode mode);
+    [[nodiscard]] ThumbnailPolicy thumbnailPolicy() const;
+    [[nodiscard]] bool setThumbnailPolicy(ThumbnailPolicy policy);
+    [[nodiscard]] int thumbnailMaxFileMiB() const;
+    [[nodiscard]] int thumbnailCacheMiB() const;
+    [[nodiscard]] float loadPreviewWidth() const;
+    [[nodiscard]] bool savePreviewWidth(float width);
 
     [[nodiscard]] float loadSidebarWidth(float defaultWidth, float minWidth, float maxWidth) const;
     [[nodiscard]] bool saveSidebarWidth(float width);
