@@ -418,6 +418,11 @@ namespace filemanager {
               if (tabId == m_activeTabId && m_callbacks.onCancelFileGesture)
                 m_callbacks.onCancelFileGesture();
             },
+        .onReorderSearchResults =
+            [this, tabId] {
+              if (tabId == m_activeTabId && m_callbacks.onReorderSearchResults)
+                m_callbacks.onReorderSearchResults();
+            },
         .onBeforeNavigate =
             [this, tabId](const std::filesystem::path& targetPath, bool pathChanged) {
               auto* tab = findTab(tabId);
@@ -498,6 +503,8 @@ namespace filemanager {
                       == tab->session.entries().end()) {
                 tab->selectionAnchor.reset();
               }
+              if (m_callbacks.onSearchActivityChanged)
+                m_callbacks.onSearchActivityChanged(tabId);
               if (tabId == m_activeTabId && m_callbacks.onActiveEntriesLoaded)
                 m_callbacks.onActiveEntriesLoaded(*tab, chooseFirst);
             },
@@ -545,6 +552,8 @@ namespace filemanager {
                 tab->selectionAnchor = std::move(tab->browsingSelection->anchor);
                 tab->browsingSelection.reset();
               }
+              if (m_callbacks.onSearchActivityChanged)
+                m_callbacks.onSearchActivityChanged(tabId);
               if (tabId == m_activeTabId && m_callbacks.onActiveEntriesChanged)
                 m_callbacks.onActiveEntriesChanged(*tab);
             },

@@ -192,6 +192,7 @@ namespace filemanager {
 
   private:
     void openMainContextMenu(ContextMenuPopupRequest request, bool highlightOnOpen, bool preferSurfaceOutput);
+    void appendOpenWithEntries(const FileEntry& target, std::vector<ContextMenuControlEntry>& entries);
 
     bool launchProtectedApplication(const BrowserTab& tab, GAppInfo* app, const std::filesystem::path& path);
     friend class ::FileManagerTestAccess;

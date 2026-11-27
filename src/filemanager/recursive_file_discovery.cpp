@@ -106,11 +106,35 @@ namespace filemanager {
     return filemanager::openSearchDescendant(rootFd, parent.c_str() + offset, O_PATH | O_DIRECTORY | O_CLOEXEC);
   }
 
+  int RecursiveFileDiscovery::Source::pinRegular(const std::filesystem::path& path, GFileType type) const {
+    int fd = -1;
+    if (type == G_FILE_TYPE_SYMBOLIC_LINK && openLink) {
+      fd = openLink(path);
+    } else if (type == G_FILE_TYPE_REGULAR) {
+      const int directory = folderFd >= 0 ? folderFd : openFolder(path.parent_path());
+      if (directory >= 0) {
+        fd = openSearchDescendant(directory, path.filename().c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        if (folderFd < 0)
+          close(directory);
+      }
+    }
+    struct statx info{};
+    if (fd >= 0
+        && (statx(fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_TYPE, &info) != 0
+            || !S_ISREG(info.stx_mode)
+            || (info.stx_attributes & STATX_ATTR_AUTOMOUNT) != 0)) {
+      close(fd);
+      return -1;
+    }
+    return fd;
+  }
+
   struct RecursiveFileDiscovery::Run : std::enable_shared_from_this<Run> {
     GCancellable* cancellable = g_cancellable_new();
     std::shared_ptr<const SearchPlan> plan;
     MakeConsumer consumer;
     Complete complete;
+    Lane workerLane = Lane::Discovery;
     bool showHidden = false;
     std::deque<SearchRoot> pending;
     SearchPathSet knownRoots;
@@ -341,7 +365,7 @@ namespace filemanager {
       return suffix == "." ? root.path : root.path / suffix;
     }
 
-    std::filesystem::path resolveDirectoryLink(const Candidate& candidate) const {
+    OpenSearchPath resolveLink(const std::filesystem::path& candidatePath) const {
       const auto& plan = *run->plan;
       const SearchPathBoundary boundary{
           physicalRoot, rootFd, [&](const std::filesystem::path& path, int parent) {
@@ -370,9 +394,19 @@ namespace filemanager {
             return true;
           }
       };
-      const OpenSearchPath target(
-          plan, physicalRoot / (current.path / candidate.name).lexically_relative(root.path), &boundary
-      );
+      return OpenSearchPath(plan, physicalRoot / candidatePath.lexically_relative(root.path), &boundary);
+    }
+
+    Source source(int pinnedFolder) const {
+      Source result{root.path, rootFd, pinnedFolder, {}};
+      if (run->plan->followSymlinks) {
+        result.openLink = [this](const std::filesystem::path& path) { return resolveLink(path).release(); };
+      }
+      return result;
+    }
+
+    std::filesystem::path resolveDirectoryLink(const Candidate& candidate) const {
+      const auto target = resolveLink(current.path / candidate.name);
       struct statx info{};
       if (target.fd() < 0
           || statx(target.fd(), "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_TYPE, &info) != 0
@@ -407,7 +441,7 @@ namespace filemanager {
         if (std::exchange(publishRoot, false)) {
           const Candidate mount{root.path.filename().native(), G_FILE_TYPE_DIRECTORY};
           return {
-              batch(root.path.parent_path(), std::span(&mount, 1), {root.path, rootFd, -1}, cancellable), false,
+              batch(root.path.parent_path(), std::span(&mount, 1), source(-1), cancellable), false,
               std::exchange(aliasMounts, {})
           };
         }
@@ -430,15 +464,13 @@ namespace filemanager {
           std::ranges::reverse(candidates);
           enqueueFolders(candidates);
           return {
-              batch(current.path, candidates, {root.path, rootFd, folderFd}, cancellable), false,
-              std::exchange(aliasMounts, {})
+              batch(current.path, candidates, source(folderFd), cancellable), false, std::exchange(aliasMounts, {})
           };
         }
       }
       return {
-          flush && error.empty() && !g_cancellable_is_cancelled(cancellable)
-              ? flush({root.path, rootFd, -1}, cancellable)
-              : Publish{},
+          flush && error.empty() && !g_cancellable_is_cancelled(cancellable) ? flush(source(-1), cancellable)
+                                                                             : Publish{},
           true, std::exchange(aliasMounts, {})
       };
     }
@@ -453,12 +485,24 @@ namespace filemanager {
       });
     }
 
-    static GThreadPool* pool(bool network) {
+    static GThreadPool* pool(Lane lane, bool network) {
       // Separate process-wide limits keep abandoned or stalled network reads
       // from occupying local traversal slots after the next query or tab opens.
       static GThreadPool* local = g_thread_pool_new(readTask, nullptr, kWorkersPerLane, false, nullptr);
       static GThreadPool* remote = g_thread_pool_new(readTask, nullptr, kWorkersPerLane, false, nullptr);
-      return network ? remote : local;
+      static GThreadPool* largeLocal = g_thread_pool_new(readTask, nullptr, 1, false, nullptr);
+      static GThreadPool* largeRemote = g_thread_pool_new(readTask, nullptr, 1, false, nullptr);
+      static GThreadPool* extractionLocal = g_thread_pool_new(readTask, nullptr, 1, false, nullptr);
+      static GThreadPool* extractionRemote = g_thread_pool_new(readTask, nullptr, 1, false, nullptr);
+      switch (lane) {
+      case Lane::Discovery:
+        return network ? remote : local;
+      case Lane::LargeContent:
+        return network ? largeRemote : largeLocal;
+      case Lane::Extraction:
+        return network ? extractionRemote : extractionLocal;
+      }
+      std::unreachable();
     }
 
     void next() {
@@ -494,7 +538,7 @@ namespace filemanager {
       g_task_set_task_data(task, new std::shared_ptr<Scan>(shared_from_this()), [](gpointer data) {
         delete static_cast<std::shared_ptr<Scan>*>(data);
       });
-      g_thread_pool_push(pool(root.network), g_object_ref(task), nullptr);
+      g_thread_pool_push(pool(run->workerLane, root.network), g_object_ref(task), nullptr);
     }
   };
 
@@ -509,9 +553,10 @@ namespace filemanager {
   void RecursiveFileDiscovery::Run::schedule() {
     if (g_cancellable_is_cancelled(cancellable))
       return;
+    const std::size_t workerLimit = workerLane == Lane::Discovery ? kWorkersPerLane : 1;
     for (auto it = pending.begin(); it != pending.end();) {
       const auto lane = static_cast<std::size_t>(it->network);
-      if (active[lane] == kWorkersPerLane || activeDevices.contains(it->device)) {
+      if (active[lane] == workerLimit || activeDevices.contains(it->device)) {
         ++it;
         continue;
       }
@@ -555,7 +600,7 @@ namespace filemanager {
   }
 
   void RecursiveFileDiscovery::startPlan(
-      std::shared_ptr<const SearchPlan> plan, bool showHidden, MakeConsumer consumer, Complete complete
+      std::shared_ptr<const SearchPlan> plan, bool showHidden, MakeConsumer consumer, Complete complete, Lane lane
   ) {
     cancel();
     auto run = std::make_shared<Run>();
@@ -566,6 +611,7 @@ namespace filemanager {
     run->showHidden = showHidden;
     run->consumer = std::move(consumer);
     run->complete = std::move(complete);
+    run->workerLane = lane;
     m_run = run;
     run->schedule();
   }

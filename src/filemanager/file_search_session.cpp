@@ -4,7 +4,9 @@
 #include "filemanager/file_search_match.h"
 #include "filemanager/file_sort.h"
 
+#include <algorithm>
 #include <chrono>
+#include <deque>
 #include <iterator>
 #include <unistd.h>
 #include <utility>
@@ -18,6 +20,104 @@ namespace {
 
   using Source = filemanager::RecursiveFileDiscovery::Source;
 
+  class ResultProjection {
+  public:
+    ResultProjection(
+        filemanager::SearchFilters filters, std::shared_ptr<filemanager::ContentSearch> content,
+        filemanager::ContentLane lane
+    )
+        : m_filters(std::move(filters)), m_content(std::move(content)), m_lane(lane) {}
+
+    const filemanager::SearchFilters& filters() const { return m_filters; }
+    bool readsContent() const { return bool(m_content); }
+
+    bool needsCandidate(const std::filesystem::path& path, GCancellable* cancel) {
+      const auto candidate = m_content->lane(FileEntry{.absPath = path}, cancel);
+      return (candidate == filemanager::ContentLane::Extraction) == (m_lane == filemanager::ContentLane::Extraction);
+    }
+
+    void add(FileEntry entry, filemanager::ContentCandidate pinned, GCancellable* cancel) {
+      if (!m_content) {
+        m_result.entries.push_back(std::move(entry));
+        return;
+      }
+      if (m_content->lane(entry, cancel) != m_lane)
+        return;
+      pinned.entry = std::move(entry);
+      if (m_lane == filemanager::ContentLane::Extraction) {
+        constexpr std::size_t queueCapacity = 24;
+        collectExtraction(false);
+        if (m_extraction.size() == queueCapacity) {
+          merge(m_extraction.front().get());
+          m_extraction.pop_front();
+        }
+        if (!g_cancellable_is_cancelled(cancel))
+          m_extraction.push_back(filemanager::ContentSearch::queueExtraction(m_content, std::move(pinned), cancel));
+        return;
+      }
+      if (m_pending.empty())
+        m_queued = std::chrono::steady_clock::now();
+      m_pending.push_back(std::move(pinned));
+      constexpr std::size_t batchSize = 64;
+      if (m_pending.size() == batchSize)
+        scan(cancel);
+    }
+
+    void skip(const std::filesystem::path& path, GCancellable* cancel) {
+      if (m_content->lane(FileEntry{.absPath = path}, cancel) == m_lane)
+        ++m_result.issues.inaccessible;
+    }
+
+    auto take(GCancellable* cancel, bool final) {
+      if (m_lane == filemanager::ContentLane::Extraction)
+        collectExtraction(final);
+      if (m_content
+          && ((final && (m_first || !m_pending.empty()))
+              || (!m_pending.empty()
+                  && (m_first
+                      || m_lane == filemanager::ContentLane::LargePlain
+                      || std::chrono::steady_clock::now() - m_queued >= std::chrono::milliseconds(35)))))
+        scan(cancel);
+      return std::pair(std::exchange(m_result, {}), std::exchange(m_notice, {}));
+    }
+
+  private:
+    void scan(GCancellable* cancel) {
+      auto result = m_content->match(m_pending, cancel);
+      m_pending.clear();
+      if (std::exchange(m_first, false))
+        m_notice = m_content->notice();
+      merge(std::move(result));
+    }
+
+    void collectExtraction(bool wait) {
+      std::erase_if(m_extraction, [this, wait](auto& task) {
+        if (!wait && task.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+          return false;
+        merge(task.get());
+        return true;
+      });
+    }
+
+    void merge(filemanager::ContentResult result) {
+      m_result.issues.merge(result.issues);
+      m_result.entries.insert(
+          m_result.entries.end(), std::make_move_iterator(result.entries.begin()),
+          std::make_move_iterator(result.entries.end())
+      );
+    }
+
+    filemanager::SearchFilters m_filters;
+    std::shared_ptr<filemanager::ContentSearch> m_content;
+    filemanager::ContentLane m_lane;
+    std::vector<filemanager::ContentCandidate> m_pending;
+    std::deque<std::future<filemanager::ContentResult>> m_extraction;
+    filemanager::ContentResult m_result;
+    std::string m_notice;
+    bool m_first = true;
+    std::chrono::steady_clock::time_point m_queued;
+  };
+
   class ResultReader {
   public:
     ResultReader(const filemanager::SearchPlan& plan, const Source& source) : m_plan(plan), m_source(source) {}
@@ -29,27 +129,48 @@ namespace {
     ResultReader& operator=(const ResultReader&) = delete;
 
     void append(
-        std::vector<FileEntry>& results, const std::filesystem::path& parent, const Candidate& candidate,
-        GCancellable* cancel
+        ResultProjection& results, const std::filesystem::path& parent, const Candidate& candidate, GCancellable* cancel
     ) {
       using filemanager::OpenSearchPath;
       const auto path = parent / candidate.name;
+      filemanager::ContentCandidate pinned({}, -1);
+      if (results.readsContent()) {
+        if ((candidate.type != G_FILE_TYPE_REGULAR
+             && (candidate.type != G_FILE_TYPE_SYMBOLIC_LINK || !m_source.openLink))
+            || !results.needsCandidate(path, cancel))
+          return;
+        pinned.fd = m_source.pinRegular(path, candidate.type);
+        if (pinned.fd < 0) {
+          if (candidate.type == G_FILE_TYPE_REGULAR)
+            results.skip(path, cancel);
+          return;
+        }
+      }
       g_autoptr(GFileInfo) info = nullptr;
-      if (candidate.type == G_FILE_TYPE_SYMBOLIC_LINK) {
+      if (pinned.fd >= 0) {
+        info = query(OpenSearchPath::fdPath(pinned.fd), G_FILE_QUERY_INFO_NONE, cancel);
+        if (!info) {
+          results.skip(path, cancel);
+          return;
+        }
+        g_file_info_set_name(info, candidate.name.c_str());
+        g_file_info_set_is_symlink(info, candidate.type == G_FILE_TYPE_SYMBOLIC_LINK);
+      } else if (candidate.type == G_FILE_TYPE_SYMBOLIC_LINK) {
         const OpenSearchPath target(m_plan, path);
         if (target.fd() >= 0)
           info = query(OpenSearchPath::fdPath(target.fd()), G_FILE_QUERY_INFO_NONE, cancel);
+        if (info) {
+          g_file_info_set_name(info, candidate.name.c_str());
+          g_file_info_set_is_symlink(info, true);
+        }
       }
-      if (info) {
-        g_file_info_set_name(info, candidate.name.c_str());
-        g_file_info_set_is_symlink(info, true);
-      } else if (path == m_source.root) {
+      if (!info && path == m_source.root) {
         info = query(OpenSearchPath::fdPath(m_source.rootFd), G_FILE_QUERY_INFO_NONE, cancel);
         if (info) {
           g_file_info_set_name(info, candidate.name.c_str());
           g_file_info_set_is_symlink(info, false);
         }
-      } else {
+      } else if (!info) {
         if (m_source.folderFd >= 0) {
           if (m_pinnedParent.empty())
             m_pinnedParent = OpenSearchPath::fdPath(m_source.folderFd);
@@ -63,7 +184,20 @@ namespace {
         if (!m_pinnedParent.empty())
           info = query(m_pinnedParent / candidate.name, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancel);
       }
-      if (!info)
+      if (!info) {
+        return;
+      }
+      const auto& filters = results.filters();
+      if (filters.size
+          && (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR
+              || !g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_SIZE)
+              || !filters.size->matches(g_file_info_get_size(info))))
+        return;
+      if (filters.modified
+          && (!g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_MODIFIED)
+              || !filters.modified->matches(
+                  static_cast<std::int64_t>(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_MODIFIED))
+              )))
         return;
       auto entry = filemanager::makeFileEntry(info, path, G_FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE);
       if (!g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK)
@@ -73,12 +207,12 @@ namespace {
       }
       if (entry.type.empty() && entry.isDir)
         entry.type = "inode/directory";
-      else if (entry.type.empty()) {
+      else if (entry.type.empty() || (pinned.fd >= 0 && g_content_type_is_unknown(entry.type.c_str()))) {
         g_autofree char* guessed = g_content_type_guess(entry.name.c_str(), nullptr, 0, nullptr);
         if (guessed)
           entry.type = guessed;
       }
-      results.push_back(std::move(entry));
+      results.add(std::move(entry), std::move(pinned), cancel);
     }
 
   private:
@@ -119,20 +253,19 @@ namespace {
           || std::chrono::steady_clock::now() - queuedAt >= std::chrono::milliseconds(35);
     }
 
-    std::optional<std::vector<FileEntry>> match(
+    bool match(
         const filemanager::FzfSearch& options, const std::string& query, GCancellable* cancel,
-        const filemanager::SearchPlan& plan, const Source& source
+        const filemanager::SearchPlan& plan, const Source& source, ResultProjection& results
     ) {
       if (items.empty())
-        return std::vector<FileEntry>{};
+        return true;
       std::vector<std::string_view> names;
       names.reserve(items.size());
       for (const auto& item : items)
         names.push_back(item.candidate.name);
       const auto indices = filemanager::filterWithFzf(options, query, names, cancel);
       if (!indices)
-        return std::nullopt;
-      std::vector<FileEntry> results;
+        return false;
       ResultReader reader(plan, source);
       for (const auto index : *indices) {
         if (g_cancellable_is_cancelled(cancel))
@@ -142,7 +275,7 @@ namespace {
       }
       items.clear();
       first = false;
-      return results;
+      return true;
     }
   };
 } // namespace
@@ -153,11 +286,12 @@ namespace filemanager {
 
   void FileSearchSession::edit(
       const std::filesystem::path& root, std::string query, bool showHidden, Order order, Changed changed,
-      std::function<bool()> canReorder, FzfSearch backend, BuildPlan buildPlan
+      std::function<bool()> canReorder, FzfSearch backend, BuildPlan buildPlan, SearchFilters filters
   ) {
     cancel();
-    if (query.empty())
+    if (query.empty() && !filters.active())
       return;
+    m_filters = std::move(filters);
 
     m_buildPlan = buildPlan ? std::move(buildPlan)
                             : [root] { return resolveSearchScope({}, root, {}, nullptr, {}, discoverSearchMounts()); };
@@ -165,7 +299,7 @@ namespace filemanager {
     m_showHidden = showHidden;
     m_changed = std::move(changed);
     m_canReorder = std::move(canReorder);
-    m_order = order;
+    m_order = m_displayedOrder = order;
     m_fzf = std::move(backend);
     m_status = Status::Searching;
     // Debounce live edits, but invalidate the previous scan and results immediately.
@@ -195,16 +329,35 @@ namespace filemanager {
     }
   }
 
-  void FileSearchSession::cancel() {
+  void FileSearchSession::stopDiscovery() {
     cancelTimeout();
-    m_discovery.cancel();
+    for (auto& lane : m_discovery)
+      lane.cancel();
+    m_pendingLanes = 0;
+    m_completionPending = false;
+  }
+
+  void FileSearchSession::stop() {
+    if (m_status != Status::Searching)
+      return;
+    stopDiscovery();
+    m_status = Status::Cancelled;
+    (void)applyOrder();
+    m_changed(true);
+  }
+
+  void FileSearchSession::cancel() {
+    stopDiscovery();
     cancelSort();
     m_entries.clear();
+    m_pendingEntries.clear();
     m_query.clear();
     m_error.clear();
+    m_contentNotice.clear();
+    m_contentIssues = {};
+    m_filters = {};
     m_changed = {};
     m_canReorder = {};
-    m_discoveryFinished = false;
     m_skipped = 0;
     m_buildPlan = {};
     m_fzf = {};
@@ -213,71 +366,107 @@ namespace filemanager {
   }
 
   RecursiveFileDiscovery::Publish
-  FileSearchSession::publish(FileSearchSession* session, std::vector<FileEntry> results) {
-    if (results.empty())
+  FileSearchSession::publish(FileSearchSession* session, ContentResult results, std::string notice) {
+    if (results.entries.empty() && !results.issues.partial() && results.issues.unsupported == 0 && notice.empty())
       return {};
-    return [session, results = std::move(results)]() mutable {
-      session->m_entries.insert(
-          session->m_entries.end(), std::make_move_iterator(results.begin()), std::make_move_iterator(results.end())
+    return [session, results = std::move(results), notice = std::move(notice)]() mutable {
+      session->m_pendingEntries.insert(
+          session->m_pendingEntries.end(), std::make_move_iterator(results.entries.begin()),
+          std::make_move_iterator(results.entries.end())
       );
-      session->m_changed(false);
+      session->m_contentIssues.merge(results.issues);
+      const bool diagnostics = results.issues.partial() || results.issues.unsupported != 0 || !notice.empty();
+      if (!notice.empty())
+        session->m_contentNotice = std::move(notice);
+      session->notifyResults(session->applyOrder() || diagnostics);
     };
   }
 
   void FileSearchSession::completed(std::string error, std::size_t skipped) {
     m_error = std::move(error);
     m_skipped = skipped;
-    m_discoveryFinished = true;
-    if (!m_error.empty()) {
-      m_status = Status::Failed;
-      m_changed(true);
-    } else {
-      sortResults();
-    }
+    m_completionPending = true;
+    resumeOrdering();
   }
 
   void FileSearchSession::start() {
-    auto plan = std::make_shared<SearchPlan>(m_buildPlan());
-    auto complete = [this](std::string error, std::size_t skipped) { completed(std::move(error), skipped); };
-    if (m_fzf.executable.empty() || m_fzfFallback) {
-      m_discovery.startPlan(
-          plan, m_showHidden,
-          [this, plan, query = foldSearchName(m_query)] {
+    for (auto& lane : m_discovery)
+      lane.cancel();
+    m_error.clear();
+    m_skipped = 0;
+    const auto plan = std::make_shared<SearchPlan>(m_buildPlan());
+    auto content = m_filters.content ? std::make_shared<ContentSearch>(*m_filters.content) : nullptr;
+    using Worker = RecursiveFileDiscovery::Lane;
+    const bool plain = !m_filters.content || m_filters.content->mode != ContentMode::Extracted;
+    const bool extraction = m_filters.content && m_filters.content->mode != ContentMode::Plain;
+    m_pendingLanes = static_cast<std::size_t>(plain) + static_cast<std::size_t>(plain && content) + extraction;
+    if (plain)
+      startLane(plan, content, ContentLane::Plain, Worker::Discovery);
+    if (plain && content)
+      startLane(plan, content, ContentLane::LargePlain, Worker::LargeContent);
+    if (extraction)
+      startLane(plan, content, ContentLane::Extraction, Worker::Extraction);
+  }
+
+  void FileSearchSession::startLane(
+      const std::shared_ptr<SearchPlan>& plan, const std::shared_ptr<ContentSearch>& content, ContentLane lane,
+      RecursiveFileDiscovery::Lane worker
+  ) {
+    // Each lane generates its own bounded batches from the same scope. A slow
+    // extractor cannot stall discovery or retain an unbounded queue of pinned
+    // descriptors, and a burst of extraction candidates does not drop files.
+    auto complete = [this](std::string error, std::size_t skipped) {
+      if (m_error.empty())
+        m_error = std::move(error);
+      m_skipped = std::max(m_skipped, skipped);
+      if (--m_pendingLanes == 0)
+        completed(std::exchange(m_error, {}), m_skipped);
+    };
+    m_discovery[static_cast<std::size_t>(worker)].startPlan(
+        plan, m_showHidden,
+        [this, plan, content, lane, filters = m_filters, options = m_fzf, query = m_query, fallback = m_fzfFallback] {
+          auto projection = std::make_shared<ResultProjection>(filters, content, lane);
+          const auto publishBatch = [this, projection](GCancellable* cancel, bool final) {
+            auto [results, notice] = projection->take(cancel, final);
+            return publish(this, std::move(results), std::move(notice));
+          };
+          if (query.empty() || options.executable.empty() || fallback) {
             return RecursiveFileDiscovery::Consumer{
-                [this, plan, query](
+                [plan, projection, publishBatch, folded = foldSearchName(query)](
                     const std::filesystem::path& parent, std::span<const Candidate> candidates, const Source& source,
                     GCancellable* cancel
                 ) {
-                  std::vector<FileEntry> results;
                   ResultReader reader(*plan, source);
                   for (const auto& candidate : candidates) {
                     if (g_cancellable_is_cancelled(cancel))
                       break;
-                    if (foldSearchName(candidate.name).contains(query))
-                      reader.append(results, parent, candidate, cancel);
+                    if (folded.empty() || foldSearchName(candidate.name).contains(folded))
+                      reader.append(*projection, parent, candidate, cancel);
                   }
-                  return publish(this, std::move(results));
+                  return publishBatch(cancel, false);
                 },
-                {}
+                [content, publishBatch](const Source&, GCancellable* cancel) {
+                  return content ? publishBatch(cancel, true) : RecursiveFileDiscovery::Publish{};
+                }
             };
-          },
-          std::move(complete)
-      );
-      return;
-    }
+          }
 
-    m_discovery.startPlan(
-        plan, m_showHidden,
-        [this, plan, options = m_fzf, query = m_query] {
           auto batch = std::make_shared<FzfBatch>();
-          auto flush = [this, plan, batch, options,
-                        query](const Source& source, GCancellable* cancel) -> RecursiveFileDiscovery::Publish {
-            auto results = batch->match(options, query, cancel, *plan, source);
-            if (results)
-              return publish(this, std::move(*results));
+          const auto flush = [this, plan, projection, publishBatch, batch, options, query](
+                                 const Source& source, GCancellable* cancel, bool final
+                             ) -> RecursiveFileDiscovery::Publish {
+            auto batchSource = source;
+            batchSource.folderFd = -1;
+            if (batch->match(options, query, cancel, *plan, batchSource, *projection))
+              return publishBatch(cancel, final);
             return [this] {
               // Discard the partial fzf projection and restart with native matching.
+              cancelSort();
               m_entries.clear();
+              m_pendingEntries.clear();
+              m_displayedOrder = m_order;
+              m_contentIssues = {};
+              m_contentNotice.clear();
               m_fzfFallback = true;
               start();
               m_changed(false);
@@ -289,20 +478,64 @@ namespace filemanager {
                   GCancellable* cancel
               ) {
                 batch->push(parent, candidates);
-                return batch->ready() ? flush({source.root, source.rootFd, -1}, cancel)
-                                      : RecursiveFileDiscovery::Publish{};
+                return batch->ready() ? flush(source, cancel, false) : RecursiveFileDiscovery::Publish{};
               },
-              flush
+              [flush](const Source& source, GCancellable* cancel) { return flush(source, cancel, true); }
           };
         },
-        std::move(complete)
+        std::move(complete), worker
     );
   }
 
   void FileSearchSession::setOrder(Order order) {
+    if (order == m_order)
+      return;
+    cancelSort();
     m_order = order;
-    if (m_discoveryFinished && m_status != Status::Failed)
+    resumeOrdering();
+  }
+
+  void FileSearchSession::resumeOrdering() { notifyResults(applyOrder()); }
+
+  bool FileSearchSession::applyOrder() {
+    const bool needsSort = m_displayedOrder != m_order && m_entries.size() > 1;
+    if (m_sort || (!needsSort && m_pendingEntries.empty()) || (m_canReorder && !m_canReorder()))
+      return false;
+    if (needsSort) {
       sortResults();
+      return false;
+    }
+    m_displayedOrder = m_order;
+    mergePendingEntries();
+    return true;
+  }
+
+  void FileSearchSession::notifyResults(bool entriesChanged) {
+    if (m_completionPending && !m_sort) {
+      m_completionPending = false;
+      m_status = m_error.empty() ? Status::Finished : Status::Failed;
+      m_changed(true);
+    } else if (entriesChanged) {
+      m_changed(false);
+    }
+  }
+
+  void FileSearchSession::mergePendingEntries() {
+    if (m_pendingEntries.empty())
+      return;
+    const auto less = [order = m_displayedOrder](const FileEntry& lhs, const FileEntry& rhs) {
+      return fileEntryLess(lhs, rhs, order.field, order.direction, order.foldersFirst, order.hiddenLast);
+    };
+    std::ranges::stable_sort(m_pendingEntries, less);
+    const auto oldSize = m_entries.size();
+    m_entries.insert(
+        m_entries.end(), std::make_move_iterator(m_pendingEntries.begin()),
+        std::make_move_iterator(m_pendingEntries.end())
+    );
+    m_pendingEntries.clear();
+    std::inplace_merge(
+        m_entries.begin(), m_entries.begin() + static_cast<std::ptrdiff_t>(oldSize), m_entries.end(), less
+    );
   }
 
   void FileSearchSession::cancelSort() {
@@ -313,14 +546,8 @@ namespace filemanager {
   }
 
   void FileSearchSession::sortResults() {
-    cancelSort();
-    if (m_entries.size() < 2) {
-      m_status = Status::Finished;
-      m_changed(true);
-      return;
-    }
-
-    // Keep the progressive listing usable while sorting a snapshot off the UI thread.
+    // Keep the old view usable during a column sort. New batches wait for the
+    // new order and are merged into the sorted snapshot when it is ready.
     struct SortRequest {
       std::vector<FileEntry> entries;
       Order order;
@@ -334,12 +561,19 @@ namespace filemanager {
             return;
 
           auto& self = *static_cast<FileSearchSession*>(data);
+          if (g_task_get_cancellable(completed) != self.m_sort)
+            return;
           g_clear_object(&self.m_sort);
+          if (self.m_canReorder && !self.m_canReorder()) {
+            self.notifyResults(false);
+            return;
+          }
+
           auto& request = *static_cast<SortRequest*>(g_task_get_task_data(completed));
-          if (!self.m_canReorder || self.m_canReorder())
-            self.m_entries.swap(request.entries);
-          self.m_status = Status::Finished;
-          self.m_changed(true);
+          self.m_entries.swap(request.entries);
+          self.m_displayedOrder = request.order;
+          self.mergePendingEntries();
+          self.notifyResults(true);
         },
         this
     );

@@ -20,6 +20,7 @@ class Flex;
 class InputArea;
 class InputDispatcher;
 class Label;
+class Spinner;
 struct PointerEvent;
 class Renderer;
 class ScrollView;
@@ -57,6 +58,7 @@ namespace filemanager {
     bool rebuildIfDirty();
     void syncLayout(Renderer& renderer);
     void updateTheme();
+    void syncSearchActivity(TabId tabId);
 
     bool handlePointer(const PointerEvent& event, float x, float y);
     void cancelGesture();
@@ -74,6 +76,7 @@ namespace filemanager {
       Flex* container = nullptr;
       InputArea* hitArea = nullptr;
       FileIcon* icon = nullptr;
+      Spinner* searchSpinner = nullptr;
       Label* label = nullptr;
       Button* closeButton = nullptr;
       bool active = false;

@@ -38,6 +38,7 @@
 #include "ui/controls/progress_bar.h"
 #include "ui/controls/scroll_view.h"
 #include "ui/controls/separator.h"
+#include "ui/controls/spinner.h"
 #include "ui/dialogs/dialog_background_artwork.h"
 #include "ui/dialogs/file_entry_row.h"
 #include "ui/dialogs/file_entry_tile.h"
@@ -61,10 +62,13 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <format>
 #include <future>
 #include <iomanip>
+#include <locale>
 #include <linux/input-event-codes.h>
 #include <sstream>
+#include <stdexcept>
 #include <sys/stat.h>
 #include <tuple>
 #include <utility>
@@ -315,18 +319,6 @@ namespace {
     return {value, std::string(units[index]), index};
   }
 
-  void applyNytheraBevel(Flex& panel, float radius) {
-    panel.setRadius(radius);
-    panel.setCornerShapes(
-        CornerShapes{
-            .tl = CornerShape::Chamfered,
-            .tr = CornerShape::Chamfered,
-            .br = CornerShape::Chamfered,
-            .bl = CornerShape::Chamfered,
-        }
-    );
-  }
-
   void useSubtleSelection(Button& button, bool muted = false) {
     auto palette = Button::defaultPalette(button.variant());
     palette.selected = Button::ButtonStateColors{
@@ -403,11 +395,15 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               m_statusMessageUntil = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             else
               m_statusMessageUntil = {};
-            if (active.needsRefresh) {
-              active.pendingScrollOffsetAfterRefresh = active.displayedScrollState().offset;
+            const bool searchView = active.session.search().active();
+            const bool needsRefresh = active.needsRefresh;
+            if (needsRefresh) {
+              if (!searchView)
+                active.pendingScrollOffsetAfterRefresh = active.displayedScrollState().offset;
               active.needsRefresh = false;
-              active.session.refreshPreservingSelection();
-            } else {
+              active.session.refreshPreservingSelection(false);
+            }
+            if (!needsRefresh || searchView) {
               if (m_grid != nullptr) {
                 m_grid->notifyDataChanged();
                 restoreSelection(false);
@@ -455,6 +451,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
             if (m_surface)
               m_surface->requestLayout();
           },
+      .onSearchActivityChanged = [this](filemanager::TabId id) { m_tabBar.syncSearchActivity(id); },
       .onRequestCloseLastTab = [this] { requestQuit(m_surface.get()); },
       .isSizeColumnVisible = [this] { return m_listHeader.columnLayout().visible[columnIndex(FileColumn::Size)]; },
       .isRenaming =
@@ -467,6 +464,11 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               tab->needsRefresh = true;
           },
       .onCancelFileGesture = [this] { cancelFileGesture(); },
+      .onReorderSearchResults =
+          [this] {
+            if (m_transfers.isDragPending() || m_transfers.isDraggingFiles() || (m_grid && m_grid->rubberBandActive()))
+              cancelFileGesture();
+          },
       .onActiveBeforeNavigate =
           [this](filemanager::BrowserTab& tab, const std::filesystem::path&, bool pathChanged) {
             if (tab.session.search().active())
@@ -516,6 +518,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               }
             }
             restoreSelection(chooseFirst);
+            updateStatusBar();
             if (m_surface)
               m_surface->requestLayout();
           },
@@ -528,6 +531,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               m_grid->notifyDataChanged();
               restoreSelection();
             }
+            updateStatusBar();
             if (m_surface)
               m_surface->requestLayout();
           },
@@ -1300,6 +1304,8 @@ void FileManager::cancelRename() {
   if (m_refreshAfterRename) {
     m_refreshAfterRename = false;
     enumerate(session.path());
+  } else {
+    session.resumeSearchOrdering();
   }
 }
 
@@ -1524,12 +1530,17 @@ int FileManager::run() {
           self->m_grid = nullptr;
           self->m_locationInput = nullptr;
           self->m_searchBar = nullptr;
+          self->m_searchTools = nullptr;
+          self->m_searchFilterUi = {};
           self->m_searchInput = nullptr;
-          self->m_searchStatus = nullptr;
           self->m_searchButton = nullptr;
           self->m_searchModeButton = nullptr;
           self->m_searchScopeButton = nullptr;
           self->m_statusLabel = nullptr;
+          self->m_statusDetailLabel = nullptr;
+          self->m_searchStatus = nullptr;
+          self->m_searchSpinner = nullptr;
+          self->m_searchStatusArea = nullptr;
           if (!self->m_operations.active() && self->m_transfers.pendingClipboardReads() == 0)
             self->m_running = false;
           return G_SOURCE_REMOVE;
@@ -1772,7 +1783,7 @@ void FileManager::pinPlace(const std::filesystem::path& path) {
 }
 
 void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry) {
-  if (activateSearchScopeEntry(entry))
+  if (activateSearchScopeEntry(entry) || activateSearchFilterEntry(entry))
     return;
   if (entry.id >= kFirstSearchMode
       && entry.id < kFirstSearchMode + static_cast<int>(filemanager::kSearchModeLabels.size())) {
@@ -2807,6 +2818,17 @@ void FileManager::setStatus(std::string text) {
 
 void FileManager::updateSelectionSummary() { updateStatusBar(); }
 
+std::string FileManager::formatCount(std::size_t count) {
+  static const auto locale = [] {
+    try {
+      return std::locale("");
+    } catch (const std::runtime_error&) {
+      return std::locale::classic();
+    }
+  }();
+  return std::format(locale, "{:L}", count);
+}
+
 void FileManager::updateStatusBar() {
   if (!m_statusLabel)
     return;
@@ -2870,16 +2892,14 @@ void FileManager::updateStatusBar() {
         hasSize = true;
       }
     }
-    primary = std::to_string(tab.selectedPaths.size()) + " selected";
-    details = std::to_string(folders) + " folders, " + std::to_string(files) + " files";
+    primary = formatCount(tab.selectedPaths.size()) + " selected";
+    details = formatCount(folders) + " folders, " + formatCount(files) + " files";
     if (hasSize) {
       const auto size = compactSize(bytes);
       std::ostringstream out;
       out << std::fixed << std::setprecision(size.value == std::round(size.value) ? 0 : 1) << size.value;
       details += "  |  " + out.str() + " " + size.unit;
     }
-  } else if (session.search().active()) {
-    cancelSelectionInfoQuery();
   } else {
     cancelSelectionInfoQuery();
     std::size_t folders = 0, files = 0;
@@ -2892,15 +2912,15 @@ void FileManager::updateStatusBar() {
         bytes += entry.size;
       }
     }
-    primary = std::to_string(folders) + " folders";
-    details = std::to_string(files) + " files";
+    primary = formatCount(folders) + (folders == 1 ? " folder" : " folders");
+    details = formatCount(files) + (files == 1 ? " file" : " files");
     if (files) {
       const auto size = compactSize(bytes);
       std::ostringstream out;
       out << std::fixed << std::setprecision(size.value == std::round(size.value) ? 0 : 1) << size.value;
       details += " · " + out.str() + " " + size.unit;
     }
-    if (!session.browsingTrash()) {
+    if (!session.search().active() && !session.browsingTrash()) {
       if (tab.statusFreeSpacePath() != session.path())
         queryStatusFreeSpaceAsync(session.path());
       if (tab.statusFreeSpacePath() == session.path() && tab.freeSpaceBytes().has_value()) {
@@ -2914,9 +2934,15 @@ void FileManager::updateStatusBar() {
   m_statusLabel->setText(primary);
   if (m_statusDetailLabel)
     m_statusDetailLabel->setText(details.empty() ? "" : "  |  " + details);
-  if (m_statusFreeLabel)
-    m_statusFreeLabel->setText(freeSpace);
-  m_statusLabel->setTooltip("");
+  if (freeSpace.empty()) {
+    if (m_statusLabel->hasTooltip())
+      m_statusLabel->clearTooltip();
+  } else {
+    const auto currentTooltip = m_statusLabel->tooltipContent();
+    const auto* currentText = std::get_if<std::string>(&currentTooltip);
+    if (!currentText || *currentText != freeSpace)
+      m_statusLabel->setTooltip(std::move(freeSpace));
+  }
 }
 
 void FileManager::updateWindowTitle() {
@@ -2941,7 +2967,7 @@ std::unique_ptr<Flex> FileManager::buildHeaderAppBar() {
       ),
       Style::borderWidth
   );
-  applyNytheraBevel(*appBar, Style::scaledRadiusMd(1.0F));
+  appBar->setRadius(Style::scaledRadiusMd(1.0F));
 
   auto appName = std::make_unique<Flex>();
   m_appBrandContainer = appName.get();
@@ -3468,6 +3494,54 @@ void FileManager::toggleSortOrder() { m_listHeader.toggleSortOrder(); }
 
 void FileManager::syncSortControls() { m_listHeader.syncSortControls(); }
 
+std::unique_ptr<Flex> FileManager::buildStatusRow(float fontSize) {
+  auto statusRow = std::make_unique<Flex>();
+  statusRow->setAlign(FlexAlign::Center);
+  statusRow->setMirrorInRtl(false);
+  statusRow->setGap(Style::spaceSm);
+  statusRow->setFlexGrow(1.0F);
+
+  auto summary = std::make_unique<Flex>();
+  summary->setAlign(FlexAlign::Center);
+  summary->setMirrorInRtl(false);
+  summary->setFlexGrow(1.0F);
+  summary->setClipChildren(true);
+  auto primary = std::make_unique<Label>();
+  primary->setFontSize(fontSize);
+  primary->setMaxLines(1);
+  primary->setEllipsize(TextEllipsize::Middle);
+  primary->setColor(colorSpecFromRole(ColorRole::OnSurface));
+  m_statusLabel = static_cast<Label*>(summary->addChild(std::move(primary)));
+  auto detail = std::make_unique<Label>();
+  detail->setFontSize(fontSize);
+  detail->setMaxLines(1);
+  detail->setEllipsize(TextEllipsize::Middle);
+  detail->setFlexGrow(1.0F);
+  detail->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
+  m_statusDetailLabel = static_cast<Label*>(summary->addChild(std::move(detail)));
+  statusRow->addChild(std::move(summary));
+
+  auto search = std::make_unique<Flex>();
+  search->setGap(Style::spaceXs);
+  search->setMirrorInRtl(false);
+  auto spinner = std::make_unique<Spinner>();
+  spinner->setSpinnerSize(fontSize);
+  spinner->setVisible(false);
+  m_searchSpinner = static_cast<Spinner*>(search->addChild(std::move(spinner)));
+  m_searchSpinner->setAnimationManager(&m_menuAnimations);
+  auto status = std::make_unique<Label>();
+  status->setFontSize(fontSize);
+  status->setMaxLines(1);
+  status->setEllipsize(TextEllipsize::End);
+  status->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
+  status->setVisible(false);
+  m_searchStatus = static_cast<Label*>(search->addChild(std::move(status)));
+  m_searchStatusArea = static_cast<Flex*>(statusRow->addChild(std::move(search)));
+  m_searchStatusArea->setVisible(false);
+
+  return statusRow;
+}
+
 void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
   (void)needsUpdate;
   if (!m_surface || m_surface->width() == 0 || m_surface->height() == 0)
@@ -3497,7 +3571,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
         ),
         Style::borderWidth
     );
-    applyNytheraBevel(*m_root, Style::scaledRadiusLg(1.0F));
+    m_root->setRadius(Style::scaledRadiusLg(1.0F));
 
     auto sidebar = std::make_unique<Flex>();
     sidebar->setDirection(FlexDirection::Vertical);
@@ -3515,7 +3589,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
         ),
         Style::borderWidth
     );
-    applyNytheraBevel(*sidebar, Style::scaledRadiusMd(1.0F));
+    sidebar->setRadius(Style::scaledRadiusMd(1.0F));
     auto placesScroll = std::make_unique<ScrollView>();
     placesScroll->setFlexGrow(1.0F);
     placesScroll->setScrollbarVisible(true);
@@ -3537,14 +3611,16 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     auto mainColumn = std::make_unique<Flex>();
     mainColumn->setDirection(FlexDirection::Vertical);
     mainColumn->setAlign(FlexAlign::Stretch);
-    mainColumn->setGap(Style::spaceSm);
+    constexpr float toolbarGap = Style::spaceSm;
+    constexpr float paneGap = 2.0F;
+    mainColumn->setGap(toolbarGap);
     mainColumn->setFlexGrow(1.0F);
     mainColumn->addChild(buildHeaderAppBar());
 
     auto mainPane = std::make_unique<Flex>();
     mainPane->setDirection(FlexDirection::Vertical);
     mainPane->setAlign(FlexAlign::Stretch);
-    mainPane->setGap(2.0F);
+    mainPane->setGap(paneGap);
     mainPane->setFlexGrow(1.0F);
     m_statusHeight = m_settings.loadStatusHeight(m_statusHeight, kStatusMinHeight, kStatusMaxHeight);
 
@@ -3600,7 +3676,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
         ),
         Style::borderWidth
     );
-    applyNytheraBevel(*locationBar, Style::scaledRadiusSm(1.0F));
+    locationBar->setRadius(Style::scaledRadiusSm(1.0F));
     auto location = std::make_unique<Input>();
     m_locationInput = location.get();
     m_locationInput->setValue(activeSession().path().string());
@@ -3635,7 +3711,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     mainPane->addChild(std::move(navigation));
 
     mainPane->addChild(m_tabBar.buildUi());
-    buildSearchBar(*mainPane);
+    buildSearchBar(*mainPane, toolbarGap - paneGap);
 
     mainPane->addChild(m_listHeader.buildHeader());
     mainPane->addChild(
@@ -3660,7 +3736,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
         ),
         Style::borderWidth
     );
-    applyNytheraBevel(*m_grid, Style::scaledRadiusMd(1.0F));
+    m_grid->setRadius(Style::scaledRadiusMd(1.0F));
     m_grid->setAdapter(m_adapter.get());
     m_grid->setSquareCells(false);
     m_listHeader.ensureViewScaleLoaded();
@@ -3786,36 +3862,8 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     mainPane->addChild(std::move(grid));
     mainPane->addChild(m_listHeader.buildHorizontalScrollbar());
 
-    auto status = std::make_unique<Label>();
-    m_statusLabel = status.get();
-    m_statusLabel->setText("Loading…");
     const float statusFontSize =
         12.0F + (m_statusHeight - kStatusMinHeight) * (10.0F / (kStatusMaxHeight - kStatusMinHeight));
-    m_statusLabel->setFontSize(statusFontSize);
-    m_statusLabel->setMaxLines(1);
-    m_statusLabel->setEllipsize(TextEllipsize::Middle);
-    m_statusLabel->setColor(colorSpecFromRole(ColorRole::OnSurface));
-    auto statusDetails = std::make_unique<Label>();
-    m_statusDetailLabel = statusDetails.get();
-    m_statusDetailLabel->setFontSize(statusFontSize);
-    m_statusDetailLabel->setMaxLines(1);
-    m_statusDetailLabel->setEllipsize(TextEllipsize::Middle);
-    m_statusDetailLabel->setFlexGrow(1.0F);
-    m_statusDetailLabel->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
-    auto statusFree = std::make_unique<Label>();
-    m_statusFreeLabel = statusFree.get();
-    m_statusFreeLabel->setFontSize(statusFontSize);
-    m_statusFreeLabel->setMaxLines(1);
-    m_statusFreeLabel->setEllipsize(TextEllipsize::End);
-    m_statusFreeLabel->setTextAlign(TextAlign::End);
-    m_statusFreeLabel->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
-    auto statusRow = std::make_unique<Flex>();
-    statusRow->setAlign(FlexAlign::Center);
-    statusRow->setGap(Style::spaceSm);
-    statusRow->setFlexGrow(1.0F);
-    statusRow->addChild(std::move(status));
-    statusRow->addChild(std::move(statusDetails));
-    statusRow->addChild(std::move(statusFree));
     auto statusDivider = std::make_unique<Flex>();
     statusDivider->setMinHeight(4.0F);
     statusDivider->setMaxHeight(4.0F);
@@ -3838,7 +3886,8 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     statusStrip->setMaxHeight(m_statusHeight);
     statusStrip->setHitTestVisible(true);
     m_statusStrip = static_cast<Flex*>(mainPane->addChild(std::move(statusStrip)));
-    m_statusStrip->addChild(std::move(statusRow));
+    m_statusStrip->addChild(buildStatusRow(statusFontSize));
+    updateStatusBar();
     m_statusStrip->setPadding(std::clamp((m_statusHeight - statusFontSize) * 0.5F, 2.0F, 7.0F), 10.0F);
     mainColumn->addChild(std::move(mainPane));
     m_root->addChild(std::move(mainColumn));
@@ -3877,8 +3926,23 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     const int headerWidth =
         static_cast<int>(static_cast<float>(m_surface->width()) - 2.0F * kWindowPadding - sidebarSpace);
     m_menus.syncResponsiveMenuBar(headerWidth);
+    updateSearchFilterWidth(static_cast<float>(headerWidth), renderer);
     updateAdminHeaderUi(headerWidth);
-    updateSearchScopeWidth(static_cast<float>(m_surface->width()) - (showSidebar ? effectiveSidebar : 0.0F));
+    auto* clearFilters = m_searchFilterUi.clear;
+    const float scopeWidthBudget = clearFilters->visible()
+        ? static_cast<float>(headerWidth) - clearFilters->measure(renderer, {}).width - m_searchBar->gap()
+        : static_cast<float>(m_surface->width()) - (showSidebar ? effectiveSidebar : 0.0F);
+    updateSearchScopeWidth(scopeWidthBudget);
+    const float statusWidth =
+        std::max(1.0F, static_cast<float>(headerWidth) - m_statusStrip->paddingLeft() - m_statusStrip->paddingRight());
+    float summaryWidth = statusWidth;
+    if (m_searchStatusArea->visible()) {
+      m_searchStatus->setMaxWidth(std::floor(statusWidth * 0.45F));
+      summaryWidth -= m_searchStatusArea->measure(renderer, {}).width + Style::spaceSm;
+    }
+    m_statusLabel->setMaxWidth(
+        std::max(1.0F, m_statusDetailLabel->text().empty() ? summaryWidth : summaryWidth * 0.6F)
+    );
     m_root->setSize(static_cast<float>(m_surface->width()), static_cast<float>(m_surface->height()));
     m_root->layout(renderer);
     m_tabBar.syncLayout(renderer);
@@ -4153,7 +4217,8 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
       m_statusStrip->setPadding(std::clamp((m_statusHeight - fontSize) * 0.5F, 2.0F, 7.0F), 10.0F);
       m_statusLabel->setFontSize(fontSize);
       m_statusDetailLabel->setFontSize(fontSize);
-      m_statusFreeLabel->setFontSize(fontSize);
+      m_searchStatus->setFontSize(fontSize);
+      m_searchSpinner->setSpinnerSize(fontSize);
       m_surface->requestLayout();
       return;
     }
@@ -4790,7 +4855,10 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       return;
     }
     if (activeSession().searchOpen()) {
-      closeSearch();
+      if (activeSession().search().status() == filemanager::FileSearchSession::Status::Searching)
+        activeSession().stopSearch();
+      else
+        closeSearch();
       return;
     }
     if (!activeTab().selectedPaths.empty())
@@ -4830,7 +4898,10 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
     return;
   }
 
-  if (m_searchInput && focused == m_searchInput->inputArea()) {
+  const bool inFilterInput = focused && std::ranges::any_of(m_searchFilterUi.values, [focused](const Input* input) {
+                               return input && focused == input->inputArea();
+                             });
+  if ((m_searchInput && focused == m_searchInput->inputArea()) || inFilterInput) {
     if ((mods == 0U && event.sym == XKB_KEY_F5)
         || (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_r || event.sym == XKB_KEY_R))) {
       if (!event.repeat)

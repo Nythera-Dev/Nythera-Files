@@ -13,6 +13,8 @@ optdepends=(
   'gvfs-smb: SMB/CIFS network share browsing'
   'gvfs-mtp: MTP device browsing'
   'gvfs-nfs: NFS network share browsing'
+  'ripgrep: search plain-text file contents'
+  'ripgrep-all: search extracted document and archive contents'
 )
 makedepends=(git meson ninja pkgconf)
 

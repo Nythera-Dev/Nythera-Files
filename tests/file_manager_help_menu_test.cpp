@@ -375,8 +375,8 @@ public:
 
       const auto* rootBg = backgroundRect(modal.m_root.get());
       TEST_CHECK(rootBg != nullptr);
-      TEST_CHECK(rootBg->style().corners.tl == CornerShape::Chamfered);
-      TEST_CHECK(rootBg->style().corners.br == CornerShape::Chamfered);
+      TEST_CHECK(rootBg->style().corners.tl == CornerShape::Convex);
+      TEST_CHECK(rootBg->style().corners.br == CornerShape::Convex);
       TEST_CHECK(rootBg->style().border == initialPalette.primary);
 
       std::vector<std::string> texts;

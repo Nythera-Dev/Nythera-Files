@@ -60,18 +60,6 @@ namespace filemanager {
       return std::nullopt;
     }
 
-    void applyNytheraBevel(Flex& panel, float radius) {
-      panel.setRadius(radius);
-      panel.setCornerShapes(
-          CornerShapes{
-              .tl = CornerShape::Chamfered,
-              .tr = CornerShape::Chamfered,
-              .br = CornerShape::Chamfered,
-              .bl = CornerShape::Chamfered,
-          }
-      );
-    }
-
     // Drag-and-drop edge autoscroll adapted from Luciole (src/app/page/drag_drop_controller.cpp).
     // MIT License — Copyright (c) 2026 noctalia-dev
     // Permission is hereby granted, free of charge, to any person obtaining a copy of this software
@@ -1561,7 +1549,7 @@ namespace filemanager {
       preview->setAlign(FlexAlign::Center);
       constexpr float previewOpacity = 0.94F;
       preview->setFill(colorSpecFromRole(ColorRole::SurfaceContainerHigh, previewOpacity));
-      applyNytheraBevel(*preview, Style::scaledRadiusMd(1.0F));
+      preview->setRadius(Style::scaledRadiusMd(1.0F));
       auto icon = std::make_unique<FileIcon>();
       icon->setHitTestVisible(false);
       icon->setGlyphSize(36.0F);

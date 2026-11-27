@@ -37,6 +37,7 @@ namespace filemanager {
       std::function<bool()> isRenaming;
       std::function<void()> onDeferRefreshDuringRename;
       std::function<void()> onCancelFileGesture;
+      std::function<void()> onReorderSearchResults;
       std::function<void(const std::filesystem::path& targetPath, bool pathChanged)> onBeforeNavigate;
       std::function<void(const std::filesystem::path& newPath)> onBeforePathChange;
       std::function<void(const std::filesystem::path& path, bool trash)> onAfterNavigatePathSet;
@@ -84,8 +85,8 @@ namespace filemanager {
 
     void navigate(const std::filesystem::path& requestedPath, bool recordHistory = true);
     void navigateTrash();
-    void enumerate(const std::filesystem::path& path);
-    void refreshPreservingSelection();
+    void enumerate(const std::filesystem::path& path, bool refreshSearch = true);
+    void refreshPreservingSelection(bool refreshSearch = true);
     void cancelEnumeration();
     [[nodiscard]] AdminRequestId privilegedListingId() const noexcept { return m_privilegedListingId; }
     void discardPrivilegedListing();
@@ -112,6 +113,12 @@ namespace filemanager {
     [[nodiscard]] SearchMode searchMode() const;
     [[nodiscard]] bool fzfSearchActive() const { return !m_fzfExecutable.empty() && !m_search.usingFallback(); }
     void submitSearch() { m_search.submit(); }
+    void stopSearch() { m_search.stop(); }
+    void resumeSearchOrdering() { m_search.resumeOrdering(); }
+    [[nodiscard]] SearchFilterDraft& searchFilters() { return m_searchFilters; }
+    [[nodiscard]] const SearchFilterDraft& searchFilters() const { return m_searchFilters; }
+    [[nodiscard]] bool searchFiltersExpanded() const { return m_searchFiltersExpanded; }
+    void setSearchFiltersExpanded(bool expanded) { m_searchFiltersExpanded = expanded; }
     void closeSearch();
     [[nodiscard]] bool canSearch() const { return !m_browsingTrash && !isPrivilegedBackendActive(); }
     [[nodiscard]] bool searchOpen() const noexcept { return m_searchOpen; }
@@ -201,6 +208,8 @@ namespace filemanager {
     std::vector<FileEntry> m_entries;
     std::vector<FileEntry> m_loadingEntries;
     FileSearchSession m_search;
+    SearchFilterDraft m_searchFilters;
+    bool m_searchFiltersExpanded = false;
     std::string m_fzfExecutable;
     SearchMode m_defaultSearchMode = SearchMode::Contiguous;
     SearchMode m_selectedSearchMode = SearchMode::Contiguous;

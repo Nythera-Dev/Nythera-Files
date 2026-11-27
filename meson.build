@@ -111,8 +111,11 @@ _nythera_files_sources = files(
   'src/filemanager/file_manager_columns.cpp',
   'src/filemanager/directory_session.cpp',
   'src/filemanager/file_search_session.cpp',
+  'src/filemanager/search_filters.cpp',
+  'src/filemanager/search_content.cpp',
   'src/filemanager/fzf_search.cpp',
   'src/filemanager/file_manager_search.cpp',
+  'src/filemanager/file_manager_search_filters.cpp',
   'src/filemanager/file_manager_search_scopes.cpp',
   'src/filemanager/file_manager_custom_search.cpp',
   'src/filemanager/file_manager_search_profiles.cpp',
@@ -307,6 +310,13 @@ if build_tests
     override_options: ['b_ndebug=false'],
   )
   test('file_manager_search', file_manager_search_test_exe, timeout: 30)
+
+  file_manager_search_filters_test_exe = executable('file_manager_search_filters_test',
+    sources: files('tests/file_manager_search_filters_test.cpp'),
+    dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('file_manager_search_filters', file_manager_search_filters_test_exe, timeout: 30)
 
   search_scope_test_exe = executable('search_scope_test',
     sources: files('tests/search_scope_test.cpp'),

@@ -34,7 +34,7 @@ namespace filemanager {
         HelpDialogController::ShortcutEntry{"Go to Home Folder", "Alt+Home"},
         HelpDialogController::ShortcutEntry{"Edit Location", "Ctrl+L / Alt+D"},
         HelpDialogController::ShortcutEntry{"Search Files and Folders", "Ctrl+F"},
-        HelpDialogController::ShortcutEntry{"Close Search", "Esc"},
+        HelpDialogController::ShortcutEntry{"Stop Active Search or Close Search", "Esc"},
         HelpDialogController::ShortcutEntry{"Move Selection Up", "Up"},
         HelpDialogController::ShortcutEntry{"Move Selection Down", "Down"},
         HelpDialogController::ShortcutEntry{"Quit", "Ctrl+Q"},
@@ -87,18 +87,6 @@ namespace filemanager {
         HelpDialogController::ShortcutGroup{"View", kViewShortcuts},
     };
 
-    void applyNytheraBevel(Flex& panel, float radius) {
-      panel.setRadius(radius);
-      panel.setCornerShapes(
-          CornerShapes{
-              .tl = CornerShape::Chamfered,
-              .tr = CornerShape::Chamfered,
-              .br = CornerShape::Chamfered,
-              .bl = CornerShape::Chamfered,
-          }
-      );
-    }
-
     std::unique_ptr<Flex> makeDialogCard(ModalDialogHost& dialogHost, float gap) {
       auto card = std::make_unique<Flex>();
       dialogHost.registerCard(card.get());
@@ -108,7 +96,7 @@ namespace filemanager {
       card->setPadding(10.0F, 12.0F);
       card->setFill(colorSpecFromRole(ColorRole::SurfaceContainer));
       card->setBorder(colorSpecFromRole(ColorRole::OutlineVariant), Style::borderWidth);
-      applyNytheraBevel(*card, Style::scaledRadiusSm(1.0F));
+      card->setRadius(Style::scaledRadiusSm(1.0F));
       return card;
     }
 

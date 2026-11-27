@@ -58,6 +58,7 @@
 #include <vector>
 
 class Button;
+class Checkbox;
 class Box;
 class DialogBackgroundArtwork;
 class Separator;
@@ -66,6 +67,7 @@ class Glyph;
 class Input;
 class InputArea;
 class Label;
+class Spinner;
 class ScrollView;
 class Image;
 
@@ -154,7 +156,10 @@ private:
   void setStatus(std::string text);
   void updateNavigationControls();
   void updateSelectionSummary();
+  static std::string formatCount(std::size_t count);
   void updateStatusBar();
+  void updateSearchStatus();
+  std::unique_ptr<Flex> buildStatusRow(float fontSize);
   void cancelFileGesture() { m_transfers.cancelFileGesture(); }
   void textPrompt(
       std::string title, std::string message, bool password, std::function<void(std::optional<std::string>)> response
@@ -225,7 +230,16 @@ private:
   std::optional<std::string>
   protectedThumbnailPath(filemanager::BrowserTab& tab, const FileEntry& entry, std::size_t index);
   void rebuildBreadcrumbs();
-  void buildSearchBar(Flex& pane);
+  void buildSearchBar(Flex& pane, float extraTopSpacing);
+  void buildSearchFilters(Flex& pane);
+  void syncSearchFilters();
+  void updateSearchFilterWidth(float paneWidth, Renderer& renderer);
+  void changeSearchMetadata(const std::function<void(filemanager::SearchFilterDraft&)>& change);
+  void refreshSearchQuery(std::string query);
+  void submitSearchFilters();
+  void openSearchFilterMenu(std::size_t field);
+  bool activateSearchFilterEntry(const ContextMenuControlEntry& entry);
+  void openSearchDatePicker(bool second);
   void focusSearch();
   void toggleSearch();
   void closeSearch();
@@ -529,7 +543,25 @@ private:
   Input* m_locationInput = nullptr;
   Input* m_searchInput = nullptr;
   Flex* m_searchBar = nullptr;
-  Label* m_searchStatus = nullptr;
+  Flex* m_searchTools = nullptr;
+  struct SearchFilterUi {
+    Button* toggle = nullptr;
+    Flex* panel = nullptr;
+    Flex* metadata = nullptr;
+    Flex* size = nullptr;
+    Label* sizeCaption = nullptr;
+    Flex* date = nullptr;
+    Flex* separator = nullptr;
+    Flex* content = nullptr;
+    Flex* options = nullptr;
+    std::array<Button*, 6> choices{};
+    std::array<Input*, 4> values{};
+    std::array<Button*, 2> dates{};
+    std::array<Checkbox*, 2> checks{};
+    Button* clear = nullptr;
+    Button* submit = nullptr;
+    filemanager::ContentBackends backends;
+  } m_searchFilterUi;
   Button* m_searchButton = nullptr;
   Button* m_searchModeButton = nullptr;
   Button* m_searchScopeButton = nullptr;
@@ -537,7 +569,9 @@ private:
   filemanager::TabId m_searchUiTab = filemanager::kInvalidTabId;
   Label* m_statusLabel = nullptr;
   Label* m_statusDetailLabel = nullptr;
-  Label* m_statusFreeLabel = nullptr;
+  Label* m_searchStatus = nullptr;
+  Spinner* m_searchSpinner = nullptr;
+  Flex* m_searchStatusArea = nullptr;
   Button* m_backButton = nullptr;
   Button* m_forwardButton = nullptr;
   Button* m_upButton = nullptr;
