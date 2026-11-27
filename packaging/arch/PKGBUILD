@@ -7,7 +7,7 @@ arch=(x86_64 aarch64)
 url='https://github.com/Nythera-Dev/Nythera-Files'
 license=(MIT)
 depends=('nythera-lib>=0.1.0' 'nythera-lib<0.2.0' libnythera_lib.so
-         glib2 jemalloc libgcc libstdc++ libxkbcommon polkit tomlplusplus wayland)
+         glib2 jemalloc libarchive libgcc libstdc++ libxkbcommon polkit tomlplusplus wayland xz zlib)
 optdepends=(
   'gvfs: Wastebin (trash://), removable media mounting, and remote filesystem support'
   'gvfs-smb: SMB/CIFS network share browsing'
@@ -19,7 +19,7 @@ optdepends=(
 makedepends=(git meson ninja pkgconf)
 
 build() {
-  arch-meson "$startdir/../.." "$srcdir/build" -Dtests=disabled
+  arch-meson "$startdir/../.." "$srcdir/build" -Dtests=disabled -Darchives=enabled
   meson compile -C "$srcdir/build"
 }
 
