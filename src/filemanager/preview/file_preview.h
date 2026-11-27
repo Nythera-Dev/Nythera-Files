@@ -69,6 +69,7 @@ namespace filemanager {
     int m_imageSide = 0;
     int m_previousImageSide = 0;
     bool m_diskCache = false;
+    Flex* m_summary = nullptr;
     Label* m_name = nullptr;
     Flex* m_details = nullptr;
     std::vector<preview::Detail> m_fields;

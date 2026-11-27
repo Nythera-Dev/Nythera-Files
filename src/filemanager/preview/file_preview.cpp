@@ -102,19 +102,34 @@ namespace filemanager {
     icon->setParticipatesInLayout(false);
     m_icon = static_cast<FileIcon*>(imageFrame->addChild(std::move(icon)));
     m_imageFrame = static_cast<Flex*>(body.addChild(std::move(imageFrame)));
+    Flex* detailsHost = &body;
     if (docked) {
-      m_name = addLabel(body);
+      auto summary = std::make_unique<Flex>();
+      summary->setDirection(FlexDirection::Vertical);
+      summary->setAlign(FlexAlign::Stretch);
+      summary->setGap(Style::spaceXs);
+      m_summary = static_cast<Flex*>(body.addChild(std::move(summary)));
+      detailsHost = m_summary;
+
+      m_name = addLabel(*m_summary);
       m_name->setFontWeight(FontWeight::SemiBold);
-      m_name->setTextAlign(TextAlign::Center);
+      m_name->setFontSize(Style::fontSizeBody + 2.0F);
+      m_name->setTextAlign(TextAlign::Start);
       m_name->setMaxLines(2);
       m_name->setEllipsize(TextEllipsize::End);
+
+      auto rule = std::make_unique<Separator>();
+      rule->setOrientation(SeparatorOrientation::HorizontalRule);
+      rule->setColor(colorSpecFromRole(ColorRole::OutlineVariant));
+      rule->setGradientEdges(false);
+      m_summary->addChild(std::move(rule));
     }
 
     auto details = std::make_unique<Flex>();
     details->setDirection(FlexDirection::Vertical);
     details->setAlign(FlexAlign::Stretch);
     details->setGap(Style::spaceXs);
-    m_details = static_cast<Flex*>(body.addChild(std::move(details)));
+    m_details = static_cast<Flex*>(detailsHost->addChild(std::move(details)));
     m_notice = addLabel(body);
     m_notice->setFontSize(Style::fontSizeCaption);
     m_notice->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
@@ -187,7 +202,7 @@ namespace filemanager {
   void FilePreview::detach() {
     clear();
     m_name = m_empty = m_notice = m_text = nullptr;
-    m_details = nullptr;
+    m_summary = m_details = nullptr;
     m_textDivider = nullptr;
     m_open = m_openWith = nullptr;
     m_fields.clear();
@@ -310,7 +325,7 @@ namespace filemanager {
     m_icon->setVisible(fallback);
     if (m_name) {
       m_name->setText(entry ? sanitizeFilenameForDisplay(entry->name) : "");
-      setShown(*m_name, entry != nullptr);
+      setShown(*m_summary, entry != nullptr);
     }
     m_notice->setText(m_content ? m_content->notice : "");
     m_notice->setTextAlign(centeredSummary ? TextAlign::Center : TextAlign::Start);
@@ -368,9 +383,8 @@ namespace filemanager {
         constraints.setExactWidth(width);
         return node->measure(renderer, constraints).height + body.gap();
       };
-      const float detailsHeight = occupiedHeight(m_details) + occupiedHeight(m_notice);
-      const float budget =
-          std::max(std::min(72.0F, viewportHeight), viewportHeight - detailsHeight - occupiedHeight(m_name));
+      const float detailsHeight = occupiedHeight(m_summary ? m_summary : m_details) + occupiedHeight(m_notice);
+      const float budget = std::max(std::min(72.0F, viewportHeight), viewportHeight - detailsHeight);
       float extent = 0.0F;
       if (handle.valid()) {
         const float imageBudget = m_request->mode == PreviewMode::Information ? std::min(budget, 168.0F) : budget;
