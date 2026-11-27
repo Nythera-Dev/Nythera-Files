@@ -119,6 +119,8 @@ private:
   void persistFileViewState();
   void updateWindowTitle();
   [[nodiscard]] std::unique_ptr<Flex> buildHeaderAppBar();
+  void addWindowResizeAreas(Flex& root);
+  void layoutWindowDragAreas(Renderer& renderer, float width, float height);
   void updateAdminHeaderUi(int surfaceWidth = 0);
   bool
   enterAdministratorMode(filemanager::TabId tabId, std::optional<std::filesystem::path> targetDirectory = std::nullopt);
@@ -539,6 +541,8 @@ private:
   std::chrono::steady_clock::time_point m_selectionTick;
   std::unique_ptr<Flex> m_root;
   Flex* m_appBar = nullptr;
+  InputArea* m_windowMoveArea = nullptr;
+  std::array<InputArea*, 8> m_windowResizeAreas{};
   Flex* m_appBrandContainer = nullptr;
   Flex* m_adminHeaderContainer = nullptr;
   Box* m_adminHeaderSeparator = nullptr;

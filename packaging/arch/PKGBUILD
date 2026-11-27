@@ -1,32 +1,41 @@
 # Build from a Nythera Files checkout: cd packaging/arch && makepkg -s
 pkgname=nythera-files
 pkgver=$(cat ../../VERSION)
-pkgrel=1
+pkgrel=3
 pkgdesc='Nythera Files native Wayland file manager'
 arch=(x86_64 aarch64)
 url='https://github.com/Nythera-Dev/Nythera-Files'
 license=(MIT)
 depends=('nythera-lib>=0.1.0' 'nythera-lib<0.2.0' libnythera_lib.so
-         gdk-pixbuf2 glib2 jemalloc libarchive libgcc libstdc++ libxkbcommon polkit tomlplusplus wayland xz zlib)
+         desktop-file-utils gdk-pixbuf2 glib2 glibc jemalloc 'libarchive>=3.4.0' libgcc libstdc++
+         libxkbcommon polkit shared-mime-info tomlplusplus wayland xz zlib)
 optdepends=(
   'gvfs: Wastebin (trash://), removable media mounting, and remote filesystem support'
   'gvfs-smb: SMB/CIFS network share browsing'
   'gvfs-mtp: MTP device browsing'
   'gvfs-nfs: NFS network share browsing'
-  'ffmpeg: video stills and embedded audio artwork'
+  'udisks2: removable drive discovery and unmounting'
+  'ffmpeg: video stills, embedded audio artwork, and media metadata'
   'ffmpegthumbnailer: filmstrip borders for video thumbnails'
-  'poppler: first-page PDF thumbnails'
+  'poppler: first-page PDF thumbnails and metadata'
+  'fzf: fuzzy filename search'
   'ripgrep: search plain-text file contents'
   'ripgrep-all: search extracted document and archive contents'
 )
 makedepends=(git meson ninja pkgconf)
+options=(!debug)
 
 build() {
-  arch-meson "$startdir/../.." "$srcdir/build" -Dtests=disabled -Darchives=enabled
+  arch-meson "$startdir/../.." "$srcdir/build" -Dtests=disabled -Darchives=enabled \
+    -Djemalloc=enabled -Dnative_optimizations=false --libexecdir=lib
   meson compile -C "$srcdir/build"
 }
 
 package() {
   meson install -C "$srcdir/build" --no-rebuild --destdir "$pkgdir"
+  install -Dm644 "$startdir/dev.nythera.FileManager.desktop" \
+    "$pkgdir/usr/share/applications/dev.nythera.FileManager.desktop"
+  install -Dm644 "$startdir/../../files-assets/concepts/nythera-files-icon.png" \
+    "$pkgdir/usr/share/pixmaps/dev.nythera.FileManager.png"
   install -Dm644 "$startdir/../../LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

@@ -191,8 +191,39 @@ public:
     manager.activeSession().m_browsingTrash = false;
 
     // 2. Normal menu bar and collapsed hamburger menu exposure.
-    Flex appBar;
-    manager.m_menus.attachMenuBarUi(appBar, 32.0F);
+    Flex root;
+    root.setDirection(FlexDirection::Vertical);
+    root.setAlign(FlexAlign::Stretch);
+    root.setPadding(8.0F);
+    root.addChild(manager.buildHeaderAppBar());
+    manager.addWindowResizeAreas(root);
+    InputDispatcher dispatcher;
+    dispatcher.setSceneRoot(&root);
+    const auto areaAtCenter = [&dispatcher](const Node* node) {
+      float x = 0.0F, y = 0.0F;
+      Node::absolutePosition(node, x, y);
+      return dispatcher.inputAreaAt(x + node->width() / 2.0F, y + node->height() / 2.0F);
+    };
+    const auto layoutWindow = [&](float width, float height) {
+      root.setSize(width, height);
+      root.layout(renderer);
+      manager.layoutWindowDragAreas(renderer, width, height);
+      const std::array<std::pair<float, float>, 8> edgePoints{{
+          {width / 2.0F, 3.0F},
+          {width / 2.0F, height - 3.0F},
+          {3.0F, height / 2.0F},
+          {width - 3.0F, height / 2.0F},
+          {3.0F, 3.0F},
+          {width - 3.0F, 3.0F},
+          {3.0F, height - 3.0F},
+          {width - 3.0F, height - 3.0F},
+      }};
+      for (std::size_t i = 0; i < edgePoints.size(); ++i) {
+        const auto [x, y] = edgePoints[i];
+        TEST_CHECK(dispatcher.inputAreaAt(x, y) == manager.m_windowResizeAreas[i]);
+      }
+      TEST_CHECK(dispatcher.inputAreaAt(width / 2.0F, height / 2.0F) == nullptr);
+    };
     TEST_CHECK(manager.m_menus.m_applicationMenuButtons[filemanager::menu_id::kHelpMenuIndex] != nullptr);
     TEST_CHECK(manager.m_menus.m_applicationMenuButtons[filemanager::menu_id::kHelpMenuIndex]->label() != nullptr);
     TEST_CHECK(
@@ -202,6 +233,11 @@ public:
     TEST_CHECK(manager.m_menus.m_compactMenuButton != nullptr);
 
     manager.m_menus.syncResponsiveMenuBar(1120);
+    layoutWindow(1120.0F, 760.0F);
+    TEST_CHECK(areaAtCenter(manager.m_appBrandContainer) == manager.m_windowMoveArea);
+    TEST_CHECK(dispatcher.inputAreaAt(12.0F, 12.0F) == manager.m_windowMoveArea);
+    const auto* helpButton = manager.m_menus.m_applicationMenuButtons[filemanager::menu_id::kHelpMenuIndex];
+    TEST_CHECK(areaAtCenter(helpButton) == helpButton->inputArea());
     TEST_CHECK(manager.m_menus.m_appMenuItems->visible());
     TEST_CHECK(!manager.m_menus.m_compactMenuButton->visible());
 
@@ -217,6 +253,8 @@ public:
 
     // Narrow width collapse exposes Help in the hamburger menu.
     manager.m_menus.syncResponsiveMenuBar(500);
+    layoutWindow(560.0F, 380.0F);
+    TEST_CHECK(areaAtCenter(manager.m_menus.m_compactMenuButton) == manager.m_menus.m_compactMenuButton->inputArea());
     TEST_CHECK(!manager.m_menus.m_appMenuItems->visible());
     TEST_CHECK(manager.m_menus.m_compactMenuButton->visible());
     const auto collapsedByWidth = manager.m_menus.applicationMenuEntries(0);

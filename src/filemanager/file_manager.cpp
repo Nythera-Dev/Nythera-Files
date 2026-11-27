@@ -295,6 +295,22 @@ private:
 namespace {
   constexpr float kToolbarHeight = 32.0F;
   constexpr float kWindowPadding = 8.0F;
+  constexpr float kWindowResizeInset = 6.0F;
+  constexpr float kWindowResizeCorner = kWindowPadding;
+  struct WindowResizeHandle {
+    std::uint32_t edge;
+    std::uint32_t cursor;
+  };
+  constexpr std::array kWindowResizeHandles{
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_TOP, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE},
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE},
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_LEFT, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE},
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_RIGHT, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE},
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE},
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE},
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE},
+      WindowResizeHandle{XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE},
+  };
   constexpr float kPaneGap = 2.0F;
   constexpr float kSidebarDividerWidth = 4.0F;
   constexpr float kSidebarMinWidth = 150.0F;
@@ -1531,6 +1547,8 @@ int FileManager::run() {
           self->m_transfers.detachUi();
           self->m_root.reset();
           self->m_appBar = nullptr;
+          self->m_windowMoveArea = nullptr;
+          self->m_windowResizeAreas.fill(nullptr);
           self->m_appBrandContainer = nullptr;
           self->m_adminHeaderContainer = nullptr;
           self->m_adminHeaderSeparator = nullptr;
@@ -3064,8 +3082,22 @@ std::unique_ptr<Flex> FileManager::buildHeaderAppBar() {
   );
   appBar->setRadius(Style::scaledRadiusMd(1.0F));
 
+  // The controls are added above this area so they keep their own pointer gestures.
+  auto moveArea = std::make_unique<InputArea>();
+  moveArea->setParticipatesInLayout(false);
+  moveArea->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
+  moveArea->setCursorShape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB);
+  moveArea->setOnPress([this](const InputArea::PointerData& event) {
+    if (event.pressed && event.serial && m_surface && m_wayland.seat()) {
+      m_dispatcher.cancelPointerCapture();
+      m_surface->beginMove(event.serial);
+    }
+  });
+  m_windowMoveArea = static_cast<InputArea*>(appBar->addChild(std::move(moveArea)));
+
   auto appName = std::make_unique<Flex>();
   m_appBrandContainer = appName.get();
+  appName->setHitTestVisible(false);
   appName->setAlign(FlexAlign::Center);
   appName->setGap(9.0F); // The display font's space advance is 360/1000 em at 25 px.
   auto appNameNythera = std::make_unique<Label>();
@@ -3125,11 +3157,49 @@ std::unique_ptr<Flex> FileManager::buildHeaderAppBar() {
 
   auto appSpacer = std::make_unique<Flex>();
   appSpacer->setFlexGrow(1.0F);
+  appSpacer->setHitTestVisible(false);
   appBar->addChild(std::move(appSpacer));
   m_menus.attachMenuBarUi(*appBar, kToolbarHeight);
 
   updateAdminHeaderUi();
   return appBar;
+}
+
+void FileManager::addWindowResizeAreas(Flex& root) {
+  for (std::size_t i = 0; i < kWindowResizeHandles.size(); ++i) {
+    const auto [edge, cursor] = kWindowResizeHandles[i];
+    auto area = std::make_unique<InputArea>();
+    area->setParticipatesInLayout(false);
+    area->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
+    area->setCursorShape(cursor);
+    area->setOnPress([this, edge](const InputArea::PointerData& event) {
+      if (event.pressed && event.serial && m_surface && m_surface->xdgToplevel() && m_wayland.seat()) {
+        m_dispatcher.cancelPointerCapture();
+        xdg_toplevel_resize(m_surface->xdgToplevel(), m_wayland.seat(), event.serial, edge);
+      }
+    });
+    m_windowResizeAreas[i] = static_cast<InputArea*>(root.addChild(std::move(area)));
+  }
+}
+
+void FileManager::layoutWindowDragAreas(Renderer& renderer, float width, float height) {
+  m_windowMoveArea->setSize(m_appBar->width(), m_appBar->height());
+  m_windowMoveArea->layout(renderer);
+
+  constexpr float corner = kWindowResizeCorner;
+  constexpr float inset = kWindowResizeInset;
+  const std::array<LayoutRect, kWindowResizeHandles.size()> bounds{{
+      {corner, 0.0F, std::max(0.0F, width - 2.0F * corner), inset},
+      {corner, height - inset, std::max(0.0F, width - 2.0F * corner), inset},
+      {0.0F, corner, inset, std::max(0.0F, height - 2.0F * corner)},
+      {width - inset, corner, inset, std::max(0.0F, height - 2.0F * corner)},
+      {0.0F, 0.0F, corner, corner},
+      {width - corner, 0.0F, corner, corner},
+      {0.0F, height - corner, corner, corner},
+      {width - corner, height - corner, corner, corner},
+  }};
+  for (std::size_t i = 0; i < bounds.size(); ++i)
+    m_windowResizeAreas[i]->arrange(renderer, bounds[i]);
 }
 
 void FileManager::updateAdminHeaderUi(int headerWidth) {
@@ -4000,6 +4070,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_statusStrip->setPadding(std::clamp((m_statusHeight - statusFontSize) * 0.5F, 2.0F, 7.0F), 10.0F);
     mainColumn->addChild(std::move(mainPane));
     m_root->addChild(std::move(mainColumn));
+    addWindowResizeAreas(*m_root);
     m_dispatcher.setSceneRoot(m_root.get());
     m_dispatcher.setFocus(m_grid->focusArea());
     m_surface->setSceneRoot(m_root.get());
@@ -4055,6 +4126,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     );
     m_root->setSize(static_cast<float>(m_surface->width()), static_cast<float>(m_surface->height()));
     m_root->layout(renderer);
+    layoutWindowDragAreas(renderer, m_root->width(), m_root->height());
     m_tabBar.syncLayout(renderer);
     m_listHeader.applyPendingFit(renderer);
     if (m_listHeader.applyColumnWidths())
