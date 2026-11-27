@@ -1,6 +1,7 @@
 #include "filemanager/search_thumbnails.h"
 
 #include "core/files/directory_scanner.h"
+#include "filemanager/preview/thumbnail_provider.h"
 
 #include <algorithm>
 #include <array>
@@ -20,18 +21,18 @@ namespace filemanager {
   }
 
   bool SearchThumbnails::eligible(const FileEntry& entry) {
-    constexpr std::array<std::string_view, 12> supported = {
-        "image/jpeg", "image/png",  "image/webp", "image/jxl",  "image/bmp",     "image/x-ms-bmp",
-        "image/gif",  "image/heic", "image/heif", "image/avif", "image/svg+xml", "image/svg+xml-compressed",
-    };
-    const auto limit = entry.type == "image/svg+xml" || entry.type == "image/svg+xml-compressed"
-        ? ThumbnailService::kMaxSvgSourceBytes
-        : ThumbnailService::kMaxSourceFileBytes;
-    return !entry.isDir
-        && !entry.isSymlink
-        && entry.size > 0
-        && entry.size <= limit
-        && std::ranges::contains(supported, entry.type);
+    if (entry.isDir || entry.isSymlink || entry.size == 0 || !entry.absPath.is_absolute())
+      return false;
+    if (entry.type.starts_with("video/") || entry.type.starts_with("audio/"))
+      return true;
+    const bool svg = DirectoryScanner::isSvgPath(entry.absPath)
+        || entry.type == "image/svg+xml"
+        || entry.type == "image/svg+xml-compressed";
+    const auto limit = svg ? ThumbnailService::kMaxSvgSourceBytes : ThumbnailService::kMaxSourceFileBytes;
+    return entry.size <= limit
+        && (DirectoryScanner::isThumbnailPath(entry.absPath)
+            || preview::imageThumbnail(entry.type)
+            || preview::mediaThumbnail(entry.type));
   }
 
   bool SearchThumbnails::permitsAutomaticPreview(GFileInfo* filesystem) {
@@ -76,10 +77,11 @@ namespace filemanager {
     );
   }
 
-  void SearchThumbnails::updateVisible(std::span<const std::string> paths, int targetPx) {
-    if (m_targetPx != targetPx) {
+  void SearchThumbnails::updateVisible(std::span<const std::string> paths, int targetPx, ThumbnailPolicy policy) {
+    if (m_targetPx != targetPx || m_policy != policy) {
       clear();
       m_targetPx = targetPx;
+      m_policy = policy;
     }
     const std::unordered_set<std::string_view> visible(paths.begin(), paths.end());
     std::erase_if(m_requests, [&](const auto& item) {
@@ -90,6 +92,12 @@ namespace filemanager {
     });
     for (const auto& path : paths) {
       auto& request = m_requests.try_emplace(path).first->second;
+      if (m_policy == ThumbnailPolicy::All) {
+        request.checked = true;
+        request.allowed = true;
+      }
+      if (m_policy == ThumbnailPolicy::Never)
+        continue;
       // Keep preview policy I/O bounded and lower priority than discovery.
       if (!request.checked && m_policyInFlight.expired())
         queryPolicy(path, request);

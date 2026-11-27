@@ -114,6 +114,18 @@ Open the sliders button in the search toolbar to filter by file size, modificati
 
 Plain-text search runs with time and memory limits. Files larger than 128 MiB use a separate search lane. Extracted text has its own queue, a 128 MiB input limit, and a three-level archive limit. The search status reports access failures, extraction limits and failures, and timed-out batches. Files uses a separate ripgrep-all cache at `$XDG_CACHE_HOME/nythera-files/search-content/ripgrep-all-v2` (under `~/.cache` when the XDG cache variable is unset).
 
+## File previews
+
+Select one item and press **Space** or choose **Quick Look** from its context menu. Use **Left** or **Right** to step one item. **Up** and **Down** step one list item or one grid row. Press **Space** or **Escape** to close Quick Look.
+
+Under **View → Preview Pane**, choose **Full Preview**, **Information Only**, or **Hidden**. **F8** toggles the pane. Drag the divider to resize it. Full Preview can show scrollable UTF-8 text, images, video stills, embedded audio artwork, and the first page of a PDF. Information Only shows a static thumbnail and file details. The pane collapses when the window is too narrow.
+
+List, grid, and search results generate thumbnails for visible items according to **View → Thumbnails**. The default is **Local Locations**. Video stills and audio artwork use FFmpeg. PDF previews use Poppler utilities. Optional GdkPixbuf loaders extend the image formats supported by NytheraLib, and `ffmpegthumbnailer` can add filmstrip borders to browsing thumbnails.
+
+The freedesktop PNG cache lives at `$XDG_CACHE_HOME/thumbnails` or `~/.cache/thumbnails`. **Inspect Cache** shows shared usage. **Clear Files Thumbnails** removes entries written by Nythera Files. Quick Look and protected thumbnails remain memory-only. In `[files]`, the `thumbnail_max_file_mib` setting accepts 1–64 MiB for image and PDF source files, and `thumbnail_cache_mib` accepts 16–8192 MiB for the shared cache. The defaults are 64 MiB and 1024 MiB.
+
+Thumbnail providers and preview behaviour are adapted from [Luciole](https://github.com/noctalia-dev/luciole) under the [MIT licence](src/filemanager/preview/LICENSE.luciole).
+
 ## Appearance & Theming
 
 Nythera Files shares the same general design language as Nythera Shell: dark surfaces, crimson accents, subtle effects and custom branding.

@@ -85,6 +85,7 @@ xkbcommon_dep       = dependency('xkbcommon')
 glib_dep            = dependency('glib-2.0')
 gobject_dep         = dependency('gobject-2.0')
 gio_dep             = dependency('gio-2.0')
+preview_pixbuf_dep  = dependency('gdk-pixbuf-2.0', required: false)
 gio_unix_dep        = dependency('gio-unix-2.0')
 polkit_gobject_dep  = dependency('polkit-gobject-1')
 
@@ -105,6 +106,9 @@ endif
 
 _nythera_files_sources = files(
   'src/filemanager/file_manager.cpp',
+  'src/filemanager/file_manager_preview.cpp',
+  'src/filemanager/file_manager_preview_pane.cpp',
+  'src/filemanager/file_manager_quick_look.cpp',
   'src/filemanager/file_manager_settings.cpp',
   'src/filemanager/configuration_notice.cpp',
   'src/filemanager/file_list_header.cpp',
@@ -121,6 +125,10 @@ _nythera_files_sources = files(
   'src/filemanager/file_manager_search_profiles.cpp',
   'src/filemanager/file_manager_search_settings.cpp',
   'src/filemanager/search_thumbnails.cpp',
+  'src/filemanager/preview/thumbnail_provider.cpp',
+  'src/filemanager/preview/file_preview.cpp',
+  'src/filemanager/preview/preview_content.cpp',
+  'src/filemanager/preview/provider_process.cpp',
   'src/filemanager/recursive_file_discovery.cpp',
   'src/filemanager/search_scope.cpp',
   'src/filemanager/browser_tab.cpp',
@@ -185,12 +193,19 @@ _nythera_files_dependencies = [
   gio_unix_dep,
   polkit_gobject_dep,
 ] + jemalloc_deps
+if preview_pixbuf_dep.found()
+  _nythera_files_dependencies += preview_pixbuf_dep
+endif
 
 _nythera_compile_definitions = [
   '-DNYTHERA_INSTALL_PREFIX="' + get_option('prefix') + '"',
   '-DNYTHERA_INSTALL_DATADIR="' + get_option('datadir') + '"',
   '-DNYTHERA_VERSION="' + meson.project_version() + '"',
 ]
+if preview_pixbuf_dep.found()
+  _nythera_compile_definitions += '-DNYTHERA_PREVIEW_PIXBUF'
+endif
+
 
 _nythera_cpp_args = [
   '-Wall', '-Wextra', '-Wno-missing-field-initializers', '-Wpedantic', '-Wconversion', '-Wshadow',
@@ -350,6 +365,13 @@ if build_tests
     override_options: ['b_ndebug=false'],
   )
   test('file_manager_keyboard_audit', file_manager_keyboard_audit_test_exe)
+
+  file_preview_test_exe = executable('file_preview_test',
+    sources: files('tests/file_preview_test.cpp'),
+    dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('file_preview', file_preview_test_exe, timeout: 20)
 
   file_manager_search_test_exe = executable('file_manager_search_test',
     sources: files('tests/file_manager_search_test.cpp'),
@@ -681,3 +703,6 @@ if build_tests
   )
   test('test_isolation', test_isolation_test_exe, timeout: 20)
 endif
+
+install_data('src/filemanager/preview/LICENSE.luciole',
+  install_dir: get_option('datadir') / 'licenses' / 'nythera-files', install_tag: 'files')

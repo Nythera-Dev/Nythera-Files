@@ -29,6 +29,8 @@ namespace filemanager {
     constexpr std::array kWindowAndNavigationShortcuts{
         HelpDialogController::ShortcutEntry{"New Window", "Ctrl+N"},
         HelpDialogController::ShortcutEntry{"Open", "Enter"},
+        HelpDialogController::ShortcutEntry{"Quick Look", "Space"},
+        HelpDialogController::ShortcutEntry{"Toggle Preview Pane", "F8"},
         HelpDialogController::ShortcutEntry{"Go to Parent Folder", "Backspace / Alt+Up"},
         HelpDialogController::ShortcutEntry{"Back / Forward", "Alt+Left / Alt+Right"},
         HelpDialogController::ShortcutEntry{"Go to Home Folder", "Alt+Home"},

@@ -469,6 +469,54 @@ namespace filemanager {
     return save({{{"files", search ? "search_view_scale" : "view_scale"}, std::format("{:.6f}", scale)}});
   }
 
+  PreviewMode FileManagerSettings::previewMode() const {
+    const auto mode = m_preferences["files"]["preview_mode"].value_or<std::string_view>("full");
+    if (mode == "hidden")
+      return PreviewMode::Hidden;
+    if (mode == "information")
+      return PreviewMode::Information;
+    return PreviewMode::Full;
+  }
+
+  bool FileManagerSettings::setPreviewMode(PreviewMode mode) {
+    const std::string_view value = mode == PreviewMode::Information ? "information"
+        : mode == PreviewMode::Hidden                               ? "hidden"
+                                                                    : "full";
+    return save({{{"files", "preview_mode"}, literal(std::string(value))}});
+  }
+
+  ThumbnailPolicy FileManagerSettings::thumbnailPolicy() const {
+    const auto policy = m_preferences["files"]["thumbnail_policy"].value_or<std::string_view>("local");
+    if (policy == "never")
+      return ThumbnailPolicy::Never;
+    if (policy == "all")
+      return ThumbnailPolicy::All;
+    return ThumbnailPolicy::Local;
+  }
+
+  bool FileManagerSettings::setThumbnailPolicy(ThumbnailPolicy policy) {
+    const std::string value = policy == ThumbnailPolicy::Never ? "never"
+        : policy == ThumbnailPolicy::All                       ? "all"
+                                                               : "local";
+    return save({{{"files", "thumbnail_policy"}, literal(value)}});
+  }
+
+  int FileManagerSettings::thumbnailMaxFileMiB() const {
+    return m_preferences["files"]["thumbnail_max_file_mib"].value_or(64);
+  }
+
+  int FileManagerSettings::thumbnailCacheMiB() const {
+    return m_preferences["files"]["thumbnail_cache_mib"].value_or(1024);
+  }
+
+  float FileManagerSettings::loadPreviewWidth() const {
+    return loadClampedFloat(m_state, "preview_width", 320.0F, 208.0F, 800.0F);
+  }
+
+  bool FileManagerSettings::savePreviewWidth(float width) {
+    return m_state.setString(kOwner, "preview_width", std::to_string(width));
+  }
+
   float FileManagerSettings::loadSidebarWidth(float defaultWidth, float minWidth, float maxWidth) const {
     return loadClampedFloat(m_state, "sidebar_width", defaultWidth, minWidth, maxWidth);
   }
