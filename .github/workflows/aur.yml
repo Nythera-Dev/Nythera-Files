@@ -1,0 +1,15 @@
+name: AUR testing packages
+
+on:
+  push:
+    branches: [testing]
+
+permissions:
+  contents: read
+
+jobs:
+  aur:
+    uses: Nythera-Dev/NytheraLib/.github/workflows/aur.yml@testing
+    secrets:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+      AUR_SSH_KNOWN_HOSTS: ${{ secrets.AUR_SSH_KNOWN_HOSTS }}
