@@ -290,8 +290,9 @@ namespace filemanager {
           m_callbacks.onStatus(
               launchError ? launchError->message : "Could not open this file with the selected application"
           );
-      } else if (!setAsDefault) {
-        if (m_callbacks.onStatus)
+      } else {
+        recordLocalOpen(*origin, target);
+        if (!setAsDefault && m_callbacks.onStatus)
           m_callbacks.onStatus("");
       }
       g_clear_error(&launchError);
@@ -319,19 +320,31 @@ namespace filemanager {
   }
 
   bool FileLaunchController::launchOpenWithApp(std::size_t index, const std::filesystem::path& target) {
-    if (!m_tabs.activeTab().capabilities().canLaunchApps || index >= m_openWithApplications.size() || target.empty())
+    const auto& tab = m_tabs.activeTab();
+    if (!tab.capabilities().canLaunchApps || index >= m_openWithApplications.size() || target.empty())
       return false;
-    if (launchProtectedApplication(m_tabs.activeTab(), m_openWithApplications[index].get(), target))
+    if (launchProtectedApplication(tab, m_openWithApplications[index].get(), target))
       return true;
     GError* error = nullptr;
     if (!launchApplicationForFile(m_openWithApplications[index].get(), target, &error)) {
       if (m_callbacks.onStatus)
         m_callbacks.onStatus(error ? error->message : "Could not open this file with the selected application");
-    } else if (m_callbacks.onStatus) {
-      m_callbacks.onStatus("");
+    } else {
+      recordLocalOpen(tab, target);
+      if (m_callbacks.onStatus)
+        m_callbacks.onStatus("");
     }
     g_clear_error(&error);
     return true;
+  }
+
+  void FileLaunchController::recordLocalOpen(const BrowserTab& tab, const std::filesystem::path& path) {
+    if (m_callbacks.onFileOpened
+        && !tab.administratorBrowsing
+        && !tab.hasActiveAdminSession()
+        && !tab.session.browsingTrash()
+        && !tab.session.browsingArchive())
+      m_callbacks.onFileOpened(path);
   }
 
   std::vector<std::string> FileLaunchController::externalToolTargets(external_tools::Tool tool) const {
@@ -493,13 +506,15 @@ namespace filemanager {
     });
   }
 
-  void FileLaunchController::launchFileUri(TabId tabId, GFile* file, std::string success) {
+  void
+  FileLaunchController::launchFileUri(TabId tabId, GFile* file, std::string success, std::function<void()> onSuccess) {
     char* uri = g_file_get_uri(file);
     struct LaunchRequest {
       FileLaunchController* controller;
       std::weak_ptr<bool> alive;
       TabId tabId;
       std::string success;
+      std::function<void()> onSuccess;
     };
     g_app_info_launch_default_for_uri_async(
         uri, nullptr, nullptr,
@@ -508,6 +523,8 @@ namespace filemanager {
           GError* error = nullptr;
           const bool launched = g_app_info_launch_default_for_uri_finish(result, &error);
           if (const auto locked = request->alive.lock(); locked && *locked) {
+            if (launched && request->onSuccess)
+              request->onSuccess();
             std::string message = !launched ? (error == nullptr ? "Could not open this file" : error->message)
                                             : std::move(request->success);
             if (request->tabId == request->controller->m_tabs.activeTabId()) {
@@ -519,7 +536,7 @@ namespace filemanager {
           }
           g_clear_error(&error);
         },
-        new LaunchRequest{this, m_alive, tabId, std::move(success)}
+        new LaunchRequest{this, m_alive, tabId, std::move(success), std::move(onSuccess)}
     );
     g_free(uri);
   }

@@ -27,6 +27,7 @@
 namespace filemanager {
 
   namespace {
+    constexpr std::string_view kRecentPlaceId = "personal:recent";
     constexpr float kPlaceRowSelectionOpacity = 0.42F;
     constexpr float kStorageMeterFillOpacity = 0.75F;
     constexpr float kStorageMeterTrackOpacity = 0.6F;
@@ -577,6 +578,99 @@ namespace filemanager {
     g_object_unref(prompt);
   }
 
+  std::unique_ptr<Flex> PlacesSidebarController::buildRecentRow(const Place& place) {
+    auto recentRow = std::make_unique<Flex>();
+    recentRow->setDirection(FlexDirection::Horizontal);
+    recentRow->setAlign(FlexAlign::Center);
+    recentRow->setGap(2.0F);
+
+    auto recentBtn = makeButton("Recent", [this, path = place.path] {
+      if (m_callbacks.onNavigate)
+        m_callbacks.onNavigate(path, true);
+    });
+    recentBtn->setContentAlign(ButtonContentAlign::Start);
+    recentBtn->setFocusHighlightEnabled(false);
+    recentBtn->setFlexGrow(1.0F);
+    useSubtleSelection(*recentBtn, false);
+    recentBtn->setTooltip("Recent Files and Locations");
+    auto icon = std::make_unique<FileIcon>();
+    icon->setThemedIconNames({"document-open-recent", "document-open-recent-symbolic", "clock"});
+    icon->setGlyphSize(20.0F);
+    recentBtn->setLeadingIcon(std::move(icon), 20.0F);
+    if (auto* area = recentBtn->inputArea())
+      area->setTabFocusKey("place:" + place.identity);
+    auto* recentBtnPtr = static_cast<Button*>(recentRow->addChild(std::move(recentBtn)));
+    m_placeButtons.emplace_back(recentBtnPtr, place.path);
+    m_placeRows.emplace_back(recentBtnPtr, place);
+
+    if (m_settings.showFrequentLocations() && m_callbacks.frequentLocations) {
+      auto arrowPtr = std::make_shared<Button*>(nullptr);
+      auto arrowBtn = std::make_unique<Button>();
+      *arrowPtr = arrowBtn.get();
+      arrowBtn->setGlyph("chevron-right");
+      arrowBtn->setGlyphSize(14.0F);
+      arrowBtn->setVariant(ButtonVariant::Ghost);
+      arrowBtn->setControlHeight(kToolbarHeight);
+      arrowBtn->setPadding(0.0F, 6.0F);
+      arrowBtn->setFocusHighlightEnabled(false);
+      arrowBtn->setTooltip("Frequent Locations");
+      arrowBtn->setOnClick([this, arrowPtr] {
+        if (!m_callbacks.onShowFrequentMenu || !m_callbacks.frequentLocations || *arrowPtr == nullptr)
+          return;
+        auto frequent = m_callbacks.frequentLocations();
+        std::vector<ContextMenuControlEntry> entries;
+        if (frequent.empty())
+          entries.push_back({.label = "No frequent locations yet", .enabled = false});
+        for (std::size_t i = 0; i < frequent.size(); ++i) {
+          const auto& record = frequent[i];
+          auto label = record.path.string();
+          if (record.pinned)
+            label += " (Pinned)";
+          const int id = static_cast<int>(i) * 4;
+          entries.push_back({
+              .id = id,
+              .label = std::move(label),
+              .hasSubmenu = true,
+              .submenuEntries =
+                  {{.id = id, .label = "Open"},
+                   {.id = id + 1, .label = record.pinned ? "Unpin" : "Pin"},
+                   {.id = id + 2, .label = "Remove"},
+                   {.id = id + 3, .label = "Exclude from Frequent"}},
+              .splitSubmenu = true,
+              .activateMainSection = true,
+          });
+        }
+        float x = 0.0F, y = 0.0F;
+        Node::absolutePosition(*arrowPtr, x, y);
+        m_callbacks.onShowFrequentMenu(
+            std::move(entries), x + (*arrowPtr)->width(), y, [this, frequent = std::move(frequent)](int id) {
+              const auto& record = frequent.at(static_cast<std::size_t>(id / 4));
+              switch (id % 4) {
+              case 0:
+                if (m_callbacks.onNavigate)
+                  m_callbacks.onNavigate(record.path, true);
+                break;
+              case 1:
+                if (m_callbacks.onTogglePinFrequentLocation)
+                  m_callbacks.onTogglePinFrequentLocation(record.path, !record.pinned);
+                break;
+              case 2:
+                if (m_callbacks.onRemoveFrequentLocation)
+                  m_callbacks.onRemoveFrequentLocation(record.path);
+                break;
+              case 3:
+                if (m_callbacks.onExcludeFrequentLocation)
+                  m_callbacks.onExcludeFrequentLocation(record.path);
+                break;
+              }
+            }
+        );
+      });
+      recentRow->addChild(std::move(arrowBtn));
+    }
+    return recentRow;
+  }
+
   void PlacesSidebarController::rebuild() {
     m_dirty = false;
     if (m_content == nullptr || m_model == nullptr)
@@ -632,20 +726,30 @@ namespace filemanager {
     std::unordered_set<std::string> savedPaths;
     for (const auto& saved : m_savedPlaces) {
       const auto norm = saved.path.lexically_normal();
-      m_pathCache.resolveAsync(norm, [this, alive = std::weak_ptr<bool>(m_alive)](const PlacePathResolution&) {
-        const auto locked = alive.lock();
-        if (!locked || !*locked)
-          return;
-        markDirty(false);
-      });
       if (!savedPaths.insert(norm.string()).second)
         continue;
+      // Cache hits call their completion inline. Only new resolutions should
+      // invalidate the sidebar, or each rebuild queues another layout.
+      if (!m_pathCache.findCached(norm)) {
+        m_pathCache.resolveAsync(norm, [this, alive = std::weak_ptr<bool>(m_alive)](const PlacePathResolution&) {
+          const auto locked = alive.lock();
+          if (!locked || !*locked)
+            return;
+          markDirty(false);
+        });
+      }
       places.push_back(
           {.label = saved.label,
            .identity = "saved:" + saved.id,
            .path = saved.path,
            .iconNames = {"folder", "folder-symbolic"},
            .personal = true}
+      );
+    }
+    if (m_settings.recentActivityEnabled() && m_settings.showRecentSidebar()) {
+      places.insert(
+          places.begin(),
+          Place{.label = "Recent", .identity = std::string(kRecentPlaceId), .path = "recent:/", .personal = true}
       );
     }
     orderPlaces(places, m_settings.loadPlaceOrder());
@@ -684,12 +788,18 @@ namespace filemanager {
     m_placeRows.clear();
     m_placeButtons.clear();
     m_placeCapacities.clear();
+
     const std::array<std::pair<const char*, const char*>, 3> groups{
         {{"Personal", "personal_expanded"}, {"Devices", "devices_expanded"}, {"Network", "network_expanded"}}
     };
     const auto hidden = m_settings.loadHiddenMounts();
+    const bool showCapacity = m_settings.showPlacesCapacity();
     for (const auto& [nameRaw, keyRaw] : groups) {
       const std::string name(nameRaw), key(keyRaw);
+      if ((name == "Personal" && !m_settings.showPlacesPersonal())
+          || (name == "Devices" && !m_settings.showPlacesDevices())
+          || (name == "Network" && !m_settings.showPlacesNetwork()))
+        continue;
       const bool expanded = m_settings.placesSectionExpanded(key);
       auto group = std::make_unique<Flex>();
       Flex* groupPtr = group.get();
@@ -747,6 +857,10 @@ namespace filemanager {
           m_insertionLines.emplace_back(place.identity, line.get());
           group->addChild(std::move(line));
         }
+        if (place.identity == kRecentPlaceId) {
+          group->addChild(buildRecentRow(place));
+          continue;
+        }
         auto row = makeButton(caption, [this, place] {
           if (place.mounted && m_callbacks.onNavigate)
             m_callbacks.onNavigate(place.path, true);
@@ -758,8 +872,8 @@ namespace filemanager {
         });
         if (place.mounted && !place.path.empty()) {
           row->setOnMiddleClick([this, place] {
-            if (m_callbacks.onOpenPlaceInBackgroundTab)
-              m_callbacks.onOpenPlaceInBackgroundTab(place);
+            if (m_callbacks.onMiddleClickPlace)
+              m_callbacks.onMiddleClickPlace(place);
           });
         }
         row->setContentAlign(ButtonContentAlign::Start);
@@ -786,7 +900,7 @@ namespace filemanager {
         if (auto* area = rowPtr->inputArea())
           area->setTabFocusKey("place:" + place.identity);
         m_placeRows.emplace_back(rowPtr, place);
-        if (place.mounted && !place.personal) {
+        if (showCapacity && place.mounted && !place.personal) {
           rowPtr->setClipChildren(true);
           rowPtr->setMirrorInRtl(false);
           rowPtr->label()->setFlexGrow(1.0F);
@@ -989,7 +1103,7 @@ namespace filemanager {
     if (x < vx || x >= vx + m_scroll->width() || y < vy || y >= vy + m_scroll->height())
       return std::nullopt;
     for (const auto& [row, place] : m_placeRows) {
-      if (!place.mounted || place.identity == "personal:trash")
+      if (!place.mounted || place.identity == "personal:trash" || place.identity == kRecentPlaceId)
         continue;
       bool visible = true;
       for (Node* node = row; node; node = node->parent())

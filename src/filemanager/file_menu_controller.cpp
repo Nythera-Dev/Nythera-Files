@@ -131,6 +131,7 @@ namespace filemanager {
     m_contextMenuPopup->setHighlightOnOpen(false);
     m_contextMenuPopup->setOnActivate([this](const ContextMenuControlEntry& entry) { activateEntry(entry); });
     m_contextMenuPopup->setOnDismissed([this] {
+      m_contextMenuPopup->setOnActivate([this](const ContextMenuControlEntry& entry) { activateEntry(entry); });
       m_applicationMenuOpen.reset();
       m_applicationMenuHovered.reset();
       for (std::size_t i = 0; i < m_applicationMenuButtons.size(); ++i) {
@@ -567,6 +568,10 @@ namespace filemanager {
           });
       entries.push_back({.id = menu_id::kRestore, .label = "Restore", .enabled = restoring});
       entries.push_back({.id = menu_id::kRestoreTo, .label = "Restore to…", .enabled = restoring});
+      entries.push_back({.separator = true});
+      entries.push_back(
+          {.id = menu_id::kPreferences, .label = "Preferences…", .shortcut = "Ctrl+,", .actionGlyph = "settings"}
+      );
       return entries;
     }
     entries.insert(
@@ -603,6 +608,10 @@ namespace filemanager {
     }
     entries.push_back(
         {.id = menu_id::kManualSymlink, .label = "Symlink…", .enabled = canCreate, .actionGlyph = "link"}
+    );
+    entries.push_back({.separator = true});
+    entries.push_back(
+        {.id = menu_id::kPreferences, .label = "Preferences…", .shortcut = "Ctrl+,", .actionGlyph = "settings"}
     );
     return entries;
   }
@@ -863,6 +872,8 @@ namespace filemanager {
                .hasSubmenu = true,
                .submenuEntries = helpMenuEntries(),
                .attachSubmenuContent = true},
+              {.separator = true},
+              {.id = menu_id::kPreferences, .label = "Preferences…", .shortcut = "Ctrl+,", .actionGlyph = "settings"},
           }
       );
     }
@@ -1214,7 +1225,8 @@ namespace filemanager {
   }
 
   void FileMenuController::showPlacesMenu(
-      std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen
+      std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen,
+      std::function<void(int)> activate
   ) {
     auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr;
     if (!m_contextMenuPopup || !surface || entries.empty())
@@ -1248,6 +1260,9 @@ namespace filemanager {
             .inputSerial = m_callbacks.lastInputSerial ? m_callbacks.lastInputSerial() : 0
         }
     );
+
+    if (activate && m_contextMenuPopup->isOpen())
+      m_contextMenuPopup->setOnActivate([activate = std::move(activate)](const auto& entry) { activate(entry.id); });
   }
 
   std::vector<ContextMenuControlEntry> FileMenuController::columnVisibilityEntries() const {
@@ -1380,7 +1395,7 @@ namespace filemanager {
     const auto& session = tab.session;
     const auto caps = tab.capabilities();
     const auto selectedPath = m_callbacks.selectedPath ? m_callbacks.selectedPath() : std::nullopt;
-    if (entry.id >= menu_id::kFileNewWindow && entry.id <= menu_id::kShowMenuBar) {
+    if (entry.id >= menu_id::kFileNewWindow && entry.id <= menu_id::kPreferences) {
       switch (entry.id) {
       case menu_id::kFileNewWindow:
         if (!session.browsingTrash() && m_callbacks.launchNewWindow)
@@ -1434,6 +1449,10 @@ namespace filemanager {
         break;
       case menu_id::kShowMenuBar:
         toggleMenuBarVisibility();
+        break;
+      case menu_id::kPreferences:
+        if (m_callbacks.openPreferences)
+          m_callbacks.openPreferences();
         break;
       }
       return true;

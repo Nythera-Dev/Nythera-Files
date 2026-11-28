@@ -1594,8 +1594,8 @@ public:
     manager.activatePointerMiddleItem(static_cast<std::size_t>(regIt - manager.activeSession().entries().begin()));
     TEST_CHECK(manager.m_tabs.count() == 2); // Regular files do not open tabs on middle-click.
 
-    if (manager.m_places.m_callbacks.onOpenPlaceInBackgroundTab) {
-      manager.m_places.m_callbacks.onOpenPlaceInBackgroundTab(trashPlace);
+    if (manager.m_places.m_callbacks.onMiddleClickPlace) {
+      manager.m_places.m_callbacks.onMiddleClickPlace(trashPlace);
       TEST_CHECK(manager.m_tabs.count() == 3);
       TEST_CHECK(manager.m_tabs.activeTabId() == firstId);
       TEST_CHECK(manager.m_tabs.tabs().back()->session.browsingTrash());

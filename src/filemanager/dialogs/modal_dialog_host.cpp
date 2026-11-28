@@ -7,6 +7,7 @@
 #include "filemanager/dialogs/conflict_dialog_controller.h"
 #include "filemanager/dialogs/symlink_dialog_controller.h"
 #include "filemanager/file_manager_settings.h"
+#include "render/core/render_styles.h"
 #include "render/render_context.h"
 #include "render/scene/input_area.h"
 #include "ui/controls/button.h"
@@ -778,6 +779,8 @@ namespace filemanager {
     if (!compositorBorder)
       m_root->setBorder(colorSpecFromRole(ColorRole::Primary), Style::borderWidth);
     m_root->setRadius(Style::scaledRadiusMd(1.0F));
+    if (m_customContent && m_customContent->roundedCorners)
+      m_root->setCornerShapes({});
     if (compositorBorder)
       m_root->setClipChildren(true);
     if (m_style == DialogStyle::Warning) {
@@ -999,6 +1002,7 @@ namespace filemanager {
     const auto mode = m_settings.transparencyMode();
     const float background = detachedPanelBackgroundOpacityForTransparencyMode(mode);
     m_root->setFill(colorSpecFromRole(ColorRole::SurfaceContainerLow, background));
+    m_root->setSurfaceBackground(mode != PanelTransparencyMode::Solid);
     for (auto* card : m_cards)
       card->setFill(
           colorSpecFromRole(ColorRole::SurfaceContainer, panelCardOpacityForTransparencyMode(mode, background))

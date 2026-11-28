@@ -139,13 +139,19 @@ The interface uses native rendering through NytheraLib rather than depending on 
 
 The aim is to make something visually distinctive without sacrificing the functionality expected from a file manager.
 
-**Independent theming is still in development.** Eventually, Files should support its own themes while optionally following Nythera Shell's appearance settings.
+Files follows Nythera Shell’s appearance by default and uses NytheraLib’s built-in palette in a standalone session. A Files theme JSON file can replace the inherited palette, and individual colour overrides apply on top. Files also supports its own interface font, icon theme, animations, transparency and Haze preferences.
 
 My colour scheme shouldn't have to be everyone else's 😁
 
 ## Files preferences and state
 
-Files keeps sparse preferences in `$XDG_CONFIG_HOME/nythera/files/config.toml` and its transparency override in `$XDG_CONFIG_HOME/nythera/files/theme.toml`. Window and pane sizes and sidebar expansion are runtime state in `$XDG_STATE_HOME/nythera/files/state.toml`. The existing `NYTHERA_CONFIG_HOME` and `NYTHERA_STATE_HOME` overrides take precedence over the XDG variables.
+Files keeps sparse preferences in `$XDG_CONFIG_HOME/nythera/files/config.toml` and its theme settings in `$XDG_CONFIG_HOME/nythera/files/theme.toml`. Window geometry, the last window’s tab paths, pane sizes and sidebar expansion are runtime state in `$XDG_STATE_HOME/nythera/files/state.toml`. The existing `NYTHERA_CONFIG_HOME` and `NYTHERA_STATE_HOME` overrides take precedence over the XDG variables.
+
+Open Preferences from Edit, the hamburger menu or Ctrl+,. General controls where Files starts, whether the last window’s tabs are restored, and what happens when a window closes with operations running. A directory argument takes precedence over tab restoration. An external directory request opens in a tab by default when Files already has a window. Use `--new-window` for a separate window.
+
+Appearance can import or export a Nythera palette JSON file and apply colour overrides while Shell inheritance is enabled. Navigation controls tab placement, click activation, the address bar and Places visibility. Right-click Back or Forward to jump through the current tab’s history. Press Tab while editing a path for completion.
+
+Recent activity is stored separately in `$XDG_STATE_HOME/nythera/files/recent_activity.json`. Files records normal file opens and directory visits, excluding Administrator Mode and refreshes. Disabling recording hides Recent and preserves history. Clearing history removes file and visit records while retaining pins and exclusions.
 
 In `config.toml`:
 

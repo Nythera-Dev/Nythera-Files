@@ -103,13 +103,18 @@ void FileManager::setThumbnailPolicy(filemanager::ThumbnailPolicy policy) {
     m_grid->notifyDataChanged();
 }
 
-void FileManager::inspectThumbnailCache(bool clear) {
-  const auto report = [this, alive = std::weak_ptr<bool>(m_alive)](ThumbnailService::DiskCacheInfo info) {
+void FileManager::inspectThumbnailCache(bool clear, std::function<void(std::string)> onResult) {
+  const auto report = [this, alive = std::weak_ptr<bool>(m_alive),
+                       onResult = std::move(onResult)](ThumbnailService::DiskCacheInfo info) {
     const auto lifetime = alive.lock();
     if (!lifetime || !*lifetime)
       return;
     g_autofree char* bytes = g_format_size(info.bytes);
-    setStatus(std::format("Shared thumbnail cache: {} thumbnails · {}", info.thumbnails, bytes));
+    auto message = std::format("Shared thumbnail cache: {} thumbnails · {}", info.thumbnails, bytes);
+    if (onResult)
+      onResult(std::move(message));
+    else
+      setStatus(std::move(message));
   };
   if (!clear) {
     m_pickerThumbnails.requestFreedesktopCacheInfo(false, report);

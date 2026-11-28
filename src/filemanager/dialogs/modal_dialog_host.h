@@ -96,6 +96,7 @@ namespace filemanager {
       bool compactHeightMode = false;
       bool selectDropdowns = false;
       bool rememberSize = true;
+      bool roundedCorners = false;
       std::uint32_t preferredWidth = 0;
       std::uint32_t preferredHeight = 0;
       std::uint32_t minWidth = 0;

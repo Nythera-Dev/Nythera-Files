@@ -115,6 +115,8 @@ namespace filemanager {
   }
 
   [[nodiscard]] inline std::filesystem::path normalizeTabPath(const std::filesystem::path& path) {
+    if (isRecentTabPath(path))
+      return "recent:/";
     if (path.empty() || isTrashTabPath(path))
       return path == "trash:" ? std::filesystem::path("trash:/") : path.lexically_normal();
     auto normalized = path.lexically_normal();
@@ -127,6 +129,8 @@ namespace filemanager {
   tabDisplayLabel(const std::filesystem::path& path, const std::filesystem::path& homePath) {
     if (isTrashTabPath(path))
       return "Wastebin";
+    if (isRecentTabPath(path))
+      return "Recent";
     const auto normalized = normalizeTabPath(path);
     const auto normalizedHome = normalizeTabPath(homePath);
     if (!normalizedHome.empty() && normalized == normalizedHome)
@@ -150,6 +154,8 @@ namespace filemanager {
   [[nodiscard]] inline std::string tabTooltipForPath(const std::filesystem::path& path) {
     if (isTrashTabPath(path))
       return "Wastebin";
+    if (isRecentTabPath(path))
+      return "Recent";
     return sanitizeFilenameForDisplay(normalizeTabPath(path).string());
   }
 
@@ -157,6 +163,8 @@ namespace filemanager {
   tabIconNamesForPath(const std::filesystem::path& path, const std::filesystem::path& homePath) {
     if (isTrashTabPath(path))
       return {"user-trash", "user-trash-symbolic"};
+    if (isRecentTabPath(path))
+      return {"document-open-recent"};
     const auto normalized = normalizeTabPath(path);
     const auto normalizedHome = normalizeTabPath(homePath);
     if (!normalizedHome.empty() && normalized == normalizedHome)

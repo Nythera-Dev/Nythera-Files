@@ -4,6 +4,7 @@
 #include "filemanager/admin_protocol.h"
 #include "filemanager/archive/archive_backend.h"
 #include "filemanager/file_search_session.h"
+#include "filemanager/recent_activity_store.h"
 #include "ui/dialogs/file_dialog.h"
 
 #include <cstdint>
@@ -66,6 +67,7 @@ namespace filemanager {
       std::function<void(std::string detail)> onEnumerateFailed;
       std::function<void(bool empty)> onEnumerateCompletedStatus;
       std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)> archivePassword;
+      std::function<std::vector<RecentActivityItem>()> recentItems;
     };
 
     struct PrivilegedBackend {
@@ -104,6 +106,7 @@ namespace filemanager {
     [[nodiscard]] const auto& archiveCatalogue() const noexcept { return m_archiveCatalogue; }
     [[nodiscard]] std::function<std::optional<std::string>(bool, GCancellable*)> archivePassword() const;
     void navigateTrash();
+    void navigateRecent();
     void enumerate(const std::filesystem::path& path, bool refreshSearch = true);
     void refreshPreservingSelection(bool refreshSearch = true);
     void reloadArchive();
@@ -141,7 +144,7 @@ namespace filemanager {
     void setSearchFiltersExpanded(bool expanded) { m_searchFiltersExpanded = expanded; }
     void closeSearch();
     [[nodiscard]] bool canSearch() const {
-      return !browsingArchive() && !m_browsingTrash && !isPrivilegedBackendActive();
+      return !browsingArchive() && !m_browsingTrash && !m_browsingRecent && !isPrivilegedBackendActive();
     }
     [[nodiscard]] bool searchOpen() const noexcept { return m_searchOpen; }
     void openSearch() noexcept { m_searchOpen = true; }
@@ -164,6 +167,7 @@ namespace filemanager {
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return m_path; }
     [[nodiscard]] bool browsingTrash() const noexcept { return m_browsingTrash; }
+    [[nodiscard]] bool browsingRecent() const noexcept { return m_browsingRecent; }
     [[nodiscard]] const std::vector<FileEntry>& entries() const noexcept {
       return m_search.active() ? m_search.entries() : m_entries;
     }
@@ -229,6 +233,7 @@ namespace filemanager {
 
     std::filesystem::path m_path;
     bool m_browsingTrash = false;
+    bool m_browsingRecent = false;
     std::unordered_map<std::string, std::string> m_trashUris;
     std::unordered_map<std::string, std::string> m_trashOriginalPaths;
     std::vector<BrowserLocation> m_backHistory;
