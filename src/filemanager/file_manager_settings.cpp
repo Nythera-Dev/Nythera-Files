@@ -5,6 +5,7 @@
 #include "config/files_config_validator.h"
 #include "config/toml_persistence.h"
 #include "core/log.h"
+#include "filemanager/file_column_serialization.h"
 
 #include <algorithm>
 #include <charconv>

@@ -316,7 +316,14 @@ public:
     dialog.closeDialog(1);
     TEST_CHECK(dialog.closeQueued());
     const auto dirLink = work / "file-link";
-    pumpUntil([&] { return !dialog.isOpen() && !ops.operations().empty() && ops.operations().back().finished; });
+    pumpUntil([&] {
+      return !dialog.isOpen()
+          && !ops.operations().empty()
+          && ops.operations().back().finished
+          && !manager.activeSession().loading()
+          && manager.activeTab().capabilities().canCreate
+          && !manager.m_operations.active();
+    });
     TEST_CHECK(ops.operations().back().succeeded);
     TEST_CHECK(std::filesystem::is_symlink(std::filesystem::symlink_status(dirLink)));
     TEST_CHECK(std::filesystem::read_symlink(dirLink) == emptyDir);
@@ -334,7 +341,12 @@ public:
     dialog.closeDialog(1);
     TEST_CHECK(dialog.closeQueued());
     pumpUntil([&] {
-      return !dialog.isOpen() && ops.operations().size() == opCountBeforeRel + 1 && ops.operations().back().finished;
+      return !dialog.isOpen()
+          && ops.operations().size() == opCountBeforeRel + 1
+          && ops.operations().back().finished
+          && !manager.activeSession().loading()
+          && manager.activeTab().capabilities().canCreate
+          && !manager.m_operations.active();
     });
     TEST_CHECK(ops.operations().back().succeeded);
     const auto relLink = work / "rel-link";
