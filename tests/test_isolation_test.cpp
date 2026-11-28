@@ -1,9 +1,11 @@
+#include "config/application_paths.h"
 #include "filemanager/file_manager.h"
 #include "filemanager/file_operation_manager.h"
 #include "filemanager/wastebin_fallback.h"
 #include "test_isolation.h"
 #include "util/file_utils.h"
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -35,17 +37,25 @@ public:
       return snap;
     };
 
-    const std::filesystem::path realStateFile = env.realUserHome().empty()
-        ? std::filesystem::path{}
-        : (env.realUserHome() / ".local" / "state" / "nythera" / "state.toml");
-    const StatSnapshot realBefore = realStateFile.empty() ? StatSnapshot{} : snapshotStat(realStateFile);
+    const std::array<std::filesystem::path, 3> realFiles = env.realUserHome().empty()
+        ? std::array<std::filesystem::path, 3>{}
+        : std::array<std::filesystem::path, 3>{
+              env.realUserHome() / ".config" / "nythera" / "files" / "config.toml",
+              env.realUserHome() / ".local" / "state" / "nythera" / "files" / "state.toml",
+              env.realUserHome() / ".local" / "state" / "nythera" / "state.toml",
+          };
+    std::array<StatSnapshot, 3> realBefore{};
+    for (std::size_t i = 0; i < realFiles.size(); ++i) {
+      if (!realFiles[i].empty())
+        realBefore[i] = snapshotStat(realFiles[i]);
+    }
 
     const auto pinnedDir = env.work() / "pinned-place";
     std::filesystem::create_directory(pinnedDir);
 
     FileManager manager(env.work().string());
     bool resolved = false;
-    manager.m_places.m_placePathResolveHook = [&](const std::filesystem::path&, auto done) {
+    manager.m_pathCache.m_resolveHook = [&](const std::filesystem::path&, auto done) {
       done(FileManager::PlacePathResolution{.exists = true, .isDirectory = true, .canonicalPath = pinnedDir});
       resolved = true;
       return true;
@@ -54,18 +64,35 @@ public:
     TEST_CHECK(resolved);
     TEST_CHECK(manager.m_places.m_savedPlaces.size() == 1);
 
-    const auto isolatedStateFile = env.state() / "nythera" / "state.toml";
-    TEST_CHECK(std::filesystem::is_regular_file(isolatedStateFile));
-    std::ifstream in(isolatedStateFile);
-    const std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    TEST_CHECK(content.find(pinnedDir.string()) != std::string::npos);
+    const auto isolatedConfigFile =
+        std::filesystem::path(FileUtils::applicationConfigDir(FileUtils::Application::Files)) / "config.toml";
+    TEST_CHECK(nythera::test::isPathWithinRoot(isolatedConfigFile, env.config()));
+    TEST_CHECK(std::filesystem::is_regular_file(isolatedConfigFile));
+    {
+      std::ifstream in(isolatedConfigFile);
+      const std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      TEST_CHECK(content.find(pinnedDir.string()) != std::string::npos);
+    }
 
-    if (!realStateFile.empty()) {
-      const StatSnapshot realAfter = snapshotStat(realStateFile);
-      TEST_CHECK(realAfter.exists == realBefore.exists);
-      TEST_CHECK(realAfter.size == realBefore.size);
-      TEST_CHECK(realAfter.mtimeSec == realBefore.mtimeSec);
-      TEST_CHECK(realAfter.mtimeNsec == realBefore.mtimeNsec);
+    TEST_CHECK(manager.m_settings.saveSidebarWidth(240));
+    const auto isolatedStateFile =
+        std::filesystem::path(FileUtils::applicationStateDir(FileUtils::Application::Files)) / "state.toml";
+    TEST_CHECK(nythera::test::isPathWithinRoot(isolatedStateFile, env.state()));
+    TEST_CHECK(std::filesystem::is_regular_file(isolatedStateFile));
+    {
+      std::ifstream in(isolatedStateFile);
+      const std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      TEST_CHECK(content.find("240") != std::string::npos);
+    }
+
+    for (std::size_t i = 0; i < realFiles.size(); ++i) {
+      if (!realFiles[i].empty()) {
+        const StatSnapshot realAfter = snapshotStat(realFiles[i]);
+        TEST_CHECK(realAfter.exists == realBefore[i].exists);
+        TEST_CHECK(realAfter.size == realBefore[i].size);
+        TEST_CHECK(realAfter.mtimeSec == realBefore[i].mtimeSec);
+        TEST_CHECK(realAfter.mtimeNsec == realBefore[i].mtimeNsec);
+      }
     }
   }
 

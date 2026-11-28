@@ -5,6 +5,7 @@
 #include "filemanager/admin_helper_session.h"
 #include "filemanager/admin_protocol.h"
 #include "filemanager/admin_session_client.h"
+#include "filemanager/dialogs/conflict_dialog_controller.h"
 #include "filemanager/file_manager.h"
 #include "filemanager/file_transfer_payload.h"
 #include "filemanager/file_view_menu.h"
@@ -370,7 +371,7 @@ public:
       const auto& tab = manager.activeTab();
       if (index >= tab.session.entries().size())
         return false;
-      return tab.selectedPaths.contains(tab.session.entries()[index].absPath.string());
+      return tab.m_selectedPaths.contains(tab.session.entries()[index].absPath.string());
     }
 
     [[nodiscard]] std::unique_ptr<Node> createTile() override {
@@ -431,18 +432,18 @@ public:
       grid->setAdapter(adapter.get());
       grid->bindScrollState(&manager.activeTab().scrollState);
       grid->setOnSelectionChanged([&manager](std::optional<std::size_t> index) {
-        if (manager.m_restoringSelection)
+        if (manager.m_selection.m_restoringSelection)
           return;
         auto& tab = manager.activeTab();
         const auto& entries = tab.session.entries();
         if (index.has_value() && *index < entries.size()) {
-          tab.selectedPath = entries[*index].absPath;
-          tab.selectedPaths = {entries[*index].absPath.string()};
-          tab.selectionAnchor = entries[*index].absPath;
+          tab.m_selectedPath = entries[*index].absPath;
+          tab.m_selectedPaths = {entries[*index].absPath.string()};
+          tab.m_selectionAnchor = entries[*index].absPath;
         } else {
-          tab.selectedPath.reset();
-          tab.selectedPaths.clear();
-          tab.selectionAnchor.reset();
+          tab.m_selectedPath.reset();
+          tab.m_selectedPaths.clear();
+          tab.m_selectionAnchor.reset();
         }
       });
       manager.m_grid = grid;
@@ -608,7 +609,7 @@ private:
           TEST_CHECK(result.ok() && result.succeeded == 1);
           applied = true;
         },
-        administrator
+        adminOperationContext(administrator)
     ));
     pumpUntil([&] { return applied; });
     struct stat state{};
@@ -684,7 +685,7 @@ private:
     pumpUntil([&] { return manager.activeTab().capabilities().canMutate; });
 
     NativeDataTransfer::ReadCallback pending;
-    manager.m_transfers.m_readPasteSelectionForTesting = [&](auto cb) { pending = std::move(cb); };
+    manager.m_clipboard.m_readPasteSelectionForTesting = [&](auto cb) { pending = std::move(cb); };
     const auto paste = [&](std::vector<std::string> paths, bool cut) {
       manager.pasteClipboard();
       TEST_CHECK(pending);
@@ -703,7 +704,9 @@ private:
     TEST_CHECK(pending && manager.activateTab(normalId));
     std::exchange(pending, {})(encodeFileTransfer({source.string()}, false));
     TEST_CHECK(!manager.activeTab().hasActiveAdminSession());
-    TEST_CHECK(manager.m_operations.copy({source.string()}, normal.string(), &manager.activeTab()) == 0);
+    TEST_CHECK(
+        manager.m_operations.copy({source.string()}, normal.string(), adminOperationContext(&manager.activeTab())) == 0
+    );
     pumpUntil([&] { return operations.size() == 1 && operations.back().finished; });
     TEST_CHECK(!std::filesystem::exists(normal / source.filename()));
 
@@ -712,10 +715,10 @@ private:
     TEST_CHECK(operations.back().succeeded && operations.back().adminOrigin && operations.back().undoUnavailable);
     TEST_CHECK(operations.back().processedBytes == 14 && operations.back().processedFiles == 1);
     TEST_CHECK(!manager.m_operations.canUndo() && readFile(target / source.filename()) == "paste contents");
-    TEST_CHECK(manager.activeTab().selectedPath == target / source.filename());
+    TEST_CHECK(manager.activeTab().m_selectedPath == target / source.filename());
 
     using DialogKind = filemanager::ConflictDialogKind;
-    manager.m_modalDialog.m_conflictDialogHook = [&](const auto& data, bool more, auto respond) {
+    manager.m_modalDialog.m_conflictController->m_conflictDialogHook = [&](const auto& data, bool more, auto respond) {
       TEST_CHECK(data.pathAccess == ConflictPathAccess::ExecutorOnly && data.kind == DialogKind::File);
       TEST_CHECK(!more && data.incoming.path == source);
       respond(2, "alternative.txt");
@@ -746,8 +749,8 @@ private:
     });
     TEST_CHECK(operations.back().succeeded && operations.back().requestedItemCount == 2);
     TEST_CHECK(operations.back().processedFiles == 2 && operations.back().completedEntries.size() == 2);
-    TEST_CHECK(manager.activeTab().selectedPaths.contains((target / tree.filename()).string()));
-    TEST_CHECK(manager.activeTab().selectedPaths.contains((target / empty.filename()).string()));
+    TEST_CHECK(manager.activeTab().m_selectedPaths.contains((target / tree.filename()).string()));
+    TEST_CHECK(manager.activeTab().m_selectedPaths.contains((target / empty.filename()).string()));
     TEST_CHECK(readFile(target / tree.filename() / "sub" / "child") == "mixed paste");
     TEST_CHECK(std::filesystem::file_size(target / empty.filename()) == 0);
 
@@ -764,14 +767,15 @@ private:
       pumpUntil([&] { return !manager.activeSession().loading(); });
       const auto count = operations.size();
       unsigned prompts = 0;
-      manager.m_modalDialog.m_conflictDialogHook = [choice, &prompts](const auto& data, bool more, auto respond) {
-        ++prompts;
-        TEST_CHECK(data.pathAccess == ConflictPathAccess::ExecutorOnly);
-        TEST_CHECK(data.kind == (choice == 5 ? DialogKind::Directory : DialogKind::File));
-        TEST_CHECK(more == (choice == 1 || choice == 5));
-        respond(choice == 1 ? 11 : choice, {});
-        return true;
-      };
+      manager.m_modalDialog.m_conflictController->m_conflictDialogHook =
+          [choice, &prompts](const auto& data, bool more, auto respond) {
+            ++prompts;
+            TEST_CHECK(data.pathAccess == ConflictPathAccess::ExecutorOnly);
+            TEST_CHECK(data.kind == (choice == 5 ? DialogKind::Directory : DialogKind::File));
+            TEST_CHECK(more == (choice == 1 || choice == 5));
+            respond(choice == 1 ? 11 : choice, {});
+            return true;
+          };
       std::vector<std::string> paths{source.string()};
       if (choice == 5) {
         paths = {tree.string()};
@@ -782,20 +786,23 @@ private:
         writeFile(empty, "also replaced");
         paths.push_back(empty.string());
       }
-      manager.m_transfers.m_consumedCutSelection.reset(); // The injected clipboard payload is a new selection.
+      manager.m_clipboard.m_consumedCutSelection.reset(); // The injected clipboard payload is a new selection.
       paste(std::move(paths), false);
       pumpUntil([&] { return operations.size() == count + 1 && operations.back().finished; });
       TEST_CHECK(prompts == 1 && operations.back().cancelled == (choice == 4));
       TEST_CHECK(operations.back().succeeded == (choice != 4));
-      if (choice == 3)
-        TEST_CHECK(operations.back().completedEntries.empty() && operations.back().status.contains("0 of 1"));
+      if (choice == 3) {
+        TEST_CHECK(operations.back().completedEntries.empty());
+        TEST_CHECK(operations.back().resultTitle == "Copy skipped");
+        TEST_CHECK(operations.back().resultDescription == "No items copied to " + target.string() + " · 1 skipped");
+      }
     }
     TEST_CHECK(readFile(target / source.filename()) == "replacement");
     TEST_CHECK(readFile(target / empty.filename()) == "also replaced");
     TEST_CHECK(readFile(target / tree.filename() / "added.txt") == "merge");
 
     pumpUntil([&] { return !manager.activeSession().loading(); });
-    manager.m_modalDialog.m_conflictDialogHook = [](const auto&, bool, auto respond) {
+    manager.m_modalDialog.m_conflictController->m_conflictDialogHook = [](const auto&, bool, auto respond) {
       respond(2, "alternative.txt");
       return true;
     };
@@ -805,7 +812,7 @@ private:
     TEST_CHECK(!operations.back().succeeded && operations.back().status.contains("alternative name already exists"));
 
     bool waitingForDecision = false;
-    manager.m_modalDialog.m_conflictDialogHook = [&](const auto&, bool, auto) {
+    manager.m_modalDialog.m_conflictController->m_conflictDialogHook = [&](const auto&, bool, auto) {
       waitingForDecision = true;
       return true;
     };
@@ -867,8 +874,9 @@ private:
       pumpUntil([&] {
         return manager.activeTab().hasActiveAdminSession() && manager.activeTab().capabilities().canMutate;
       });
-      const auto id =
-          manager.m_operations.copy({first.string(), source.string()}, target.string(), &manager.activeTab());
+      const auto id = manager.m_operations.copy(
+          {first.string(), source.string()}, target.string(), adminOperationContext(&manager.activeTab())
+      );
       TEST_CHECK(id != 0);
       const auto& operation = manager.m_operations.operations().back();
       pumpUntil([&] { return atCheckpoint.load(); });
@@ -917,8 +925,10 @@ private:
           TEST_CHECK(operation.completedEntries.size() == (end == End::Resume ? 2 : 1));
           TEST_CHECK(operation.mutated);
         }
-        if (end == End::Cancel)
-          TEST_CHECK(operation.resultDescription.contains("1 of 2 selected items copied"));
+        if (end == End::Cancel) {
+          TEST_CHECK(operation.resultDescription.contains("1 file copied"));
+          TEST_CHECK(operation.resultDescription.contains(target.string()));
+        }
         if (end == End::CloseTab)
           TEST_CHECK(manager.m_statusMessage != operation.status);
       }
@@ -1008,8 +1018,8 @@ private:
     // Start inline rename before simulating a helper disconnect.
     Stage3Scene scene(manager, 960.0F, 640.0F);
     Input::setValidateKeyMatcher({});
-    manager.activeTab().selectedPath = dir / "initial.txt";
-    manager.activeTab().selectedPaths = {(dir / "initial.txt").string()};
+    manager.activeTab().m_selectedPath = dir / "initial.txt";
+    manager.activeTab().m_selectedPaths = {(dir / "initial.txt").string()};
     manager.beginRename();
     TEST_CHECK(manager.m_renamePath == dir / "initial.txt");
     TEST_CHECK(manager.m_inlineEditArea != nullptr);
@@ -1078,6 +1088,21 @@ private:
     TEST_CHECK(manager.m_operations.operations().size() == opsBefore + 2);
     TEST_CHECK(manager.m_operations.canUndo());
 
+    manager.activeTab().m_selectedPaths = {(normalDir / "normal.txt").string()};
+    manager.m_modalDialog.m_presentToplevelForTest = [](auto&, auto*, auto) {};
+    manager.handleWindowKeyEvent(KeyboardEvent{.sym = XKB_KEY_Delete, .modifiers = KeyMod::Shift, .pressed = true});
+    TEST_CHECK(manager.m_modalDialog.isOpen() && manager.m_modalDialog.m_title == "Permanently delete?");
+    manager.m_modalDialog.closeDialog(0);
+    pumpUntil([&] { return !manager.m_modalDialog.isOpen(); });
+    TEST_CHECK(std::filesystem::exists(normalDir / "normal.txt"));
+
+    manager.handleWindowKeyEvent(KeyboardEvent{.sym = XKB_KEY_Delete, .pressed = true});
+    TEST_CHECK(!manager.m_modalDialog.isOpen());
+    TEST_CHECK(manager.m_operations.operations().size() == opsBefore + 3);
+    TEST_CHECK(manager.m_operations.operations().back().kind == FileOperationManager::Kind::Trash);
+    TEST_CHECK(!manager.m_operations.operations().back().adminOrigin);
+    pumpUntil([&] { return !manager.m_operations.active(); });
+
     // Admin tab still has its own privileged session intact.
     TEST_CHECK(manager.m_tabs.findTab(adminTabId)->hasActiveAdminSession());
 
@@ -1122,8 +1147,8 @@ private:
 
     // 2. Verify the shared mutations are enabled alongside the existing restricted actions.
     {
-      manager.activeTab().selectedPath = writableDir / "alpha.txt";
-      manager.activeTab().selectedPaths = {(writableDir / "alpha.txt").string()};
+      manager.activeTab().m_selectedPath = writableDir / "alpha.txt";
+      manager.activeTab().m_selectedPaths = {(writableDir / "alpha.txt").string()};
       const auto fileMenu = manager.fileMenuEntries();
       const auto* createMenu = findEntryById(fileMenu, 110);
       TEST_CHECK(createMenu != nullptr && createMenu->enabled);
@@ -1158,7 +1183,7 @@ private:
     if (manager.activeSession().loading())
       TEST_CHECK(manager.m_pendingInlineRenamePath == writableDir / "New File");
     pumpUntil([&] { return !manager.activeSession().loading(); });
-    TEST_CHECK(manager.activeTab().selectedPath == writableDir / "New File");
+    TEST_CHECK(manager.activeTab().m_selectedPath == writableDir / "New File");
     scene.relayout(manager, 1120.0F, 760.0F);
     TEST_CHECK(manager.m_renamePath == writableDir / "New File");
     TEST_CHECK(manager.m_inlineEditArea != nullptr);
@@ -1171,9 +1196,9 @@ private:
           && !manager.activeSession().loading();
     });
     TEST_CHECK(!std::filesystem::exists(writableDir / "New File"));
-    TEST_CHECK(manager.activeTab().selectedPath == writableDir / "created_doc.txt");
+    TEST_CHECK(manager.activeTab().m_selectedPath == writableDir / "created_doc.txt");
     TEST_CHECK(
-        manager.activeTab().selectedPaths == std::unordered_set<std::string>{(writableDir / "created_doc.txt").string()}
+        manager.activeTab().m_selectedPaths == std::unordered_set<std::string>{(writableDir / "created_doc.txt").string()}
     );
     scene.relayout(manager, 1120.0F, 760.0F);
 
@@ -1184,7 +1209,7 @@ private:
           && !manager.m_operations.active()
           && !manager.activeSession().loading();
     });
-    TEST_CHECK(manager.activeTab().selectedPath == writableDir / "New Folder");
+    TEST_CHECK(manager.activeTab().m_selectedPath == writableDir / "New Folder");
     scene.relayout(manager, 1120.0F, 760.0F);
     TEST_CHECK(manager.m_renamePath == writableDir / "New Folder");
     manager.cancelRename();
@@ -1198,7 +1223,7 @@ private:
           && !manager.m_operations.active()
           && !manager.activeSession().loading();
     });
-    TEST_CHECK(manager.activeTab().selectedPath == writableDir / "New Folder 2");
+    TEST_CHECK(manager.activeTab().m_selectedPath == writableDir / "New Folder 2");
     scene.relayout(manager, 1120.0F, 760.0F);
     TEST_CHECK(manager.m_renamePath == writableDir / "New Folder 2");
     typeInlineTextAndSubmit(manager.m_dispatcher, "renamed_folder");
@@ -1215,7 +1240,7 @@ private:
     const auto alphaIt = std::ranges::find(manager.activeSession().entries(), alphaPath, &FileEntry::absPath);
     TEST_CHECK(alphaIt != manager.activeSession().entries().end());
     scene.grid->setSelectedIndex(static_cast<std::size_t>(alphaIt - manager.activeSession().entries().begin()), false);
-    TEST_CHECK(manager.activeTab().selectedPath == alphaPath);
+    TEST_CHECK(manager.activeTab().m_selectedPath == alphaPath);
     manager.handleWindowKeyEvent(KeyboardEvent{.sym = XKB_KEY_F2, .pressed = true});
     TEST_CHECK(manager.m_renamePath == alphaPath && manager.m_inlineEditArea != nullptr);
 
@@ -1243,28 +1268,48 @@ private:
     });
     TEST_CHECK(!std::filesystem::exists(alphaPath));
     TEST_CHECK(readFile(writableDir / "beta.txt") == "alpha");
-    TEST_CHECK(manager.activeTab().selectedPath == writableDir / "beta.txt");
+    TEST_CHECK(manager.activeTab().m_selectedPath == writableDir / "beta.txt");
 
     // 6. Text creation, duplicate, selection symlink and multi-item delete use the shared transport.
     manager.activateContextMenuEntry(ContextMenuControlEntry{.id = 113});
     pumpUntil([&] { return !manager.m_operations.active() && !manager.activeSession().loading(); });
     TEST_CHECK(std::filesystem::is_regular_file(writableDir / "New File.txt"));
     manager.m_pendingInlineRenamePath.reset();
-    manager.activeTab().selectedPaths = {(writableDir / "beta.txt").string()};
+    manager.activeTab().m_selectedPaths = {(writableDir / "beta.txt").string()};
     manager.activateContextMenuEntry(ContextMenuControlEntry{.id = kDuplicate});
     pumpUntil([&] { return !manager.m_operations.active() && !manager.activeSession().loading(); });
     const auto duplicate = writableDir / "beta (copy).txt";
     TEST_CHECK(readFile(duplicate) == "alpha");
 
-    manager.activeTab().selectedPaths = {(writableDir / "beta.txt").string()};
+    manager.activeTab().m_selectedPaths = {(writableDir / "beta.txt").string()};
     manager.activateContextMenuEntry(ContextMenuControlEntry{.id = kSelectionSymlink});
     pumpUntil([&] { return !manager.m_operations.active() && !manager.activeSession().loading(); });
     const auto link = writableDir / "beta-link.txt";
     TEST_CHECK(std::filesystem::read_symlink(link) == writableDir / "beta.txt");
 
-    const auto id = manager.m_operations.removePermanently({duplicate.string(), link.string()}, &manager.activeTab());
-    TEST_CHECK(id != 0);
-    pumpUntil([&] { return !manager.m_operations.active() && !manager.activeSession().loading(); });
+    const auto beforeDeletion = manager.m_operations.operations().size();
+    manager.activeTab().m_selectedPaths = {duplicate.string(), link.string()};
+    manager.m_modalDialog.m_presentToplevelForTest = [](auto&, auto*, auto) {};
+    manager.handleWindowKeyEvent(KeyboardEvent{.sym = XKB_KEY_Delete, .pressed = true, .repeat = true});
+    TEST_CHECK(!manager.m_modalDialog.isOpen());
+    manager.handleWindowKeyEvent(KeyboardEvent{.sym = XKB_KEY_Delete, .modifiers = KeyMod::Shift, .pressed = true});
+    TEST_CHECK(manager.m_modalDialog.isOpen() && manager.m_modalDialog.m_title == "Permanently delete?");
+    manager.m_modalDialog.closeDialog(0);
+    pumpUntil([&] { return !manager.m_modalDialog.isOpen(); });
+    TEST_CHECK(manager.m_operations.operations().size() == beforeDeletion);
+    TEST_CHECK(std::filesystem::exists(duplicate) && std::filesystem::is_symlink(link));
+    manager.handleWindowKeyEvent(KeyboardEvent{.sym = XKB_KEY_Delete, .pressed = true});
+    TEST_CHECK(manager.m_modalDialog.isOpen() && manager.m_modalDialog.m_title == "Permanently delete?");
+    // Confirm while a same-directory refresh has invalidated cached writability.
+    manager.activeSession().m_loading = true;
+    manager.activeSession().m_directoryWritable.reset();
+    TEST_CHECK(!manager.activeTab().capabilities().canMutate);
+    manager.m_modalDialog.closeDialog(1);
+    pumpUntil([&] {
+      return manager.m_operations.operations().size() == beforeDeletion + 1 && !manager.m_operations.active();
+    });
+    manager.activeSession().enumerate(writableDir);
+    pumpUntil([&] { return !manager.activeSession().loading(); });
     TEST_CHECK(!std::filesystem::exists(duplicate) && !std::filesystem::is_symlink(link));
     const auto& deletion = manager.m_operations.operations().back();
     TEST_CHECK(deletion.succeeded && deletion.adminOrigin && deletion.processedFiles == 2);
@@ -1279,8 +1324,8 @@ private:
     pumpUntil([&] { return manager.activeSession().path() == readOnlyDir && !manager.activeSession().loading(); });
     TEST_CHECK(!manager.activeTab().capabilities().canCreateBasic);
     TEST_CHECK(!manager.activeTab().capabilities().canRename);
-    manager.activeTab().selectedPath = readOnlyDir / "locked.txt";
-    manager.activeTab().selectedPaths = {(readOnlyDir / "locked.txt").string()};
+    manager.activeTab().m_selectedPath = readOnlyDir / "locked.txt";
+    manager.activeTab().m_selectedPaths = {(readOnlyDir / "locked.txt").string()};
     const auto roFileMenu = manager.fileMenuEntries();
     TEST_CHECK(!findEntryById(roFileMenu, 110)->enabled);
     const auto roEditMenu = manager.editMenuEntries();
@@ -1295,8 +1340,8 @@ private:
     manager.navigate(writableDir);
     pumpUntil([&] { return manager.activeSession().path() == writableDir && !manager.activeSession().loading(); });
     scene.relayout(manager, 1120.0F, 760.0F);
-    manager.activeTab().selectedPath = writableDir / "beta.txt";
-    manager.activeTab().selectedPaths = {(writableDir / "beta.txt").string()};
+    manager.activeTab().m_selectedPath = writableDir / "beta.txt";
+    manager.activeTab().m_selectedPaths = {(writableDir / "beta.txt").string()};
     manager.beginRename();
     TEST_CHECK(manager.m_renamePath == writableDir / "beta.txt");
     dispatchClick(manager.m_dispatcher, manager.m_adminFinishButton);

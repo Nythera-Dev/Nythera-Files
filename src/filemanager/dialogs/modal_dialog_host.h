@@ -36,6 +36,16 @@ class WaylandConnection;
 namespace filemanager {
 
   class FileManagerSettings;
+  class ConflictDialogController;
+  class SymlinkDialogController;
+
+  enum class DialogChoiceStyle : std::uint8_t { Normal, Cancel, Destructive };
+  struct DialogChoice {
+    std::string label;
+    int response;
+    DialogChoiceStyle style = DialogChoiceStyle::Normal;
+  };
+  enum class DialogStyle : std::uint8_t { Standard, Warning, Conflict, TextPrompt };
 
   enum class ConflictDialogKind : std::uint8_t {
     File,
@@ -108,9 +118,9 @@ namespace filemanager {
     ~ModalDialogHost();
 
     void showDialog(
-        std::string title, std::string message, std::vector<std::pair<std::string, int>> choices,
-        std::function<void(int)> response, ToplevelSurface* parent = nullptr, bool applyToAllCheckbox = false,
-        bool alternativeName = false, std::optional<CustomContent> customContent = std::nullopt
+        std::string title, std::string message, std::vector<DialogChoice> choices, std::function<void(int)> response,
+        ToplevelSurface* parent = nullptr, std::optional<CustomContent> customContent = std::nullopt,
+        DialogStyle style = DialogStyle::Standard
     );
     void textPrompt(
         std::string title, std::string message, bool password, std::function<void(std::optional<std::string>)> response
@@ -136,6 +146,7 @@ namespace filemanager {
     [[nodiscard]] std::uint32_t normalHeight() const noexcept;
     void setCompactHeight(std::optional<float> height);
     void setFocus(InputArea* area);
+    [[nodiscard]] InputArea* focusedArea() const noexcept { return m_dispatcher.focusedArea(); }
     void registerCard(Flex* card);
 
     [[nodiscard]] FileOperationManager::ConflictResolver
@@ -150,7 +161,7 @@ namespace filemanager {
     }
     [[nodiscard]] bool pointerCaptured() const noexcept { return m_dispatcher.pointerCaptured(); }
     [[nodiscard]] bool closeQueued() const noexcept { return m_closeQueued; }
-    [[nodiscard]] bool backgroundConflictPending() const noexcept { return m_backgroundConflictPending; }
+    [[nodiscard]] bool backgroundConflictPending() const noexcept;
     [[nodiscard]] ToplevelSurface* surface() const noexcept { return m_surface.get(); }
     [[nodiscard]] wl_surface* wlSurface() const noexcept { return m_surface ? m_surface->wlSurface() : nullptr; }
     [[nodiscard]] bool ownsSurface(wl_surface* surface) const noexcept;
@@ -168,8 +179,8 @@ namespace filemanager {
     static std::uint32_t
     initialExtent(std::uint32_t saved, std::uint32_t fallback, std::uint32_t minimum, std::uint32_t available);
     void buildDialog(float dialogWidth);
+    void wrapDialogBodyForScrolling();
     void prepareFrame(bool needsUpdate, bool needsLayout);
-    [[nodiscard]] bool submitSymlinkDialog();
 
     WaylandConnection& m_wayland;
     RenderContext& m_renderContext;
@@ -192,7 +203,7 @@ namespace filemanager {
     std::function<void(int)> m_response;
     std::string m_title;
     std::string m_message;
-    bool m_warningStyle = false;
+    DialogStyle m_style = DialogStyle::Standard;
     bool m_resizable = false;
     std::string m_sizeStateKey;
     std::uint32_t m_preferredWidth = 0;
@@ -215,35 +226,19 @@ namespace filemanager {
     Image* m_deleteWarning = nullptr;
     DialogBackgroundArtwork* m_topAccent = nullptr;
     DialogBackgroundArtwork* m_cornerAccent = nullptr;
-    std::optional<ConflictDialogData> m_conflict;
-    std::shared_ptr<void> m_conflictRequest;
-    std::shared_ptr<std::timed_mutex> m_conflictMutex = std::make_shared<std::timed_mutex>();
     // Allows headless tests to exercise dialog contents, parenting and responses.
     std::function<void(ToplevelSurface&, ToplevelSurface*, DialogSize)> m_presentToplevelForTest;
     Renderer* m_initialLayoutRendererForTest = nullptr;
-    std::function<bool(const ConflictDialogData&, bool hasRemaining, std::function<void(int, std::string)>)>
-        m_conflictDialogHook;
-    std::vector<std::pair<std::string, int>> m_choices;
+    std::vector<DialogChoice> m_choices;
     bool m_closeQueued = false;
-    bool m_applyToAllCheckbox = false;
-    bool m_applyToAllChecked = false;
-    bool m_alternativeNameEnabled = false;
-    std::string m_alternativeName;
-    std::filesystem::path m_destination;
-    Input* m_alternativeNameInput = nullptr;
-    Label* m_alternativeNameError = nullptr;
-    bool m_textPrompt = false;
+    guint m_closeSource = 0;
+    std::string m_promptValue;
+    Input* m_promptInput = nullptr;
     bool m_passwordPrompt = false;
     std::function<void()> m_cancelArchivePassword;
-    bool m_backgroundConflictPending = false;
-    bool m_symlinkDialogActive = false;
-    std::function<std::optional<SymlinkError>(const std::string&, const std::string&)> m_symlinkSubmitCallback;
-    std::function<void(const std::string&)> m_symlinkBrowseCallback;
-    std::function<void()> m_symlinkDismissCallback;
-    Input* m_symlinkName = nullptr;
-    Input* m_symlinkTarget = nullptr;
-    Button* m_symlinkBrowseButton = nullptr;
-    Label* m_symlinkError = nullptr;
+    bool m_backgroundArchivePasswordPending = false;
+    std::unique_ptr<ConflictDialogController> m_conflictController;
+    std::unique_ptr<SymlinkDialogController> m_symlinkController;
     std::optional<CustomContent> m_customContent;
     int m_resultPending = -1;
     std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);

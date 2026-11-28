@@ -69,6 +69,36 @@ namespace filemanager {
     [[nodiscard]] std::vector<std::string> selectedPathsOrdered() const;
     [[nodiscard]] std::optional<std::pair<std::filesystem::path, bool>> symlinkSelection() const;
 
+    [[nodiscard]] const std::optional<std::filesystem::path>& selectedPath() const noexcept { return m_selectedPath; }
+    [[nodiscard]] const std::unordered_set<std::string>& selectedPaths() const noexcept { return m_selectedPaths; }
+    [[nodiscard]] const std::optional<std::filesystem::path>& selectionAnchor() const noexcept {
+      return m_selectionAnchor;
+    }
+    [[nodiscard]] bool hasSelection() const noexcept { return !m_selectedPaths.empty(); }
+    [[nodiscard]] std::size_t selectionCount() const noexcept { return m_selectedPaths.size(); }
+    [[nodiscard]] bool isPathSelected(const std::string& path) const { return m_selectedPaths.contains(path); }
+
+    void clearSelection();
+    void resetSelectedPath() { m_selectedPath.reset(); }
+    void selectSingle(const std::filesystem::path& path, bool updateAnchor = true);
+    void setSelection(
+        std::unordered_set<std::string> paths, std::optional<std::filesystem::path> primary,
+        std::optional<std::filesystem::path> anchor
+    );
+    void setSelectionWithAnchor(std::unordered_set<std::string> paths, std::optional<std::filesystem::path> primary);
+    void toggleSelection(const std::filesystem::path& path);
+    void selectRange(
+        std::size_t targetIndex, bool keepExisting,
+        const std::optional<std::filesystem::path>& fallbackAnchor = std::nullopt
+    );
+    void moveSelectionFocus(const std::filesystem::path& path);
+    void renameSelectedPath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath);
+    void eraseSelectedPath(const std::filesystem::path& path);
+    void reconcileSelectionWithEntries();
+    void saveBrowsingSelection();
+    bool restoreBrowsingSelection();
+    void clearBrowsingSelection();
+
     void cancelStatusFreeSpaceQuery();
     void queryStatusFreeSpaceAsync(const std::filesystem::path& path);
     void cancelSelectionInfoQuery();
@@ -99,17 +129,8 @@ namespace filemanager {
     std::optional<float> pendingScrollOffsetAfterRefresh;
 
     std::optional<std::filesystem::path> linkTargetToReveal;
-    std::optional<std::filesystem::path> selectedPath;
-    std::unordered_set<std::string> selectedPaths;
-    std::optional<std::filesystem::path> selectionAnchor;
 
     std::optional<PasteSelection> pendingPasteSelection;
-    struct BrowsingSelection {
-      std::optional<std::filesystem::path> path;
-      std::unordered_set<std::string> paths;
-      std::optional<std::filesystem::path> anchor;
-    };
-    std::optional<BrowsingSelection> browsingSelection;
     std::unordered_set<std::string> identityCheckedPaths;
     std::optional<std::filesystem::path> pendingPasteRevealPath;
     std::optional<std::uint64_t> pendingDropScrollGeneration;
@@ -123,6 +144,17 @@ namespace filemanager {
 
   private:
     friend class ::FileManagerTestAccess;
+
+    struct BrowsingSelection {
+      std::optional<std::filesystem::path> path;
+      std::unordered_set<std::string> paths;
+      std::optional<std::filesystem::path> anchor;
+    };
+
+    std::optional<std::filesystem::path> m_selectedPath;
+    std::unordered_set<std::string> m_selectedPaths;
+    std::optional<std::filesystem::path> m_selectionAnchor;
+    std::optional<BrowsingSelection> m_browsingSelection;
 
     std::function<void(TabId)> m_onStatusInfoChanged;
 
@@ -141,5 +173,7 @@ namespace filemanager {
     FreeSpaceQueryHook m_freeSpaceQueryHook;
     SelectionInfoQueryHook m_selectionInfoQueryHook;
   };
+
+  [[nodiscard]] std::optional<FileOperationManager::AdminOperationContext> adminOperationContext(BrowserTab* tab);
 
 } // namespace filemanager

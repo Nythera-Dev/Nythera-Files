@@ -1,3 +1,5 @@
+#include "filemanager/dialogs/conflict_dialog_controller.h"
+#include "filemanager/dialogs/symlink_dialog_controller.h"
 #include "filemanager/file_interaction.h"
 #include "filemanager/file_manager.h"
 #include "render/core/renderer.h"
@@ -8,7 +10,9 @@
 #include "ui/controls/flex.h"
 #include "ui/controls/input.h"
 #include "ui/controls/label.h"
+#include "ui/controls/scroll_view.h"
 #include "ui/dialogs/file_dialog.h"
+#include "ui/scroll_into_view.h"
 #include "util/file_utils.h"
 
 #include <algorithm>
@@ -136,38 +140,22 @@ public:
   static void openHeadlessSymlinkDialog(FileManager& manager, StubRenderer& renderer) {
     auto& dialog = manager.m_modalDialog;
     auto handlers = manager.makeSymlinkDialogHandlers();
-    dialog.m_symlinkDialogActive = true;
-    dialog.m_symlinkSubmitCallback = std::move(handlers.onSubmit);
-    dialog.m_symlinkBrowseCallback = std::move(handlers.onBrowseTarget);
-    dialog.m_symlinkDismissCallback = std::move(handlers.onDismiss);
-    dialog.m_title = "Create Symlink";
-    dialog.m_message = "Enter a name and target path. Relative targets are resolved from this folder.";
-    dialog.m_choices = {{"Cancel", 0}, {"Create Symlink", 1}};
-    dialog.m_closeQueued = false;
-    dialog.m_response = [&dialog](int) {
-      if (auto dismiss = std::exchange(dialog.m_symlinkDismissCallback, nullptr))
-        dismiss();
-      dialog.m_symlinkDialogActive = false;
-      dialog.m_symlinkSubmitCallback = nullptr;
-      dialog.m_symlinkBrowseCallback = nullptr;
-      dialog.m_symlinkName = nullptr;
-      dialog.m_symlinkTarget = nullptr;
-      dialog.m_symlinkBrowseButton = nullptr;
-      dialog.m_symlinkError = nullptr;
-    };
-    dialog.buildDialog(640.0F);
+    dialog.m_presentToplevelForTest = [](auto&, auto*, auto) {};
+    dialog.showSymlinkDialog(
+        std::move(handlers.onSubmit), std::move(handlers.onBrowseTarget), std::move(handlers.onDismiss)
+    );
     dialog.m_root->setSize(640.0F, 480.0F);
     dialog.m_root->layout(renderer);
   }
 
   static void clickBrowseButton(filemanager::ModalDialogHost& dialog, StubRenderer& renderer) {
-    TEST_CHECK(dialog.m_symlinkBrowseButton != nullptr);
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkBrowseButton != nullptr);
     dialog.m_root->layout(renderer);
     float absX = 0.0F;
     float absY = 0.0F;
-    Node::absolutePosition(dialog.m_symlinkBrowseButton->inputArea(), absX, absY);
-    const float clickX = absX + dialog.m_symlinkBrowseButton->inputArea()->width() * 0.5F;
-    const float clickY = absY + dialog.m_symlinkBrowseButton->inputArea()->height() * 0.5F;
+    Node::absolutePosition(dialog.m_symlinkController->m_symlinkBrowseButton->inputArea(), absX, absY);
+    const float clickX = absX + dialog.m_symlinkController->m_symlinkBrowseButton->inputArea()->width() * 0.5F;
+    const float clickY = absY + dialog.m_symlinkController->m_symlinkBrowseButton->inputArea()->height() * 0.5F;
     TEST_CHECK(dialog.m_dispatcher.pointerButton(clickX, clickY, BTN_LEFT, true, 1, 10, false));
     TEST_CHECK(dialog.m_dispatcher.pointerButton(clickX, clickY, BTN_LEFT, false, 2, 20, false));
   }
@@ -249,22 +237,59 @@ public:
     auto& dialog = manager.m_modalDialog;
     auto& ops = manager.m_operations;
 
+    {
+      TEST_CHECK(dialog.m_settings.saveDialogSize("conflict_dialog_size", 640, 620));
+      dialog.m_initialLayoutRendererForTest = &renderer;
+      std::pair<std::uint32_t, std::uint32_t> configured;
+      dialog.m_presentToplevelForTest = [&](auto&, auto*, auto size) { configured = size; };
+      dialog.m_conflictController->present(
+          {.incoming = {.name = "incoming", .path = targetFile}, .existing = {.name = "existing", .path = targetFile}},
+          false, nullptr, [](int, std::string) {}
+      );
+      TEST_CHECK(dialog.m_root && !dialog.m_spacer->participatesInLayout());
+      auto* error = dialog.m_conflictController->m_alternativeNameError;
+      TEST_CHECK(error && !error->visible());
+      auto* scroll = findEnclosingScrollView(error);
+      TEST_CHECK(scroll && scroll->viewportPaddingV() == 0.0F && scroll->viewportPaddingH() == 0.0F);
+      TEST_CHECK(configured.first == 640 && configured.second > 260 && configured.second < 620);
+      const float width = static_cast<float>(configured.first);
+      const float height = static_cast<float>(configured.second);
+      dialog.m_root->setSize(width, height);
+      dialog.m_root->layout(renderer);
+      TEST_CHECK(!scroll->scrollable());
+      TEST_CHECK(dialog.m_footer->y() - (scroll->y() + scroll->height()) <= 11.0F);
+      dialog.m_root->setSize(width, height - 40.0F);
+      dialog.m_root->layout(renderer);
+      TEST_CHECK(scroll->scrollable());
+      dialog.forceCloseImmediate();
+      dialog.m_initialLayoutRendererForTest = nullptr;
+    }
+
     // 2. Dialog layout, Browse... opens SelectFileOrFolder, file selection populates field and clears errors.
     openHeadlessSymlinkDialog(manager, renderer);
-    TEST_CHECK(dialog.m_symlinkName != nullptr && dialog.m_symlinkTarget != nullptr);
-    TEST_CHECK(dialog.m_symlinkBrowseButton != nullptr && dialog.m_symlinkError != nullptr);
-    TEST_CHECK(dialog.m_symlinkBrowseButton->label()->text() == "Browse…");
-    TEST_CHECK(dialog.m_symlinkBrowseButton->variant() == ButtonVariant::Outline);
-    TEST_CHECK(dialog.m_symlinkTarget->flexGrow() == 1.0F);
-    TEST_CHECK(dialog.m_symlinkTarget->parent() == dialog.m_symlinkBrowseButton->parent());
-    const auto* targetRow = dynamic_cast<const Flex*>(dialog.m_symlinkTarget->parent());
+    TEST_CHECK(
+        dialog.m_symlinkController->m_symlinkName != nullptr && dialog.m_symlinkController->m_symlinkTarget != nullptr
+    );
+    TEST_CHECK(
+        dialog.m_symlinkController->m_symlinkBrowseButton != nullptr
+        && dialog.m_symlinkController->m_symlinkError != nullptr
+    );
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkBrowseButton->label()->text() == "Browse…");
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkBrowseButton->variant() == ButtonVariant::Outline);
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkTarget->flexGrow() == 1.0F);
+    TEST_CHECK(
+        dialog.m_symlinkController->m_symlinkTarget->parent()
+        == dialog.m_symlinkController->m_symlinkBrowseButton->parent()
+    );
+    const auto* targetRow = dynamic_cast<const Flex*>(dialog.m_symlinkController->m_symlinkTarget->parent());
     TEST_CHECK(targetRow != nullptr && targetRow->direction() == FlexDirection::Horizontal);
 
     // Trigger target validation error first, then clear it via Browse... selection.
-    dialog.m_symlinkName->setValue("file-link");
-    TEST_CHECK(!dialog.submitSymlinkDialog());
-    TEST_CHECK(dialog.m_symlinkTarget->invalid());
-    TEST_CHECK(dialog.m_symlinkError->text() == "Enter a target path.");
+    dialog.m_symlinkController->m_symlinkName->setValue("file-link");
+    dialog.closeDialog(1);
+    TEST_CHECK(!dialog.closeQueued());
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkTarget->invalid());
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkError->text() == "Enter a target path.");
 
     clickBrowseButton(dialog, renderer);
     TEST_CHECK(presenter.openCalls == 1);
@@ -274,48 +299,55 @@ public:
     TEST_CHECK(presenter.lastOptions->title == "Choose Symlink Target");
 
     FileDialog::complete(targetFile);
-    TEST_CHECK(dialog.m_symlinkTarget->value() == targetFile.string());
-    TEST_CHECK(!dialog.m_symlinkTarget->invalid());
-    TEST_CHECK(dialog.m_symlinkError->text() == " ");
-    TEST_CHECK(dialog.m_dispatcher.focusedArea() == dialog.m_symlinkTarget->inputArea());
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkTarget->value() == targetFile.string());
+    TEST_CHECK(!dialog.m_symlinkController->m_symlinkTarget->invalid());
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkError->text() == " ");
+    TEST_CHECK(dialog.m_dispatcher.focusedArea() == dialog.m_symlinkController->m_symlinkTarget->inputArea());
 
     // Selecting a directory via Browse... uses the relative path's parent directory as startDirectory and populates it.
-    dialog.m_symlinkTarget->setValue("sub_dir/target.txt");
+    dialog.m_symlinkController->m_symlinkTarget->setValue("sub_dir/target.txt");
     clickBrowseButton(dialog, renderer);
     TEST_CHECK(presenter.openCalls == 2);
     TEST_CHECK(presenter.lastOptions->mode == FileDialogMode::SelectFileOrFolder);
     TEST_CHECK(presenter.lastOptions->startDirectory == subDir);
 
     FileDialog::complete(emptyDir);
-    TEST_CHECK(dialog.m_symlinkTarget->value() == emptyDir.string());
-    TEST_CHECK(dialog.submitSymlinkDialog());
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkTarget->value() == emptyDir.string());
+    dialog.closeDialog(1);
+    TEST_CHECK(dialog.closeQueued());
     const auto dirLink = work / "file-link";
-    pumpUntil([&] { return !ops.operations().empty() && ops.operations().back().finished; });
+    pumpUntil([&] { return !dialog.isOpen() && !ops.operations().empty() && ops.operations().back().finished; });
     TEST_CHECK(ops.operations().back().succeeded);
     TEST_CHECK(std::filesystem::is_symlink(std::filesystem::symlink_status(dirLink)));
     TEST_CHECK(std::filesystem::read_symlink(dirLink) == emptyDir);
 
     // 3. Manual absolute, relative, and tilde target entry remain intact alongside validation.
-    dialog.m_symlinkName->setValue("bad/name");
-    TEST_CHECK(!dialog.submitSymlinkDialog());
-    TEST_CHECK(dialog.m_symlinkName->invalid());
+    openHeadlessSymlinkDialog(manager, renderer);
+    dialog.m_symlinkController->m_symlinkName->setValue("bad/name");
+    dialog.closeDialog(1);
+    TEST_CHECK(!dialog.closeQueued());
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkName->invalid());
 
-    dialog.m_symlinkName->setValue("rel-link");
-    dialog.m_symlinkTarget->setValue("sub_dir/target.txt");
+    dialog.m_symlinkController->m_symlinkName->setValue("rel-link");
+    dialog.m_symlinkController->m_symlinkTarget->setValue("sub_dir/target.txt");
     const std::size_t opCountBeforeRel = ops.operations().size();
-    TEST_CHECK(dialog.submitSymlinkDialog());
-    pumpUntil([&] { return ops.operations().size() == opCountBeforeRel + 1 && ops.operations().back().finished; });
+    dialog.closeDialog(1);
+    TEST_CHECK(dialog.closeQueued());
+    pumpUntil([&] {
+      return !dialog.isOpen() && ops.operations().size() == opCountBeforeRel + 1 && ops.operations().back().finished;
+    });
     TEST_CHECK(ops.operations().back().succeeded);
     const auto relLink = work / "rel-link";
     TEST_CHECK(std::filesystem::is_symlink(std::filesystem::symlink_status(relLink)));
     TEST_CHECK(std::filesystem::read_symlink(relLink) == "sub_dir/target.txt");
 
     // Closing via closeDialog cancels any pending owned picker before scene teardown.
+    openHeadlessSymlinkDialog(manager, renderer);
     clickBrowseButton(dialog, renderer);
     TEST_CHECK(presenter.openCalls == 3);
     TEST_CHECK(FileDialog::currentOptions().title == "Choose Symlink Target");
     dialog.closeDialog(0);
-    pumpUntil([&] { return !dialog.m_symlinkDialogActive; });
+    pumpUntil([&] { return !dialog.isOpen(); });
     TEST_CHECK(FileDialog::currentOptions().title.empty());
     FileDialog::complete(targetFile); // Late result after close must be a safe no-op.
 
@@ -323,20 +355,20 @@ public:
     openHeadlessSymlinkDialog(manager, renderer);
     presenter.openResult = false;
     clickBrowseButton(dialog, renderer);
-    TEST_CHECK(dialog.m_symlinkError->text() == "Could not open the target picker.");
+    TEST_CHECK(dialog.m_symlinkController->m_symlinkError->text() == "Could not open the target picker.");
 
     presenter.openResult = true;
     clickBrowseButton(dialog, renderer);
     TEST_CHECK(FileDialog::currentOptions().title == "Choose Symlink Target");
     dialog.forceCloseImmediate();
-    TEST_CHECK(!dialog.m_symlinkDialogActive);
+    TEST_CHECK(!dialog.isOpen());
     TEST_CHECK(FileDialog::currentOptions().title.empty());
     FileDialog::complete(targetFile);
 
     // 5. Selection-based symlink creation remains unchanged.
     waitReady(manager, work);
     auto& tab = manager.activeTab();
-    tab.selectedPaths = {subDir.string()};
+    tab.m_selectedPaths = {subDir.string()};
     const std::size_t opCountBeforeSel = ops.operations().size();
     manager.createSelectionSymlink();
     pumpUntil([&] { return ops.operations().size() == opCountBeforeSel + 1 && ops.operations().back().finished; });

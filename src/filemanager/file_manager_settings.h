@@ -2,9 +2,9 @@
 
 #include "app/poll_source.h"
 #include "config/config_merge.h"
+#include "config/config_monitor.h"
 #include "config/state_store.h"
 #include "core/files/directory_scanner.h"
-#include "core/inotify/inotify.h"
 #include "filemanager/configuration_notice.h"
 #include "filemanager/file_columns.h"
 #include "filemanager/preview/preview_options.h"
@@ -13,9 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <map>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -143,10 +141,10 @@ namespace filemanager {
   private:
     using Change = std::pair<nythera::config::ConfigKeyPath, std::optional<std::string>>;
     bool save(std::vector<Change> changes);
+    void recordSelfWrite(const std::filesystem::path& path, std::string content);
     bool reloadSearchSettings();
     [[nodiscard]] std::filesystem::path searchSettingsPath() const;
     void reportProblem(ConfigurationProblem problem);
-    void updateWatches(const nythera::config::SourcedMergeResult& loaded);
     void accept(nythera::config::SourcedMergeResult loaded, bool notify);
     [[nodiscard]] std::optional<std::pair<std::uint32_t, std::uint32_t>>
     loadWindowSize(std::string_view key, std::uint32_t minWidth, std::uint32_t minHeight) const;
@@ -161,14 +159,7 @@ namespace filemanager {
     std::function<void()> m_onManualReload;
     ProblemCallback m_onProblem;
     std::optional<ConfigurationProblem> m_problem;
-    Inotify m_inotify;
-    struct Watch {
-      std::filesystem::path directory;
-      std::set<std::string> names;
-      bool scanToml = false;
-    };
-    std::map<int, Watch> m_watches;
-    std::map<std::filesystem::path, std::string> m_selfWrites;
+    std::optional<nythera::config::ApplicationConfigMonitor> m_monitor;
   };
 
 } // namespace filemanager

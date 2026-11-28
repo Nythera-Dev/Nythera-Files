@@ -38,7 +38,7 @@ bool FileManager::openQuickLook() {
         if (result == 1 || result == 2)
           openPreviewed(result == 2);
       },
-      m_surface.get(), false, false,
+      m_surface.get(),
       ModalDialogHost::CustomContent{
           .buildFields =
               [this](Flex& root, float) {

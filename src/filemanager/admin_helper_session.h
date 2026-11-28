@@ -67,3 +67,8 @@ namespace filemanager {
   runAdminHelperSession(int inFd, int outFd, const AdminHelperSessionConfig& config = {});
 
 } // namespace filemanager
+
+namespace filemanager::admin_operation_concurrency {
+  inline constexpr std::size_t kOperationSlots = 5;
+  std::size_t operationSlot(file_operation_engine::Kind kind, std::string_view operationData);
+} // namespace filemanager::admin_operation_concurrency

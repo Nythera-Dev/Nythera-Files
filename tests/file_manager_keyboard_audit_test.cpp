@@ -224,10 +224,10 @@ public:
       manager.handleWindowKeyEvent({.sym = sym, .utf32 = utf32, .modifiers = mods, .pressed = true, .repeat = repeat});
     };
     const auto selected = [&](std::size_t index) {
-      return manager.activeTab().selectedPaths.contains(session.entries()[index].absPath.string());
+      return manager.activeTab().m_selectedPaths.contains(session.entries()[index].absPath.string());
     };
     const auto selectedName = [&] {
-      return manager.activeTab().selectedPath.value_or(std::filesystem::path{}).filename();
+      return manager.activeTab().m_selectedPath.value_or(std::filesystem::path{}).filename();
     };
 
     key(XKB_KEY_Home);
@@ -245,7 +245,7 @@ public:
     key(XKB_KEY_Left, KeyMod::Ctrl | KeyMod::Shift);
     TEST_CHECK(view->selectedIndex() == 4 && selected(4) && selected(5));
     key(XKB_KEY_space);
-    TEST_CHECK(manager.activeTab().selectedPaths.size() == 1 && selected(4));
+    TEST_CHECK(manager.activeTab().m_selectedPaths.size() == 1 && selected(4));
     key(XKB_KEY_End);
     TEST_CHECK(view->selectedIndex() == 11 && selected(11));
     key(XKB_KEY_Home);
@@ -263,7 +263,7 @@ public:
     TEST_CHECK(view->selectedIndex() == 0);
     key(XKB_KEY_Down);
     TEST_CHECK(view->selectedIndex() == 1 && selected(1));
-    TEST_CHECK(manager.m_fileViewFocusVisible);
+    TEST_CHECK(manager.m_selection.focusVisible());
     TEST_CHECK(manager.m_dispatcher.pointerButton(8, 8, BTN_LEFT, true, 1, 1, false));
     TEST_CHECK(manager.m_dispatcher.pointerButton(8, 8, BTN_LEFT, false, 2, 2, false));
     TEST_CHECK(manager.m_dispatcher.focusedArea() == view->focusArea());
@@ -276,7 +276,7 @@ public:
     TEST_CHECK(selectedName() == "Bravo.txt");
     key(XKB_KEY_e, 0, false, 'e');
     TEST_CHECK(selectedName() == "Beta.txt");
-    manager.m_typeaheadLastTime -= std::chrono::seconds(1);
+    manager.m_selection.m_typeaheadLastTime -= std::chrono::seconds(1);
     key(XKB_KEY_g, 0, false, 'g');
     TEST_CHECK(selectedName() == "Gamma.txt");
 
@@ -403,7 +403,11 @@ public:
     properties.m_path = file;
     properties.m_nameDraft = file.filename().string();
     properties.m_itemAvailable = true;
-    properties.m_general = {{.title = "Identity", .rows = {{"Name", properties.m_nameDraft}}}};
+    properties.m_general = {
+        {.id = PropertiesWindow::PropertySectionId::Identity,
+         .title = "Identity",
+         .rows = {{PropertiesWindow::PropertyRowId::Name, "Name", properties.m_nameDraft}}}
+    };
     key(XKB_KEY_F2, 0, true);
     TEST_CHECK(!properties.m_editingName);
     key(XKB_KEY_F2);

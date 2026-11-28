@@ -2,16 +2,19 @@
 
 #include "filemanager/dialogs/checksum_dialog.h"
 #include "filemanager/dialogs/help_dialog.h"
-#include "filemanager/external_tools.h"
+#include "filemanager/file_clipboard_controller.h"
+#include "filemanager/file_launch_controller.h"
 #include "filemanager/file_list_header.h"
 #include "filemanager/file_manager_settings.h"
 #include "filemanager/file_operation_manager.h"
+#include "filemanager/file_selection_controller.h"
+#include "filemanager/menu_ids.h"
 #include "filemanager/places_sidebar.h"
+#include "filemanager/protected_file_manager.h"
 #include "filemanager/tab_manager.h"
 #include "render/animation/animation_manager.h"
 #include "render/scene/input_dispatcher.h"
 #include "ui/controls/context_menu_popup.h"
-#include "ui/dialogs/search_picker_popup.h"
 #include "wayland/native_data_transfer.h"
 #include "wayland/toplevel_surface.h"
 #include "wayland/wayland_connection.h"
@@ -21,7 +24,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <gio/gio.h>
 #include <memory>
 #include <optional>
 #include <string>
@@ -39,76 +41,6 @@ class RenderContext;
 
 namespace filemanager {
 
-  namespace menu_id {
-    inline constexpr int kManualSymlink = 117;
-    inline constexpr int kSelectionSymlink = 118;
-    inline constexpr int kDuplicate = 119;
-    inline constexpr int kSelectAll = 120;
-    inline constexpr int kDeselectAll = 121;
-    inline constexpr int kInvertSelection = 122;
-    inline constexpr int kUndo = 123;
-    inline constexpr int kRedo = 124;
-    inline constexpr int kCompactEditMenu = 125;
-    inline constexpr int kCompactViewMenu = 126;
-    inline constexpr int kListView = 127;
-    inline constexpr int kGridView = 128;
-    inline constexpr int kShowColumns = 129;
-    inline constexpr int kZoomIn = 130;
-    inline constexpr int kZoomOut = 131;
-    inline constexpr int kResetZoom = 132;
-    inline constexpr int kFirstColumnAction = 133;
-    inline constexpr int kPlaceOpenInNewTab = 41;
-    inline constexpr int kShowMenuBar = 30008;
-    inline constexpr int kNewTab = 30010;
-    inline constexpr int kReopenClosedTab = 30011;
-    inline constexpr int kCloseTab = 30012;
-    inline constexpr int kOpenFolderInNewTab = 30013;
-    inline constexpr int kAlwaysShowTabBar = 30014;
-    inline constexpr int kOpenTabsInBackground = 30015;
-    inline constexpr int kFileOpenInNewTab = 30016;
-    inline constexpr int kOpenContainingFolder = 30017;
-    inline constexpr int kTabContextNew = 30020;
-    inline constexpr int kTabContextDuplicate = 30021;
-    inline constexpr int kTabContextClose = 30022;
-    inline constexpr int kTabContextCloseOthers = 30023;
-    inline constexpr int kTabContextCloseRight = 30024;
-    inline constexpr int kFirstSearchMode = 30030;
-    inline constexpr int kFirstSearchScope = 30040;
-    inline constexpr int kSearchIncludeSystem = 30046;
-    inline constexpr int kUseCustomSearch = 30047;
-    inline constexpr int kDefineCustomSearch = 30048;
-    inline constexpr int kManageCustomSearches = 30049;
-    inline constexpr int kFirstFitColumn = 30050;
-    inline constexpr int kFitAllColumns = 30056;
-    inline constexpr int kSearchShowHidden = 30057;
-    inline constexpr int kSearchFollowLinks = 30058;
-    inline constexpr int kCompactToolsMenu = 30100;
-    inline constexpr int kFirstToolMenuRow = 30101;
-    inline constexpr int kActAsAdministrator = 30150;
-    inline constexpr int kOpenFolderAsAdministrator = 30151;
-    inline constexpr int kSaveProtectedChanges = 30152;
-    inline constexpr int kCalculateChecksum = ChecksumDialogController::kCalculateMenuId;
-    inline constexpr int kVerifyChecksum = ChecksumDialogController::kVerifyMenuId;
-    inline constexpr int kCompactHelpMenu = 30200;
-    inline constexpr int kKeyboardShortcuts = HelpDialogController::kKeyboardShortcutsMenuId;
-    inline constexpr int kReportBug = HelpDialogController::kReportBugMenuId;
-    inline constexpr int kGitHub = HelpDialogController::kGitHubMenuId;
-    inline constexpr int kAboutFiles = HelpDialogController::kAboutMenuId;
-    inline constexpr int kPreviewMode = 30401;
-    inline constexpr int kPreviewHidden = 30402;
-    inline constexpr int kPreviewInformation = 30403;
-    inline constexpr int kPreviewFull = 30404;
-    inline constexpr int kThumbnailSettings = 30405;
-    inline constexpr int kThumbnailsNever = 30406;
-    inline constexpr int kThumbnailsLocal = 30407;
-    inline constexpr int kThumbnailsAll = 30408;
-    inline constexpr int kInspectThumbnailCache = 30409;
-    inline constexpr int kClearThumbnailCache = 30410;
-    inline constexpr int kFirstExternalToolApp = 40000;
-    inline constexpr std::size_t kToolsMenuIndex = 3;
-    inline constexpr std::size_t kHelpMenuIndex = 4;
-  } // namespace menu_id
-
   class FileMenuController {
   public:
     struct Callbacks {
@@ -119,7 +51,6 @@ namespace filemanager {
       std::function<bool()> isRenaming;
       std::function<bool()> alwaysShowTabBar;
       std::function<bool()> openTabsInBackground;
-      std::function<std::size_t()> pendingClipboardReads;
       std::function<bool()> canChangeSelection;
       std::function<std::optional<std::filesystem::path>()> selectedPath;
       std::function<const std::unordered_set<std::string>&()> selectedPaths;
@@ -130,37 +61,83 @@ namespace filemanager {
       std::function<void()> onClearSelectionForEmptyMenu;
       std::function<void(std::string)> onStatus;
       std::function<void()> onRequestLayout;
-      std::function<bool(TabId, const std::filesystem::path&)> hasProtectedCopy;
-      std::function<void(TabId, const std::filesystem::path&, std::function<void(const std::filesystem::path&)>)>
-          onOpenProtectedFile;
+
+      std::function<bool(int)> activateArchiveAction;
+      std::function<bool(const ContextMenuControlEntry&)> activateSearchScopeEntry;
+      std::function<bool(const ContextMenuControlEntry&)> activateSearchFilterEntry;
+      std::function<void(SearchMode)> selectSearchMode;
+      std::function<void(TabId, std::optional<std::filesystem::path>)> enterAdministratorMode;
+      std::function<void(bool verify)> showChecksumDialog;
+      std::function<void(const std::filesystem::path&)> launchNewWindow;
+      std::function<void()> activateSelected;
+      std::function<void(const std::filesystem::path&)> activatePath;
+      std::function<void(const std::filesystem::path&, bool withApp)> openArchiveMember;
+      std::function<void(const std::filesystem::path&)> pinPlace;
+      std::function<void(const std::filesystem::path&)> openProperties;
+      std::function<void(const Place&)> openVolumeProperties;
+      std::function<void()> requestQuit;
+      std::function<void()> openNewTab;
+      std::function<void()> reopenClosedTab;
+      std::function<void(TabId)> closeTab;
+      std::function<void(TabId)> duplicateTab;
+      std::function<void(TabId)> closeOtherTabs;
+      std::function<void(TabId)> closeTabsToRight;
+      std::function<TabId()> contextMenuTabId;
+      std::function<void(const std::filesystem::path&, bool activate)> openFolderInNewTab;
+      std::function<void()> openQuickLook;
+      std::function<void(PreviewMode)> setPreviewMode;
+      std::function<void(ThumbnailPolicy)> setThumbnailPolicy;
+      std::function<void(bool clear)> inspectThumbnailCache;
+      std::function<void(const std::filesystem::path&)> goToLinkTarget;
+      std::function<void(const std::filesystem::path&)> navigate;
+      std::function<void()> navigateTrash;
+      std::function<void(const std::filesystem::path&)> enumerate;
+      std::function<void(bool)> setAlwaysShowTabBar;
+      std::function<void(bool)> setOpenTabsInBackground;
+      std::function<void(int)> handleLocationInputAction;
+      std::function<void(BrowserTab&)> recordAdminTabUserActivity;
+      std::function<void(SelectionChange)> changeSelection;
+      std::function<void()> duplicateSelection;
+      std::function<void()> createSelectionSymlink;
+      std::function<void()> showSymlinkDialog;
+      std::function<void(bool chooseDestination)> restoreWastebinSelection;
+      std::function<void()> confirmEmptyWastebin;
+      std::function<void(bool cut)> copyToDesktopClipboard;
+      std::function<void()> beginRename;
+      std::function<void()> confirmPermanentDelete;
+      std::function<void(int id)> createNewItem;
+      std::function<void(bool grid)> setGridMode;
+      std::function<void(float scale)> adjustViewScale;
+      std::function<void(FileDialogSortField)> setSortField;
+      std::function<void()> toggleSortOrder;
+      std::function<void()> toggleSearchHidden;
+      std::function<void()> persistFileViewState;
+      std::function<void()> syncSortOrHiddenEntries;
     };
 
     FileMenuController(
         WaylandConnection& wayland, RenderContext& renderContext, AnimationManager& menuAnimations,
         InputDispatcher& dispatcher, FileManagerSettings& settings, FileOperationManager& operations, TabManager& tabs,
         FileListHeaderController& listHeader, PlacesSidebarController& places, ChecksumDialogController& checksumDialog,
-        NativeDataTransfer& transfer, Callbacks callbacks
+        HelpDialogController& helpDialog, ProtectedFileManager& protectedFiles, FileLaunchController& launcher,
+        FileClipboardController& clipboard, NativeDataTransfer& transfer, Callbacks callbacks
     );
     ~FileMenuController();
 
     void loadInitialPreference();
-    void initializePopups(
-        ConfigService& configService, LayerPopupHostRegistry& pickerHosts,
-        std::function<void(const ContextMenuControlEntry&)> onActivate
-    );
+    void initializePopups(ConfigService& configService, LayerPopupHostRegistry& pickerHosts);
     void attachMenuBarUi(Flex& appBar, float toolbarHeight);
     void detachUi();
     void closeAll();
     void closeContextMenu();
-    void closeApplicationPicker();
 
     [[nodiscard]] bool isContextMenuOpen() const;
-    [[nodiscard]] bool isApplicationPickerOpen() const;
     [[nodiscard]] bool hasOpenPopup() const;
 
-    bool handleAppPickerPointer(const PointerEvent& event);
     bool handlePointer(const PointerEvent& event);
     bool handleKeyboard(const KeyboardEvent& event);
+
+    void activateEntry(const ContextMenuControlEntry& entry);
 
     void syncResponsiveMenuBar(int surfaceWidth);
     void toggleMenuBarVisibility();
@@ -179,7 +156,6 @@ namespace filemanager {
     void openSearchDropdown(std::vector<ContextMenuControlEntry> entries, const Node& trigger, bool highlightOnOpen);
     void setNextPlacesHighlightOnOpen(bool highlight) noexcept { m_nextPlacesHighlightOnOpen = highlight; }
     [[nodiscard]] bool applicationMenuCollapsed() const noexcept { return m_applicationMenuCollapsed; }
-    void openApplicationChooser();
 
     [[nodiscard]] ContextMenuControlEntry newItemMenu() const;
     [[nodiscard]] std::vector<ContextMenuControlEntry> fileMenuEntries() const;
@@ -190,27 +166,25 @@ namespace filemanager {
     [[nodiscard]] std::vector<ContextMenuControlEntry> helpMenuEntries() const;
     [[nodiscard]] std::optional<std::vector<ContextMenuControlEntry>> applicationMenuEntries(std::size_t menuIndex);
 
-    bool launchOpenWithApp(std::size_t index);
-    bool launchExternalTool(std::size_t index);
-
     [[nodiscard]] const std::optional<std::filesystem::path>& contextMenuTarget() const noexcept {
       return m_contextMenuTarget;
     }
     void setContextMenuTarget(std::optional<std::filesystem::path> target) { m_contextMenuTarget = std::move(target); }
 
-    [[nodiscard]] static bool
-    launchApplicationForFile(GAppInfo* app, const std::filesystem::path& path, GError** error);
-
   private:
     void openMainContextMenu(ContextMenuPopupRequest request, bool highlightOnOpen, bool preferSurfaceOutput);
-    void appendOpenWithEntries(const FileEntry& target, std::vector<ContextMenuControlEntry>& entries);
+    bool dispatchSearchAndArchiveAction(const ContextMenuControlEntry& entry);
+    bool dispatchToolsAndAdminAction(const ContextMenuControlEntry& entry);
+    bool dispatchFileAndLaunchAction(const ContextMenuControlEntry& entry);
+    bool dispatchTabAndPreviewAction(const ContextMenuControlEntry& entry);
+    bool dispatchPlacesAction(const ContextMenuControlEntry& entry);
+    bool dispatchSelectionAndClipboardAction(const ContextMenuControlEntry& entry);
+    bool dispatchFileMutationAction(const ContextMenuControlEntry& entry);
+    bool dispatchViewAndSortAction(const ContextMenuControlEntry& entry);
 
-    bool launchProtectedApplication(const BrowserTab& tab, GAppInfo* app, const std::filesystem::path& path);
     friend class ::FileManagerTestAccess;
 
-    [[nodiscard]] std::vector<std::string> externalToolTargets(external_tools::Tool tool) const;
     void persistApplicationMenuPreference();
-    void showApplicationChooser(std::string mime);
 
     WaylandConnection& m_wayland;
     RenderContext& m_renderContext;
@@ -222,11 +196,14 @@ namespace filemanager {
     FileListHeaderController& m_listHeader;
     PlacesSidebarController& m_places;
     ChecksumDialogController& m_checksumDialog;
+    HelpDialogController& m_helpDialog;
+    ProtectedFileManager& m_protectedFiles;
+    FileLaunchController& m_launcher;
+    FileClipboardController& m_clipboard;
     NativeDataTransfer& m_transfer;
     Callbacks m_callbacks;
 
     std::unique_ptr<ContextMenuPopup> m_contextMenuPopup;
-    std::unique_ptr<SearchPickerPopup> m_applicationPicker;
 
     Flex* m_appMenuItems = nullptr;
     Button* m_fileMenuButton = nullptr;
@@ -243,11 +220,6 @@ namespace filemanager {
     bool m_nextPlacesHighlightOnOpen = false;
 
     std::optional<std::filesystem::path> m_contextMenuTarget;
-    std::vector<std::shared_ptr<GAppInfo>> m_openWithApplications;
-    std::vector<std::pair<external_tools::Tool, external_tools::Choice>> m_externalTools;
-    std::vector<std::shared_ptr<GAppInfo>> m_applicationChooserApps;
-    std::string m_applicationChooserMime;
-    std::shared_ptr<GCancellable> m_applicationMimeRequest;
   };
 
 } // namespace filemanager

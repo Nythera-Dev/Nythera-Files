@@ -93,12 +93,6 @@ namespace filemanager {
       }
       return std::nullopt;
     }
-
-    fs::path canonicalPath(const fs::path& path) {
-      std::error_code ec;
-      auto resolved = fs::weakly_canonical(path, ec);
-      return ec ? path : resolved;
-    }
   } // namespace
 
   FileManagerSettings::FileManagerSettings(const ConfigService& shellConfig)
@@ -110,6 +104,25 @@ namespace filemanager {
       : m_shellConfig(shellConfig), m_configDir(configDir.empty() ? fs::path{} : fs::absolute(configDir)),
         m_state(std::move(runtimeStatePath)) {
     m_state.load();
+    if (!m_configDir.empty()) {
+      m_monitor.emplace(
+          nythera::config::ApplicationConfigMonitor::Options{
+              .appId = std::string(kOwner),
+              .displayName = "Files",
+              .configDir = m_configDir,
+              .validator = validateFilesConfiguration,
+              .additionalWatchFiles = {searchSettingsPath()},
+          }
+      );
+      m_monitor->setProblemCallback([this](const ConfigurationProblem& problem, const fs::path&) {
+        reportProblem(problem);
+      });
+      m_monitor->setReloadCallback([this](const SourcedMergeResult& loaded, bool manualReload) {
+        accept(loaded, true);
+        if (reloadSearchSettings() && manualReload && m_onManualReload)
+          m_onManualReload();
+      });
+    }
     reload();
   }
 
@@ -122,120 +135,22 @@ namespace filemanager {
         .value_or(m_shellConfig.config().shell.panel.transparencyMode);
   }
 
-  void FileManagerSettings::updateWatches(const SourcedMergeResult& loaded) {
-    if (m_configDir.empty())
-      return;
-    std::map<fs::path, Watch> desired;
-    auto add = [&](fs::path path, bool contents) {
-      std::error_code error;
-      fs::path name;
-      if (!contents) {
-        name = path.filename();
-        path = path.parent_path();
-      }
-      while (!path.empty() && !fs::is_directory(path, error)) {
-        name = path.filename();
-        const auto parent = path.parent_path();
-        if (parent == path)
-          return;
-        path = parent;
-      }
-      if (path.empty())
-        return;
-      const auto resolved = canonicalPath(path);
-      auto& watch = desired[resolved];
-      watch.directory = resolved;
-      if (name.empty()) {
-        watch.scanToml = true;
-      } else {
-        watch.names.insert(name.string());
-      }
-    };
-    add(m_configDir, true);
-    add(m_configDir, false);
-    add(searchSettingsPath(), false);
-    for (const auto& dir : loaded.config.includeDirs)
-      add(dir, true);
-    for (const auto& path : loaded.watchPaths) {
-      add(path, false);
-      const auto target = canonicalPath(path);
-      if (target != path)
-        add(target, false);
-      // weakly_canonical cannot follow a dangling link. Watch its named target
-      // so recreating an external included file also recovers the configuration.
-      std::error_code error;
-      const auto link = fs::read_symlink(path, error);
-      if (!error)
-        add(link.is_absolute() ? link : path.parent_path() / link, false);
-    }
-    for (const auto& path : loaded.config.loadedFiles)
-      add(path, false);
-
-    constexpr auto mask = IN_CLOSE_WRITE
-        | IN_MOVED_TO
-        | IN_MOVED_FROM
-        | IN_DELETE
-        | IN_CREATE
-        | IN_DELETE_SELF
-        | IN_MOVE_SELF
-        | IN_ATTRIB;
-    std::map<int, Watch> watches;
-    for (auto& [path, watch] : desired) {
-      if (auto descriptor = m_inotify.watch(path, mask))
-        watches.emplace(*descriptor, std::move(watch));
-    }
-    for (const auto& [descriptor, watch] : m_watches) {
-      if (!watches.contains(descriptor))
-        m_inotify.unwatch(descriptor);
-    }
-    m_watches = std::move(watches);
-  }
-
   void FileManagerSettings::doAddPollFds(std::vector<pollfd>& fds) {
-    if (m_inotify.fd() >= 0)
-      fds.push_back({.fd = m_inotify.fd(), .events = POLLIN});
+    if (m_monitor)
+      m_monitor->addPollFds(fds);
   }
 
   void FileManagerSettings::dispatch(const std::vector<pollfd>& fds, std::size_t startIdx) {
-    if (m_inotify.fd() < 0 || (fds[startIdx].revents & POLLIN) == 0)
-      return;
-    bool changed = false;
-    m_inotify.drain([&](const inotify_event* event) {
-      if (event->mask & IN_Q_OVERFLOW) {
-        changed = true;
-        return;
-      }
-      const auto watch = m_watches.find(event->wd);
-      if (watch == m_watches.end())
-        return;
-      if (!event->len) {
-        changed = true;
-        return;
-      }
-      const std::string_view name(event->name);
-      if (!watch->second.names.contains(std::string(name)) && !(watch->second.scanToml && name.ends_with(".toml")))
-        return;
-      // An ordinary new regular file is read after its writer closes it.
-      if ((event->mask & IN_CREATE) && !(event->mask & IN_ISDIR)) {
-        std::error_code ec;
-        if (!fs::is_symlink(watch->second.directory / name, ec))
-          return;
-      }
-      const auto write = m_selfWrites.find(watch->second.directory / name);
-      if (write != m_selfWrites.end() && (event->mask & IN_MOVED_TO)) {
-        std::ifstream input(write->first, std::ios::binary);
-        if (input && std::string(std::istreambuf_iterator<char>(input), {}) == write->second)
-          return;
-      }
-      changed = true;
-    });
-    m_selfWrites.clear();
-    if (changed && reload() && m_onManualReload)
-      m_onManualReload();
+    if (m_monitor)
+      m_monitor->dispatch(fds, startIdx);
+  }
+
+  void FileManagerSettings::recordSelfWrite(const fs::path& path, std::string content) {
+    if (m_monitor)
+      m_monitor->recordInProcessSelfWrite(path, std::move(content));
   }
 
   void FileManagerSettings::accept(SourcedMergeResult loaded, bool notify) {
-    updateWatches(loaded);
     m_problem.reset();
     if (loaded.config.merged == m_preferences)
       return;
@@ -259,16 +174,9 @@ namespace filemanager {
   }
 
   bool FileManagerSettings::reload() {
-    auto loaded = mergeConfigWithSources(m_configDir.string());
-    if (auto error = validateFilesConfiguration(loaded)) {
-      updateWatches(loaded);
-      (void)reloadSearchSettings();
-      kLog.warn("Retaining the previous Files configuration: {}", error->origin.prefixed(error->message));
-      reportProblem(std::move(*error));
-      return false;
-    }
-    accept(std::move(loaded), true);
-    return reloadSearchSettings();
+    const bool ok = m_monitor ? m_monitor->reload(/*notifyReload=*/false) : true;
+    const bool searchOk = reloadSearchSettings();
+    return ok && searchOk;
   }
 
   bool FileManagerSettings::save(std::vector<Change> changes) {
@@ -356,7 +264,7 @@ namespace filemanager {
       return false;
     }
     for (auto& [path, content] : expectedWrites)
-      m_selfWrites.insert_or_assign(path, std::move(content));
+      recordSelfWrite(path, std::move(content));
     accept(candidate ? std::move(*candidate) : std::move(current), hadExternalChanges);
     return true;
   }

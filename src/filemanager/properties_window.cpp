@@ -5,6 +5,7 @@
 #include "core/ui_phase.h"
 #include "cursor-shape-v1-client-protocol.h"
 #include "filemanager/browser_tab.h"
+#include "filemanager/byte_size_format.h"
 #include "filemanager/file_interaction.h"
 #include "filemanager/file_manager_settings.h"
 #include "filemanager/file_operation_manager.h"
@@ -64,29 +65,9 @@ namespace {
     std::filesystem::path path;
   };
 
-  std::string sizeText(std::uint64_t bytes) {
-    constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-    double value = static_cast<double>(bytes);
-    std::size_t unit = 0;
-    while (value >= 1024.0 && unit < std::size(units) - 1) {
-      value /= 1024.0;
-      ++unit;
-    }
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << value << ' ' << units[unit];
-    return out.str();
-  }
+  std::string sizeText(std::uint64_t bytes) { return filemanager::formatFixedBinaryByteSize(bytes); }
 
-  std::string groupedNumber(std::uint64_t value) {
-    std::ostringstream out;
-    try {
-      out.imbue(std::locale(""));
-    } catch (const std::runtime_error&) {
-      // Keep a usable number if the active locale is unavailable.
-    }
-    out << value;
-    return out.str();
-  }
+  std::string groupedNumber(std::uint64_t value) { return filemanager::propertyScanCountText(value); }
 
   std::string timeText(guint64 seconds) {
     const auto value = static_cast<std::time_t>(seconds);
@@ -235,7 +216,7 @@ bool PropertiesWindow::openTarget(
   m_general.clear();
   m_permissions.clear();
   m_details.clear();
-  m_filesystem = {"Filesystem", {}};
+  m_filesystem = {PropertySectionId::Filesystem, "Filesystem", {}};
   m_filesystemId.clear();
   m_loading = true;
   m_directory = false;
@@ -291,22 +272,26 @@ bool PropertiesWindow::openTarget(
     m_loading = false;
     m_displayName = volume->label;
     m_iconNames = volume->iconNames;
-    Section identity{"Identity", {{"Name", volume->label}, {"State", "Unmounted"}}};
+    Section identity{
+        PropertySectionId::Identity,
+        "Identity",
+        {{PropertyRowId::Name, "Name", volume->label}, {PropertyRowId::None, "State", "Unmounted"}}
+    };
     if (!volume->details.empty())
-      identity.rows.emplace_back("Description", volume->details);
+      identity.rows.push_back({PropertyRowId::None, "Description", volume->details});
     m_general.push_back(std::move(identity));
-    Section metadata{"Volume", {}};
+    Section metadata{PropertySectionId::OtherMetadata, "Volume", {}};
     if (!volume->filesystemType.empty())
-      metadata.rows.emplace_back("Filesystem type", volume->filesystemType);
+      metadata.rows.push_back({PropertyRowId::FilesystemType, "Filesystem type", volume->filesystemType});
     if (!volume->mountSource.empty())
-      metadata.rows.emplace_back("Source", volume->mountSource);
+      metadata.rows.push_back({PropertyRowId::CustomMetadata, "Source", volume->mountSource});
     if (volume->volume) {
       for (const auto& [label, kind] :
            {std::pair{"UUID", G_VOLUME_IDENTIFIER_KIND_UUID},
             std::pair{"Device", G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE}}) {
         gchar* value = g_volume_get_identifier(volume->volume.get(), kind);
         if (value && *value)
-          metadata.rows.emplace_back(label, value);
+          metadata.rows.push_back({PropertyRowId::CustomMetadata, label, value});
         g_free(value);
       }
     }
@@ -392,14 +377,19 @@ bool PropertiesWindow::openTarget(
     m_permissionEditable = m_modeAvailable && allPermissionEditable;
     m_originalMode = m_editedMode = anyMode;
     m_permissions = {
-        {"Ownership",
-         {{"Owner", commonOwner == static_cast<uid_t>(-1) ? "Mixed" : "UID " + std::to_string(commonOwner)},
-          {"Group", commonGroup == static_cast<gid_t>(-1) ? "Mixed" : "GID " + std::to_string(commonGroup)}}}
+        {PropertySectionId::Ownership,
+         "Ownership",
+         {{PropertyRowId::Owner, "Owner",
+           commonOwner == static_cast<uid_t>(-1) ? "Mixed" : "UID " + std::to_string(commonOwner)},
+          {PropertyRowId::Group, "Group",
+           commonGroup == static_cast<gid_t>(-1) ? "Mixed" : "GID " + std::to_string(commonGroup)}}}
     };
     if (m_modeAvailable) {
       const bool mixedSpecial = ((anyMode ^ commonMode) & 07000U) != 0;
       m_permissions.push_back(
-          {"Special permissions", {{"Bits", mixedSpecial ? "Mixed" : specialPermissionsText(commonMode)}}}
+          {PropertySectionId::SpecialPermissions,
+           "Special permissions",
+           {{PropertyRowId::None, "Bits", mixedSpecial ? "Mixed" : specialPermissionsText(commonMode)}}}
       );
     }
     m_permissionMessage = m_permissionEditable
@@ -407,15 +397,19 @@ bool PropertiesWindow::openTarget(
           "toggling a bit applies that value to all selected items."
         : "Permission changes are unavailable because one or more selected items cannot be safely edited.";
     m_general.push_back(
-        {"Selection",
-         {{"Items", std::to_string(m_selectionPaths.size())},
-          {"Files", std::to_string(m_selectionRegularFiles)},
-          {"Folders", std::to_string(m_selectionFolders)},
-          {"Location", sameParent ? commonParent.string() : "Multiple locations"}}}
+        {PropertySectionId::Selection,
+         "Selection",
+         {{PropertyRowId::None, "Items", std::to_string(m_selectionPaths.size())},
+          {PropertyRowId::None, "Files", std::to_string(m_selectionRegularFiles)},
+          {PropertyRowId::None, "Folders", std::to_string(m_selectionFolders)},
+          {PropertyRowId::Location, "Location", sameParent ? commonParent.string() : "Multiple locations"}}}
     );
     m_general.push_back(
-        {"Size and storage",
-         {{"Total size", "Calculating…"}, {"Size on disk", "Calculating…"}, {"Contents", "Calculating…"}}}
+        {PropertySectionId::SizeAndStorage,
+         "Size and storage",
+         {{PropertyRowId::TotalSize, "Total size", "Calculating…"},
+          {PropertyRowId::SizeOnDisk, "Size on disk", "Calculating…"},
+          {PropertyRowId::Contents, "Contents", "Calculating…"}}}
     );
     m_selectionAllocatedAvailable = m_selectionSameFilesystem;
     m_loading = false;
@@ -499,34 +493,37 @@ void PropertiesWindow::cancelFolderSize() {
 }
 
 void PropertiesWindow::updateFolderSizeRows() {
-  auto size = std::ranges::find(m_general, "Size and storage", &Section::title);
+  auto size = std::ranges::find(m_general, PropertySectionId::SizeAndStorage, &Section::id);
   if (size == m_general.end() || (!m_directory && !m_multipleSelection))
     return;
   std::erase_if(size->rows, [](const auto& row) {
-    return row.first == "Folder size"
-        || row.first == "Total size"
-        || row.first == "Size on disk"
-        || row.first == "Contents"
-        || row.first == "Calculation"
-        || row.first == "Status"
-        || row.first == "Scan status"
-        || row.first == "Scan details";
+    return row.id == PropertyRowId::FolderSize
+        || row.id == PropertyRowId::TotalSize
+        || row.id == PropertyRowId::SizeOnDisk
+        || row.id == PropertyRowId::Contents
+        || row.id == PropertyRowId::ScanDetails;
   });
-  std::vector<std::pair<std::string, std::string>> rows;
+  std::vector<PropertyRow> rows;
   if (m_folderScanning || !m_folderComplete) {
-    rows.emplace_back(m_multipleSelection ? "Total size" : "Folder size", "Calculating…");
+    rows.push_back(
+        {m_multipleSelection ? PropertyRowId::TotalSize : PropertyRowId::FolderSize,
+         m_multipleSelection ? "Total size" : "Folder size", "Calculating…"}
+    );
     if (m_multipleSelection)
-      rows.emplace_back("Size on disk", "Calculating…");
+      rows.push_back({PropertyRowId::SizeOnDisk, "Size on disk", "Calculating…"});
   } else {
     auto text = sizeText(m_folderResult.bytes);
     if (m_folderResult.bytes >= 1024)
       text += " (" + groupedNumber(m_folderResult.bytes) + " bytes)";
-    rows.emplace_back(m_multipleSelection ? "Total size" : "Folder size", text);
+    rows.push_back(
+        {m_multipleSelection ? PropertyRowId::TotalSize : PropertyRowId::FolderSize,
+         m_multipleSelection ? "Total size" : "Folder size", text}
+    );
     if (m_multipleSelection)
-      rows.emplace_back(
-          "Size on disk",
-          m_folderResult.allocatedSizeAvailable ? sizeText(m_folderResult.allocatedBytes)
-                                                : "Unavailable from the active filesystem helper"
+      rows.push_back(
+          {PropertyRowId::SizeOnDisk, "Size on disk",
+           m_folderResult.allocatedSizeAvailable ? sizeText(m_folderResult.allocatedBytes)
+                                                 : "Unavailable from the active filesystem helper"}
       );
     std::string counts =
         groupedNumber(m_folderResult.files) + " files · " + groupedNumber(m_folderResult.folders) + " folders";
@@ -534,10 +531,10 @@ void PropertiesWindow::updateFolderSizeRows() {
       counts += " · " + groupedNumber(m_folderResult.links) + " links";
     if (m_folderResult.other)
       counts += " · " + groupedNumber(m_folderResult.other) + " other entries";
-    rows.emplace_back("Contents", std::move(counts));
+    rows.push_back({PropertyRowId::Contents, "Contents", std::move(counts)});
     const auto scanPresentation = filemanager::propertyScanPresentation(m_folderResult);
     if (scanPresentation.showDisclosure)
-      rows.emplace_back("Scan details", scanPresentation.summary);
+      rows.push_back({PropertyRowId::ScanDetails, "Scan details", scanPresentation.summary});
   }
   size->rows.insert(size->rows.begin(), rows.begin(), rows.end());
   m_contentDirty = true;
@@ -650,16 +647,18 @@ void PropertiesWindow::finishSelectionSize(filemanager::FolderSizeResult result)
     m_permissionEditable = m_modeAvailable && activeAdministratorTab();
     m_originalMode = m_editedMode = anyMode;
     m_selectionTouchedMode = 0;
-    if (!m_permissions.empty() && m_permissions.front().title == "Ownership") {
+    if (!m_permissions.empty() && m_permissions.front().id == PropertySectionId::Ownership) {
       m_permissions.front().rows = {
-          {"Owner", mixedOwner ? "Mixed" : "UID " + std::to_string(owner)},
-          {"Group", mixedGroup ? "Mixed" : "GID " + std::to_string(group)},
+          {PropertyRowId::Owner, "Owner", mixedOwner ? "Mixed" : "UID " + std::to_string(owner)},
+          {PropertyRowId::Group, "Group", mixedGroup ? "Mixed" : "GID " + std::to_string(group)},
       };
       if (m_modeAvailable) {
         const bool mixedSpecial = ((anyMode ^ commonMode) & 07000U) != 0;
         m_permissions.resize(1);
         m_permissions.push_back(
-            {"Special permissions", {{"Bits", mixedSpecial ? "Mixed" : specialPermissionsText(commonMode)}}}
+            {PropertySectionId::SpecialPermissions,
+             "Special permissions",
+             {{PropertyRowId::None, "Bits", mixedSpecial ? "Mixed" : specialPermissionsText(commonMode)}}}
         );
       }
     }
@@ -992,12 +991,12 @@ void PropertiesWindow::loadChoices() {
             && window->m_defaultApplication
             && g_app_info_equal(window->m_pendingApplication.get(), window->m_defaultApplication.get()))
           window->m_pendingApplication.reset();
-        auto identity = std::ranges::find(window->m_general, "Identity", &Section::title);
+        auto identity = std::ranges::find(window->m_general, PropertySectionId::Identity, &Section::id);
         if (identity != window->m_general.end()) {
-          auto row = std::ranges::find(identity->rows, "Open with", &std::pair<std::string, std::string>::first);
+          auto row = std::ranges::find(identity->rows, PropertyRowId::OpenWith, &PropertyRow::id);
           if (row != identity->rows.end())
-            row->second = window->m_defaultApplication ? g_app_info_get_display_name(window->m_defaultApplication.get())
-                                                       : "No default application";
+            row->value = window->m_defaultApplication ? g_app_info_get_display_name(window->m_defaultApplication.get())
+                                                      : "No default application";
         }
         window->m_contentDirty = true;
         if (window->m_surface)
@@ -1094,11 +1093,11 @@ void PropertiesWindow::confirmRename(bool applyOtherChanges) {
           m_nameDraft = destination.filename().string();
           m_editingName = false;
           m_wayland.stopKeyRepeat();
-          auto identity = std::ranges::find(m_general, "Identity", &Section::title);
+          auto identity = std::ranges::find(m_general, PropertySectionId::Identity, &Section::id);
           if (identity != m_general.end()) {
-            auto name = std::ranges::find(identity->rows, "Name", &std::pair<std::string, std::string>::first);
+            auto name = std::ranges::find(identity->rows, PropertyRowId::Name, &PropertyRow::id);
             if (name != identity->rows.end())
-              name->second = m_nameDraft;
+              name->value = m_nameDraft;
           }
           xdg_toplevel_set_title(m_surface->xdgToplevel(), ("Properties — " + m_nameDraft).c_str());
           m_choicesLoading = false;
@@ -1112,7 +1111,7 @@ void PropertiesWindow::confirmRename(bool applyOtherChanges) {
         m_contentDirty = true;
         m_surface->requestLayout();
       },
-      administrator
+      filemanager::adminOperationContext(administrator)
   );
   if (!m_operation) {
     m_renaming = m_applying = m_continueAfterRename = false;
@@ -1178,7 +1177,7 @@ void PropertiesWindow::queryFilesystemMetadata() {
   const auto generation = m_generation;
   struct MountData {
     std::filesystem::path path;
-    Section section{"Filesystem", {}};
+    Section section{PropertySectionId::Filesystem, "Filesystem", {}};
     bool mountTarget = false;
     bool selectionShared = false;
   };
@@ -1203,15 +1202,16 @@ void PropertiesWindow::queryFilesystemMetadata() {
       },
       new QueryData{this, m_alive, generation, m_path}
   );
-  g_task_set_task_data(task, new MountData{m_path, {"Filesystem", {}}, false, m_multipleSelection}, [](gpointer data) {
-    delete static_cast<MountData*>(data);
-  });
+  g_task_set_task_data(
+      task, new MountData{m_path, {PropertySectionId::Filesystem, "Filesystem", {}}, false, m_multipleSelection},
+      [](gpointer data) { delete static_cast<MountData*>(data); }
+  );
   g_task_run_in_thread(task, [](GTask* worker, gpointer, gpointer data, GCancellable*) {
     auto* metadata = static_cast<MountData*>(data);
     if (auto* entry = g_unix_mount_entry_for(metadata->path.c_str(), nullptr)) {
-      const auto add = [&](const char* key, const char* value) {
+      const auto add = [&](PropertyRowId id, const char* key, const char* value) {
         if (value && *value)
-          metadata->section.rows.emplace_back(key, value);
+          metadata->section.rows.push_back({id, key, value});
       };
       metadata->mountTarget = metadata->selectionShared
           || filemanager::propertyMountTarget(metadata->path, g_unix_mount_entry_get_mount_path(entry));
@@ -1219,17 +1219,18 @@ void PropertiesWindow::queryFilesystemMetadata() {
         const char* type = g_unix_mount_entry_get_fs_type(entry);
         const char* options = g_unix_mount_entry_get_options(entry);
         if (type && *type)
-          metadata->section.rows.emplace_back(
-              "Filesystem type", filemanager::propertyFilesystemTypeDescription(type, options ? options : "")
+          metadata->section.rows.push_back(
+              {PropertyRowId::FilesystemType, "Filesystem type",
+               filemanager::propertyFilesystemTypeDescription(type, options ? options : "")}
           );
-        add("Mount point", g_unix_mount_entry_get_mount_path(entry));
-        add("Mount options", g_unix_mount_entry_get_options(entry));
+        add(PropertyRowId::MountPoint, "Mount point", g_unix_mount_entry_get_mount_path(entry));
+        add(PropertyRowId::CustomMetadata, "Mount options", g_unix_mount_entry_get_options(entry));
       }
       g_unix_mount_entry_free(entry);
     }
     struct statvfs state{};
     if (metadata->mountTarget && statvfs(metadata->path.c_str(), &state) == 0)
-      metadata->section.rows.emplace_back("Block size", sizeText(state.f_frsize));
+      metadata->section.rows.push_back({PropertyRowId::CustomMetadata, "Block size", sizeText(state.f_frsize)});
     g_task_return_pointer(worker, new MountData(*metadata), [](gpointer value) {
       delete static_cast<MountData*>(value);
     });
@@ -1308,8 +1309,10 @@ void PropertiesWindow::queryReady(GFileInfo* info, const std::string& error) {
     m_permissions.clear();
     m_details.clear();
     m_general = {
-        {"Item status",
-         {{"State", "Unavailable"}, {"Reason", replaced ? "The item was replaced. Reopen Properties." : error}}}
+        {PropertySectionId::None,
+         "Item status",
+         {{PropertyRowId::None, "State", "Unavailable"},
+          {PropertyRowId::None, "Reason", replaced ? "The item was replaced. Reopen Properties." : error}}}
     };
   } else {
     const auto name = g_file_info_get_display_name(info);
@@ -1318,59 +1321,63 @@ void PropertiesWindow::queryReady(GFileInfo* info, const std::string& error) {
     const bool link = g_file_info_get_is_symlink(info);
     const auto type = g_file_info_get_file_type(info);
     m_directory = type == G_FILE_TYPE_DIRECTORY;
-    Section identity{"Identity", {}};
+    Section identity{PropertySectionId::Identity, "Identity", {}};
     const auto namePresentation =
         filemanager::propertyNamePresentation(m_path == m_path.root_path(), name ? name : m_path.filename().string());
-    identity.rows.emplace_back("Name", namePresentation.text);
-    identity.rows.emplace_back("Type", filemanager::propertyTypeDescription(info));
-    identity.rows.emplace_back("Location", m_path.parent_path().string());
-    identity.rows.emplace_back("Full path", m_path.string());
+    identity.rows.push_back({PropertyRowId::Name, "Name", namePresentation.text});
+    identity.rows.push_back({PropertyRowId::None, "Type", filemanager::propertyTypeDescription(info)});
+    identity.rows.push_back({PropertyRowId::Location, "Location", m_path.parent_path().string()});
+    identity.rows.push_back({PropertyRowId::FullPath, "Full path", m_path.string()});
     if (link) {
       const auto target = g_file_info_get_symlink_target(info);
       if (target) {
         const std::filesystem::path targetPath(target);
-        identity.rows.emplace_back(
-            "Link target",
-            (targetPath.is_absolute() ? targetPath : m_path.parent_path() / targetPath).lexically_normal().string()
+        identity.rows.push_back(
+            {PropertyRowId::LinkTarget, "Link target",
+             (targetPath.is_absolute() ? targetPath : m_path.parent_path() / targetPath).lexically_normal().string()}
         );
       }
     }
     const auto mime = g_file_info_get_content_type(info);
     m_mime = mime && !link ? mime : "";
     if (!m_mime.empty())
-      identity.rows.emplace_back("Open with", "Loading applications…");
+      identity.rows.push_back({PropertyRowId::OpenWith, "Open with", "Loading applications…"});
     m_general = {std::move(identity)};
 
-    Section size{"Size and storage", {}};
+    Section size{PropertySectionId::SizeAndStorage, "Size and storage", {}};
     if (link) {
-      size.rows.emplace_back(
-          "Link size",
-          g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_SIZE) ? sizeText(g_file_info_get_size(info))
-                                                                          : "Unavailable"
+      size.rows.push_back(
+          {PropertyRowId::LinkSize, "Link size",
+           g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_SIZE) ? sizeText(g_file_info_get_size(info))
+                                                                           : "Unavailable"}
       );
     } else if (type != G_FILE_TYPE_DIRECTORY && g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_SIZE)) {
-      size.rows.emplace_back("Size", sizeText(g_file_info_get_size(info)));
+      size.rows.push_back({PropertyRowId::Size, "Size", sizeText(g_file_info_get_size(info))});
       if (!link && g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_BLOCKS))
-        size.rows.emplace_back(
-            "Size on disk", sizeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_UNIX_BLOCKS) * 512ULL)
+        size.rows.push_back(
+            {PropertyRowId::SizeOnDisk, "Size on disk",
+             sizeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_UNIX_BLOCKS) * 512ULL)}
         );
     } else if (type == G_FILE_TYPE_DIRECTORY) {
-      size.rows.emplace_back("Folder size", "Calculating…");
+      size.rows.push_back({PropertyRowId::FolderSize, "Folder size", "Calculating…"});
     }
     m_general.push_back(std::move(size));
 
-    Section timestamps{"Timestamps", {}};
+    Section timestamps{PropertySectionId::Timestamps, "Timestamps", {}};
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_CREATED))
-      timestamps.rows.emplace_back(
-          "Created", timeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_CREATED))
+      timestamps.rows.push_back(
+          {PropertyRowId::None, "Created",
+           timeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_CREATED))}
       );
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_MODIFIED))
-      timestamps.rows.emplace_back(
-          "Modified", timeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_MODIFIED))
+      timestamps.rows.push_back(
+          {PropertyRowId::None, "Modified",
+           timeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_MODIFIED))}
       );
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_ACCESS))
-      timestamps.rows.emplace_back(
-          "Last accessed", timeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_ACCESS))
+      timestamps.rows.push_back(
+          {PropertyRowId::None, "Last accessed",
+           timeText(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_ACCESS))}
       );
     if (!timestamps.rows.empty())
       m_general.push_back(std::move(timestamps));
@@ -1412,11 +1419,12 @@ void PropertiesWindow::queryReady(GFileInfo* info, const std::string& error) {
     const auto* ownerName = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_OWNER_USER);
     const auto* groupName = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_OWNER_GROUP);
     m_permissions = {
-        {"Ownership",
-         {{"Owner",
+        {PropertySectionId::Ownership,
+         "Ownership",
+         {{PropertyRowId::Owner, "Owner",
            hasUid ? std::string(ownerName ? ownerName : "Unknown") + " (UID " + std::to_string(uid) + ")"
                   : "Unavailable"},
-          {"Group",
+          {PropertyRowId::Group, "Group",
            hasGid ? std::string(groupName ? groupName : "Unknown") + " (GID " + std::to_string(gid) + ")"
                   : "Unavailable"}}}
     };
@@ -1424,35 +1432,45 @@ void PropertiesWindow::queryReady(GFileInfo* info, const std::string& error) {
         : link                                 ? "Link permissions are read-only; the target is never changed."
                                                : "Permissions are read-only for this item or current process.";
     if (hasMode) {
-      Section special{"Special permissions", {}};
-      special.rows.emplace_back("Bits", specialPermissionsText(mode));
+      Section special{PropertySectionId::SpecialPermissions, "Special permissions", {}};
+      special.rows.push_back({PropertyRowId::None, "Bits", specialPermissionsText(mode)});
       m_permissions.push_back(std::move(special));
     }
 
-    Section technical{"File information", {}};
+    Section technical{PropertySectionId::Technical, "File information", {}};
     if (mime)
-      technical.rows.emplace_back("MIME type", mime);
+      technical.rows.push_back({PropertyRowId::CustomMetadata, "MIME type", mime});
     const auto extension = filemanager::propertyFilenameSuffix(m_path, m_directory);
     if (!extension.empty() && type != G_FILE_TYPE_DIRECTORY)
-      technical.rows.emplace_back("Filename suffix", extension);
+      technical.rows.push_back({PropertyRowId::CustomMetadata, "Filename suffix", extension});
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_INODE))
-      technical.rows.emplace_back(
-          "Inode", std::to_string(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_UNIX_INODE))
+      technical.rows.push_back(
+          {PropertyRowId::CustomMetadata, "Inode",
+           std::to_string(g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_UNIX_INODE))}
       );
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_DEVICE))
-      technical.rows.emplace_back(
-          "Device ID", std::to_string(g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_DEVICE))
+      technical.rows.push_back(
+          {PropertyRowId::CustomMetadata, "Device ID",
+           std::to_string(g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_DEVICE))}
       );
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_NLINK))
-      technical.rows.emplace_back(
-          "Hard links", std::to_string(g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_NLINK))
+      technical.rows.push_back(
+          {PropertyRowId::CustomMetadata, "Hard links",
+           std::to_string(g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_NLINK))}
       );
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN))
-      technical.rows.emplace_back("Hidden", g_file_info_get_is_hidden(info) ? "Yes" : "No");
+      technical.rows.push_back(
+          {PropertyRowId::CustomMetadata, "Hidden", g_file_info_get_is_hidden(info) ? "Yes" : "No"}
+      );
     if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_IS_BACKUP))
-      technical.rows.emplace_back("Backup file", g_file_info_get_is_backup(info) ? "Yes" : "No");
+      technical.rows.push_back(
+          {PropertyRowId::CustomMetadata, "Backup file", g_file_info_get_is_backup(info) ? "Yes" : "No"}
+      );
     if (link)
-      technical.rows.emplace_back("Link metadata", "Metadata describes the link itself; its target was not followed");
+      technical.rows.push_back(
+          {PropertyRowId::CustomMetadata, "Link metadata",
+           "Metadata describes the link itself; its target was not followed"}
+      );
     if (const auto* id = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_ID_FILESYSTEM))
       m_filesystemId = id;
     m_details = {std::move(technical)};
@@ -1474,9 +1492,9 @@ void PropertiesWindow::queryReady(GFileInfo* info, const std::string& error) {
         m_icon->setThemedIconNames(m_iconNames);
       }
     }
-    Section other{"Other metadata", {}};
+    Section other{PropertySectionId::OtherMetadata, "Other metadata", {}};
     if (const auto* context = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_SELINUX_CONTEXT))
-      other.rows.emplace_back("SELinux context", context);
+      other.rows.push_back({PropertyRowId::CustomMetadata, "SELinux context", context});
     if (!other.rows.empty())
       m_details.push_back(std::move(other));
     if (!link)
@@ -1484,17 +1502,18 @@ void PropertiesWindow::queryReady(GFileInfo* info, const std::string& error) {
     loadChoices();
     if (m_directory && !link) {
       m_details.push_back(
-          {"Folder calculation",
-           {{"Counting policy",
+          {PropertySectionId::OtherMetadata,
+           "Folder calculation",
+           {{PropertyRowId::CustomMetadata, "Counting policy",
              "Regular files, folders, links and special entries are counted separately; the selected root is excluded. "
              "Hidden entries are included."},
-            {"Logical bytes",
+            {PropertyRowId::CustomMetadata, "Logical bytes",
              "Regular-file and link sizes; hard links count once per name. Directory inode sizes and allocated storage "
              "are excluded."},
-            {"Boundaries",
+            {PropertyRowId::CustomMetadata, "Boundaries",
              "Symbolic links are not followed. Child mounts and unsafe or unreadable subtrees are excluded. One failed "
              "subtree may omit many descendants."},
-            {"Limits",
+            {PropertyRowId::CustomMetadata, "Limits",
              "Depth 128; 1,000,000 entries; relative paths 4,096 bytes. Results are observations, not a filesystem "
              "snapshot."}}}
       );
@@ -1531,9 +1550,13 @@ void PropertiesWindow::filesystemReady(GFileInfo* info) {
     return;
   // Unix mount metadata retains NFS version information that GIO can flatten
   // to "nfs". Capacity completion must not replace that more precise label.
-  if (std::ranges::none_of(m_filesystem.rows, [](const auto& row) { return row.first == "Filesystem type"; })) {
+  if (std::ranges::none_of(m_filesystem.rows, [](const auto& row) {
+        return row.id == PropertyRowId::FilesystemType;
+      })) {
     if (const auto* type = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_FILESYSTEM_TYPE))
-      m_filesystem.rows.emplace_back("Filesystem type", filemanager::propertyFilesystemTypeDescription(type));
+      m_filesystem.rows.push_back(
+          {PropertyRowId::FilesystemType, "Filesystem type", filemanager::propertyFilesystemTypeDescription(type)}
+      );
   }
   if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_FILESYSTEM_SIZE)) {
     const auto total = g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_FILESYSTEM_SIZE);
@@ -1549,12 +1572,12 @@ void PropertiesWindow::filesystemReady(GFileInfo* info) {
             << std::setprecision(1)
             << static_cast<double>(used) / static_cast<double>(total) * 100.0
             << "%)";
-      m_filesystem.rows.emplace_back("Capacity", capacity.str());
-      m_filesystem.rows.emplace_back("Free space", sizeText(free));
+      m_filesystem.rows.push_back({PropertyRowId::Capacity, "Capacity", capacity.str()});
+      m_filesystem.rows.push_back({PropertyRowId::FreeSpace, "Free space", sizeText(free)});
       if (total)
         m_capacity = static_cast<float>(static_cast<double>(used) / static_cast<double>(total));
     } else {
-      m_filesystem.rows.emplace_back("Capacity", sizeText(total));
+      m_filesystem.rows.push_back({PropertyRowId::Capacity, "Capacity", sizeText(total)});
     }
   }
   syncFilesystemSections();
@@ -1562,34 +1585,36 @@ void PropertiesWindow::filesystemReady(GFileInfo* info) {
 
 void PropertiesWindow::syncFilesystemSections() {
   // Keep the overview compact; technical filesystem fields belong to Details.
-  auto storage = std::ranges::find(m_general, "Size and storage", &Section::title);
+  auto storage = std::ranges::find(m_general, PropertySectionId::SizeAndStorage, &Section::id);
   if (storage != m_general.end()) {
     std::erase_if(storage->rows, [](const auto& row) {
-      return row.first == "Filesystem type"
-          || row.first == "Mount point"
-          || row.first == "Capacity"
-          || row.first == "Free space";
+      return row.id == PropertyRowId::FilesystemType
+          || row.id == PropertyRowId::MountPoint
+          || row.id == PropertyRowId::Capacity
+          || row.id == PropertyRowId::FreeSpace;
     });
     if (m_mountTarget)
-      for (const auto* name : {"Filesystem type", "Mount point", "Capacity", "Free space"})
+      for (const auto id :
+           {PropertyRowId::FilesystemType, PropertyRowId::MountPoint, PropertyRowId::Capacity,
+            PropertyRowId::FreeSpace})
         for (const auto& row : m_filesystem.rows)
-          if (row.first == name)
+          if (row.id == id)
             storage->rows.push_back(row);
   }
-  Section details{"Filesystem", {}};
+  Section details{PropertySectionId::Filesystem, "Filesystem", {}};
   if (m_mountTarget && !m_filesystemId.empty())
-    details.rows.emplace_back("Filesystem ID", m_filesystemId);
+    details.rows.push_back({PropertyRowId::CustomMetadata, "Filesystem ID", m_filesystemId});
   if (m_mountTarget)
     for (const auto& row : m_filesystem.rows)
-      if (row.first != "Capacity" && row.first != "Free space")
+      if (row.id != PropertyRowId::Capacity && row.id != PropertyRowId::FreeSpace)
         details.rows.push_back(row);
-  auto found = std::ranges::find(m_details, "Filesystem", &Section::title);
+  auto found = std::ranges::find(m_details, PropertySectionId::Filesystem, &Section::id);
   if (found != m_details.end())
     *found = std::move(details);
   else if (!details.rows.empty())
     m_details.insert(m_details.begin() + std::min<std::size_t>(1, m_details.size()), std::move(details));
   if (!m_mountTarget)
-    std::erase_if(m_details, [](const auto& section) { return section.title == "Filesystem"; });
+    std::erase_if(m_details, [](const auto& section) { return section.id == PropertySectionId::Filesystem; });
   m_contentDirty = true;
   if (m_surface)
     m_surface->requestLayout();
@@ -1722,7 +1747,7 @@ void PropertiesWindow::applyPermissions() {
         }
         finishChanges(!result.ok());
       },
-      administrator
+      filemanager::adminOperationContext(administrator)
   );
   if (!m_operation) {
     m_applying = false;
@@ -1823,7 +1848,7 @@ void PropertiesWindow::applyNextSelectionPermission() {
           ++m_selectionPermissionIndex;
         applyNextSelectionPermission();
       },
-      administrator
+      filemanager::adminOperationContext(administrator)
   );
   if (!m_operation) {
     ++m_selectionPermissionFailed;
@@ -2021,6 +2046,629 @@ void PropertiesWindow::positionTabTransition() {
   m_scroll->setOpacity(m_tabProgress);
 }
 
+namespace {
+
+  std::unique_ptr<Label> makePropertyLabel(const std::string& text, bool subdued = false) {
+    auto result = std::make_unique<Label>();
+    result->setText(text);
+    result->setFontSize(Style::fontSizeBody * 0.92F);
+    if (subdued)
+      result->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
+    return result;
+  }
+
+  std::unique_ptr<Flex> makePropertySection(const std::string& text) {
+    auto result = std::make_unique<Flex>();
+    result->setDirection(FlexDirection::Vertical);
+    result->setAlign(FlexAlign::Stretch);
+    result->setGap(7.0F);
+    result->setPadding(3.0F, 2.0F);
+    auto title = makePropertyLabel(text);
+    title->setFontWeight(FontWeight::SemiBold);
+    title->setColor(colorSpecFromRole(ColorRole::Primary));
+    result->addChild(std::move(title));
+    result->addChild(std::make_unique<Separator>());
+    return result;
+  }
+
+} // namespace
+
+void PropertiesWindow::appendErrorNote(Flex& parent, const std::string& message, std::function<void()> dismiss) {
+  if (message.empty())
+    return;
+  auto row = std::make_unique<Flex>();
+  row->setDirection(FlexDirection::Horizontal);
+  row->setAlign(FlexAlign::Start);
+  row->setGap(6.0F);
+  auto text = makePropertyLabel(message);
+  text->setColor(colorSpecFromRole(ColorRole::Error));
+  text->setFlexGrow(1.0F);
+  text->setMaxLines(0);
+  row->addChild(std::move(text));
+  auto button = std::make_unique<Button>();
+  button->setText("Dismiss");
+  button->setVariant(ButtonVariant::Ghost);
+  button->setControlHeight(Style::controlHeightSm);
+  button->setOnClick([this, dismiss = std::move(dismiss)] {
+    dismiss();
+    m_contentDirty = true;
+    m_surface->requestLayout();
+  });
+  row->addChild(std::move(button));
+  parent.addChild(std::move(row));
+}
+
+std::unique_ptr<Input> PropertiesWindow::makeReadOnlyValue(const std::string& value, bool expanded, bool prominent) {
+  auto field = std::make_unique<Input>();
+  field->setValue(value.empty() ? "Unavailable" : value);
+  const float fontSize = prominent ? Style::fontSizeBody : Style::fontSizeBody * 0.92F;
+  field->setFontSize(fontSize);
+  if (prominent)
+    field->setFontWeight(FontWeight::SemiBold);
+  field->setReadOnly(true);
+  field->setFrameVisible(false);
+  field->setHorizontalPadding(0.0F);
+  field->setMinLayoutWidth(0.0F);
+  field->setFlexGrow(1.0F);
+  field->setMultiline(expanded);
+  field->setControlHeight(Style::fontSizeBody * (expanded ? 6.0F : prominent ? 1.4F : 1.25F));
+  field->setOnCopyText(m_copyText);
+  m_readOnlyInputs.emplace(field->inputArea(), field.get());
+  return field;
+}
+
+void PropertiesWindow::addPathCopyButton(
+    Flex& row, InputArea* valueArea, const std::string& name, const std::string& value
+) {
+  if (!m_copyText || value.size() <= 48)
+    return;
+  auto copy = std::make_unique<Button>();
+  copy->setGlyph("copy");
+  copy->setGlyphSize(12.0F);
+  copy->setVariant(ButtonVariant::Ghost);
+  copy->setControlHeight(24.0F);
+  copy->setPadding(3.0F);
+  copy->setTooltip("Copy " + name);
+  copy->setOpacity(0.0F);
+  copy->setTabStop(false);
+  auto* copyAction = copy.get();
+  valueArea->setOnEnter([copyAction](const InputArea::PointerData&) { copyAction->setOpacity(1.0F); });
+  valueArea->setOnLeave([copyAction] { copyAction->setOpacity(0.0F); });
+  copy->setOnEnter([copyAction] { copyAction->setOpacity(1.0F); });
+  copy->setOnLeave([copyAction] { copyAction->setOpacity(0.0F); });
+  copy->setOnClick([this, value] { m_copyText(value); });
+  row.addChild(std::move(copy));
+}
+
+std::unique_ptr<Input> PropertiesWindow::makeNameEditor() {
+  auto editor = std::make_unique<Input>();
+  editor->setValue(m_nameDraft);
+  editor->setInvalid(!filemanager::validFileName(m_nameDraft));
+  editor->inputArea()->setTabFocusKey("properties-filename");
+  editor->setFontSize(Style::fontSizeTitle);
+  editor->setFontWeight(FontWeight::SemiBold);
+  editor->setControlHeight(Style::controlHeightSm);
+  editor->setMinLayoutWidth(0.0F);
+  editor->setEnabled(!m_applying && !m_refreshing && m_itemAvailable && m_path != m_path.root_path());
+  editor->setOnChange([this](const std::string& draft) {
+    m_nameDraft = draft;
+    if (m_nameInput)
+      m_nameInput->setInvalid(!filemanager::validFileName(draft));
+    m_discardRequested = false;
+    updateFooter();
+  });
+  editor->setOnCopyText(m_copyText);
+  editor->setOnSubmit([this](const std::string&) { confirmRename(); });
+  editor->setOnKeyEvent([this](std::uint32_t symbol, std::uint32_t) {
+    if (symbol != XKB_KEY_Escape || m_applying)
+      return false;
+    cancelNameEdit();
+    return true;
+  });
+  m_nameInput = editor.get();
+  m_readOnlyInputs.emplace(editor->inputArea(), editor.get()); // Copy also preserves the editable filename.
+  return editor;
+}
+
+void PropertiesWindow::buildGeneralTab() {
+  const auto lastSection =
+      std::find_if(m_general.rbegin(), m_general.rend(), [](const auto& s) { return !s.rows.empty(); });
+  if (lastSection == m_general.rend()) {
+    m_body->addChild(makePropertyLabel("No metadata available for this item.", true));
+    return;
+  }
+  for (const auto& sectionData : m_general) {
+    if (sectionData.rows.empty())
+      continue;
+    const bool generalIdentity = sectionData.id == PropertySectionId::Identity;
+    const bool generalSelection = m_multipleSelection && sectionData.id == PropertySectionId::Selection;
+    if (generalIdentity || generalSelection) {
+      auto identity = std::make_unique<Flex>();
+      identity->setDirection(FlexDirection::Horizontal);
+      identity->setAlign(FlexAlign::Center);
+      identity->setGap(14.0F);
+      identity->setPadding(2.0F, 2.0F);
+      auto icon = std::make_unique<FileIcon>();
+      if (generalSelection) {
+        icon->setFallbackGlyph("copy");
+      } else {
+        if (!m_volumeOnly)
+          icon->setFile(m_path, m_directory);
+        icon->setThemedIconNames(m_iconNames);
+      }
+      icon->setGlyphSize(52.0F);
+      m_icon = icon.get();
+      identity->addChild(std::move(icon));
+      const auto name = std::ranges::find(sectionData.rows, PropertyRowId::Name, &PropertyRow::id);
+      const bool editable = generalIdentity
+          && name != sectionData.rows.end()
+          && !m_volumeOnly
+          && filemanager::propertyNamePresentation(m_path == m_path.root_path(), name->value).editable;
+      if (editable && m_editingName) {
+        auto editor = makeNameEditor();
+        editor->setFlexGrow(1.0F);
+        identity->addChild(std::move(editor));
+      } else if (generalSelection || name != sectionData.rows.end()) {
+        auto nameRow = std::make_unique<Flex>();
+        nameRow->setDirection(FlexDirection::Horizontal);
+        nameRow->setAlign(FlexAlign::Center);
+        nameRow->setGap(6.0F);
+        nameRow->setFlexGrow(1.0F);
+        const auto displayText =
+            generalSelection ? m_displayName : filemanager::sanitizeFilenameForDisplay(name->value);
+        auto displayName = makePropertyLabel(displayText);
+        displayName->setFontSize(Style::fontSizeTitle);
+        displayName->setFontWeight(FontWeight::SemiBold);
+        displayName->setMaxLines(1);
+        displayName->setTooltip(displayText);
+        m_filenameLabel = displayName.get();
+        nameRow->addChild(std::move(displayName));
+        if (editable && m_itemAvailable && !m_applying && !m_refreshing) {
+          auto pencil = std::make_unique<Button>();
+          pencil->setGlyph("pencil");
+          pencil->setGlyphSize(14.0F);
+          pencil->setVariant(ButtonVariant::Ghost);
+          pencil->setControlHeight(24.0F);
+          pencil->setPadding(4.0F);
+          pencil->setTooltip("Rename");
+          pencil->inputArea()->setTabFocusKey("properties-filename");
+          pencil->setOnClick([this] {
+            if (!m_itemAvailable || m_applying || m_refreshing)
+              return;
+            m_wayland.stopKeyRepeat();
+            m_editingName = m_focusNameEditor = true;
+            m_contentDirty = true;
+            m_surface->requestLayout();
+          });
+          nameRow->addChild(std::move(pencil));
+        }
+        identity->addChild(std::move(nameRow));
+      }
+      m_body->addChild(std::move(identity));
+      if (editable)
+        appendErrorNote(*m_body, m_renameError, [this] { m_renameError.clear(); });
+    }
+    const bool sizeSection = sectionData.id == PropertySectionId::SizeAndStorage;
+    const auto sectionTitle = sizeSection && !m_mountTarget && !m_multipleSelection ? "Size" : sectionData.title;
+    auto group = makePropertySection(sectionTitle);
+    if (&sectionData == &*lastSection)
+      group->setPadding(3.0F, 2.0F, 0.0F, 2.0F);
+    if (sizeSection && (m_directory || m_multipleSelection)) {
+      auto heading = std::make_unique<Flex>();
+      heading->setDirection(FlexDirection::Horizontal);
+      heading->setAlign(FlexAlign::Center);
+      heading->setGap(4.0F);
+      auto title = makePropertyLabel(sectionTitle);
+      title->setFontWeight(FontWeight::SemiBold);
+      title->setColor(colorSpecFromRole(ColorRole::Primary));
+      // The section stretches this row to its full width; let the title absorb
+      // the remaining space so the scan controls stay at the far right.
+      title->setFlexGrow(1.0F);
+      heading->addChild(std::move(title));
+      auto refresh = std::make_unique<Button>();
+      refresh->setGlyph("refresh");
+      refresh->setGlyphSize(14.0F);
+      refresh->setVariant(ButtonVariant::Ghost);
+      refresh->setControlHeight(26.0F);
+      refresh->setPadding(5.0F);
+      refresh->setTooltip(m_multipleSelection ? "Refresh selection size" : "Refresh folder size");
+      refresh->setEnabled(!m_folderScanning);
+      refresh->setOnClick([this] {
+        if (!m_folderScanning) {
+          if (m_multipleSelection)
+            ensureSelectionSize();
+          else {
+            cancelFolderSize();
+            ensureFolderSize();
+          }
+        }
+      });
+      m_sizeRefreshButton = refresh.get();
+      heading->addChild(std::move(refresh));
+      auto stop = std::make_unique<Button>();
+      stop->setGlyph("stop");
+      stop->setGlyphSize(13.0F);
+      stop->setVariant(ButtonVariant::Ghost);
+      stop->setControlHeight(26.0F);
+      stop->setPadding(5.0F);
+      stop->setTooltip(m_multipleSelection ? "Stop selection size calculation" : "Stop folder size calculation");
+      stop->setEnabled(m_folderScanning);
+      stop->setOnClick([this] {
+        if (m_folderScanning && m_folderCancel) {
+          g_cancellable_cancel(m_folderCancel);
+          if (m_cancelProtectedFolderSize)
+            (void)m_cancelProtectedFolderSize();
+        }
+      });
+      m_sizeStopButton = stop.get();
+      heading->addChild(std::move(stop));
+      // Replace the standard title row while retaining the section divider.
+      group->removeChild(group->children().front().get());
+      group->insertChildAt(0, std::move(heading));
+    }
+    auto rows = std::make_unique<Flex>();
+    rows->setDirection(FlexDirection::Vertical);
+    rows->setAlign(FlexAlign::Stretch);
+    rows->setGap(5.0F);
+    for (const auto& [rowId, name, value] : sectionData.rows) {
+      if (generalIdentity && rowId == PropertyRowId::Name)
+        continue;
+      if (rowId == PropertyRowId::ScanDetails) {
+        const auto scan = filemanager::propertyScanPresentation(m_folderResult);
+        auto disclosure = std::make_unique<Flex>();
+        disclosure->setDirection(FlexDirection::Horizontal);
+        disclosure->setAlign(FlexAlign::Center);
+        disclosure->setGap(8.0F);
+        auto details = std::make_unique<Button>();
+        details->setText(std::string(m_folderDetailsExpanded ? "▾ " : "▸ ") + "Scan details");
+        details->setVariant(ButtonVariant::Ghost);
+        // Use the metadata label's typography, retaining the existing
+        // chevron size within the same text run and button layout.
+        const auto metadataLabel = makePropertyLabel("Scan details", true);
+        const float chevronScale = details->label()->fontSize() / metadataLabel->fontSize();
+        details->setFontSize(metadataLabel->fontSize());
+        details->label()->setUseMarkup(true);
+        details->setText(
+            "<span size=\""
+            + std::to_string(chevronScale * 100.0F)
+            + "%\">"
+            + (m_folderDetailsExpanded ? "▾ " : "▸ ")
+            + "</span>Scan details"
+        );
+        auto typography = Button::defaultPalette(ButtonVariant::Ghost);
+        for (auto* state : {&typography.normal, &typography.hover, &typography.pressed, &typography.disabled})
+          state->label = colorSpecFromRole(ColorRole::OnSurfaceVariant);
+        if (typography.selected)
+          typography.selected->label = colorSpecFromRole(ColorRole::OnSurfaceVariant);
+        details->setCustomPalette(std::move(typography));
+        details->setControlHeight(Style::controlHeightSm);
+        details->setContentAlign(ButtonContentAlign::Start);
+        details->setOnClick([this] {
+          m_folderDetailsExpanded = !m_folderDetailsExpanded;
+          m_contentDirty = true;
+          m_surface->requestLayout();
+        });
+        disclosure->addChild(std::move(details));
+        auto summary = makePropertyLabel(value, true);
+        summary->setFlexGrow(1.0F);
+        summary->setMinWidth(0.0F);
+        summary->setMaxLines(0);
+        disclosure->addChild(std::move(summary));
+        rows->addChild(std::move(disclosure));
+        if (m_folderDetailsExpanded) {
+          auto diagnosticRows = std::make_unique<Flex>();
+          diagnosticRows->setDirection(FlexDirection::Vertical);
+          diagnosticRows->setAlign(FlexAlign::Stretch);
+          diagnosticRows->setGap(5.0F);
+          diagnosticRows->setPadding(0.0F, 0.0F, 0.0F, 18.0F);
+          for (const auto& [diagnosticName, diagnosticValue] : scan.details) {
+            auto diagnosticRow = std::make_unique<Flex>();
+            diagnosticRow->setDirection(FlexDirection::Horizontal);
+            diagnosticRow->setAlign(FlexAlign::Start);
+            diagnosticRow->setGap(12.0F);
+            auto key = makePropertyLabel(diagnosticName, true);
+            key->setMinWidth(126.0F);
+            key->setMaxWidth(126.0F);
+            key->setMaxLines(0);
+            diagnosticRow->addChild(std::move(key));
+            auto diagnostic = makePropertyLabel(diagnosticValue, true);
+            diagnostic->setFlexGrow(1.0F);
+            diagnostic->setMinWidth(0.0F);
+            diagnostic->setMaxLines(0);
+            diagnosticRow->addChild(std::move(diagnostic));
+            diagnosticRows->addChild(std::move(diagnosticRow));
+          }
+          rows->addChild(std::move(diagnosticRows));
+        }
+        continue;
+      }
+
+      auto row = std::make_unique<Flex>();
+      row->setDirection(FlexDirection::Horizontal);
+      row->setAlign(FlexAlign::Center);
+      row->setGap(12.0F);
+      auto key = makePropertyLabel(name, true);
+      key->setMinWidth(110.0F);
+      key->setMaxWidth(110.0F);
+      row->addChild(std::move(key));
+
+      const bool application = rowId == PropertyRowId::OpenWith;
+      const bool prominentSize = sizeSection
+          && (rowId == PropertyRowId::Size
+              || rowId == PropertyRowId::FolderSize
+              || rowId == PropertyRowId::LinkSize
+              || rowId == PropertyRowId::TotalSize);
+      auto val = makeReadOnlyValue(
+          application && m_pendingApplication
+              ? std::string(g_app_info_get_display_name(m_pendingApplication.get())) + " (pending)"
+              : value,
+          false, prominentSize
+      );
+      auto* valueArea = val->inputArea();
+      row->addChild(std::move(val));
+      if ((rowId == PropertyRowId::FolderSize || rowId == PropertyRowId::TotalSize) && m_folderScanning) {
+        auto spinner = std::make_unique<Spinner>();
+        spinner->setSpinnerSize(12.0F);
+        spinner->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
+        m_sizeSpinner = spinner.get();
+        row->addChild(std::move(spinner));
+      }
+      if (application) {
+        auto change = std::make_unique<Button>();
+        change->setText("Change…");
+        change->setVariant(ButtonVariant::Outline);
+        change->setControlHeight(Style::controlHeightSm);
+        change->setEnabled(!m_applying && !m_refreshing && !m_choicesLoading && !m_applications.empty());
+        auto* action = change.get();
+        change->setOnClick([this, action] { chooseApplication(action); });
+        row->addChild(std::move(change));
+      }
+      if (rowId == PropertyRowId::Location || rowId == PropertyRowId::FullPath || rowId == PropertyRowId::LinkTarget)
+        addPathCopyButton(*row, valueArea, name, value);
+      rows->addChild(std::move(row));
+      if (application)
+        appendErrorNote(*rows, m_applicationError, [this] { m_applicationError.clear(); });
+    }
+    group->addChild(std::move(rows));
+    if (generalIdentity && !m_mime.empty()) {
+      auto scope = makePropertyLabel("Default application changes apply to all " + m_mime + " items.", true);
+      scope->setMaxLines(2);
+      group->addChild(std::move(scope));
+    }
+    if (sizeSection && m_mountTarget && m_capacity >= 0) {
+      auto capacity = std::make_unique<ProgressBar>();
+      capacity->setProgress(m_capacity);
+      capacity->setSize(0.0F, 8.0F);
+      capacity->setRadius(4.0F);
+      group->addChild(std::move(capacity));
+    }
+    m_body->addChild(std::move(group));
+  }
+}
+
+void PropertiesWindow::buildPermissionsTab() {
+  if (m_permissions.empty()) {
+    m_body->addChild(makePropertyLabel("No metadata available for this item.", true));
+    return;
+  }
+  for (const auto& sectionData : m_permissions) {
+    if (sectionData.rows.empty())
+      continue;
+    auto group = makePropertySection(sectionData.title);
+    auto rows = std::make_unique<Flex>();
+    rows->setDirection(FlexDirection::Vertical);
+    rows->setAlign(FlexAlign::Stretch);
+    rows->setGap(7.0F);
+    for (const auto& [rowId, name, value] : sectionData.rows) {
+      auto row = std::make_unique<Flex>();
+      row->setDirection(FlexDirection::Horizontal);
+      row->setAlign(FlexAlign::Center);
+      row->setGap(12.0F);
+      auto key = makePropertyLabel(name, true);
+      key->setMinWidth(126.0F);
+      key->setMaxWidth(126.0F);
+      row->addChild(std::move(key));
+      if (!m_multipleSelection
+          && m_permissionEditable
+          && sectionData.id == PropertySectionId::Ownership
+          && (rowId == PropertyRowId::Owner || rowId == PropertyRowId::Group)) {
+        const bool groupChoice = rowId == PropertyRowId::Group;
+        const auto choices = groupChoice ? m_accounts.groups : m_accounts.users;
+        const auto current = groupChoice ? m_gid : m_uid;
+        const auto pending = groupChoice ? m_pendingGroup : m_pendingOwner;
+        auto select = std::make_unique<Select>();
+        select->setControlHeight(Style::controlHeightSm);
+        select->setFlexGrow(1.0F);
+        select->setFontSize(Style::fontSizeBody * 0.92F);
+        std::vector<std::string> options;
+        std::size_t selected = static_cast<std::size_t>(-1);
+        for (std::size_t i = 0; i < choices.size(); ++i) {
+          options.push_back(
+              choices[i].name + (groupChoice ? " (GID " : " (UID ") + std::to_string(choices[i].id) + ")"
+          );
+          if ((!pending.empty() && choices[i].name == pending) || (pending.empty() && choices[i].id == current))
+            selected = i;
+        }
+        select->setOptions(std::move(options));
+        if (selected != static_cast<std::size_t>(-1))
+          select->setSelectedIndexSilently(selected);
+        else {
+          select->clearSelection();
+          select->setPlaceholder(value);
+        }
+        select->setEnabled(
+            m_permissionEditable && !m_applying && !m_refreshing && !m_choicesLoading && !choices.empty()
+        );
+        select->setOnSelectionChanged([this, choices, groupChoice, current](std::size_t index, std::string_view) {
+          if (m_applying || index >= choices.size())
+            return;
+          auto& staged = groupChoice ? m_pendingGroup : m_pendingOwner;
+          staged = choices[index].id == current ? "" : choices[index].name;
+          m_recursive = false;
+          m_discardRequested = false;
+          updatePermissionControls();
+        });
+        m_ownershipSelects[groupChoice ? 1 : 0] = select.get();
+        row->addChild(std::move(select));
+        rows->addChild(std::move(row));
+        continue;
+      }
+      row->addChild(makeReadOnlyValue(value, false, false));
+      rows->addChild(std::move(row));
+    }
+    if (sectionData.id == PropertySectionId::Ownership) {
+      if (!m_permissionEditable && !m_permissionMessage.empty()) {
+        auto note = makePropertyLabel(m_permissionMessage, true);
+        note->setMaxLines(0);
+        rows->addChild(std::move(note));
+      }
+      if (!m_modeAvailable || m_multipleSelection)
+        appendErrorNote(*rows, m_permissionError, [this] { m_permissionError.clear(); });
+    }
+    group->addChild(std::move(rows));
+    m_body->addChild(std::move(group));
+  }
+  if (m_modeAvailable) {
+    auto access = makePropertySection("Access permissions");
+    const char* names[] = {"Owner", "Group", "Others"};
+    const char* headings[] = {
+        "Read", "Write",
+        m_multipleSelection ? "Execute / Traverse"
+            : m_directory   ? "Traverse"
+                            : "Execute"
+    };
+    auto columns = std::make_unique<Flex>();
+    columns->setDirection(FlexDirection::Horizontal);
+    columns->setAlign(FlexAlign::Center);
+    columns->setGap(8.0F);
+    auto blank = std::make_unique<Flex>();
+    blank->setFlexGrow(1.0F);
+    columns->addChild(std::move(blank));
+    for (const auto* heading : headings) {
+      auto column = std::make_unique<Flex>();
+      column->setMinWidth(70);
+      column->setMaxWidth(70);
+      column->setJustify(FlexJustify::Center);
+      column->addChild(makePropertyLabel(heading, true));
+      columns->addChild(std::move(column));
+    }
+    access->addChild(std::move(columns));
+    if (m_multipleSelection) {
+      auto mixed = makePropertyLabel(m_permissionMessage, true);
+      mixed->setMaxLines(0);
+      access->addChild(std::move(mixed));
+    }
+    for (std::size_t rowIndex = 0; rowIndex < 3; ++rowIndex) {
+      auto row = std::make_unique<Flex>();
+      row->setDirection(FlexDirection::Horizontal);
+      row->setAlign(FlexAlign::Center);
+      row->setGap(8.0F);
+      auto name = makePropertyLabel(names[rowIndex]);
+      name->setFlexGrow(1.0F);
+      row->addChild(std::move(name));
+      for (std::size_t bit = 0; bit < 3; ++bit) {
+        auto check = std::make_unique<Checkbox>();
+        const auto mask = (4U >> bit) << ((2 - rowIndex) * 3);
+        check->setOnChange([this, mask](bool checked) {
+          m_editedMode = checked ? m_editedMode | mask : m_editedMode & ~mask;
+          if (m_multipleSelection) {
+            m_selectionTouchedMode |= mask;
+            for (auto& item : m_selectionPermissionItems)
+              item.applied = false;
+          }
+          m_discardRequested = false;
+          updatePermissionControls();
+        });
+        m_permissionChecks[rowIndex][bit] = check.get();
+        auto cell = std::make_unique<Flex>();
+        cell->setMinWidth(70);
+        cell->setMaxWidth(70);
+        cell->setJustify(FlexJustify::Center);
+        cell->addChild(std::move(check));
+        row->addChild(std::move(cell));
+      }
+      access->addChild(std::move(row));
+      if (rowIndex != 2)
+        access->addChild(std::make_unique<Separator>());
+    }
+    appendErrorNote(*access, m_permissionError, [this] { m_permissionError.clear(); });
+    m_body->addChild(std::move(access));
+  }
+  if (m_directory && m_permissionEditable) {
+    auto contents = makePropertySection("Apply to contents");
+    auto row = std::make_unique<Flex>();
+    row->setDirection(FlexDirection::Horizontal);
+    row->setAlign(FlexAlign::Center);
+    row->setGap(6.0F);
+    auto recursive = std::make_unique<Checkbox>();
+    m_recursiveCheck = recursive.get();
+    recursive->setOnChange([this](bool checked) {
+      m_recursive = checked;
+      for (auto& item : m_selectionPermissionItems)
+        if (item.directory)
+          item.applied = false;
+      m_discardRequested = false;
+      updatePermissionControls();
+    });
+    row->addChild(std::move(recursive));
+    auto text = makePropertyLabel("Apply changes recursively to all files and folders");
+    text->setFlexGrow(1.0F);
+    text->setMaxLines(2);
+    row->addChild(std::move(text));
+    contents->addChild(std::move(row));
+    m_body->addChild(std::move(contents));
+  }
+}
+
+void PropertiesWindow::buildDetailsTab() {
+  if (m_details.empty()) {
+    m_body->addChild(makePropertyLabel("No metadata available for this item.", true));
+    return;
+  }
+  for (const auto& sectionData : m_details) {
+    if (sectionData.rows.empty())
+      continue;
+    auto group = makePropertySection(sectionData.title);
+    auto rows = std::make_unique<Flex>();
+    rows->setDirection(FlexDirection::Vertical);
+    rows->setAlign(FlexAlign::Stretch);
+    rows->setGap(7.0F);
+    for (const auto& [rowId, name, value] : sectionData.rows) {
+      auto row = std::make_unique<Flex>();
+      row->setDirection(FlexDirection::Horizontal);
+      row->setAlign(FlexAlign::Center);
+      row->setGap(12.0F);
+      auto key = makePropertyLabel(name, true);
+      const float keyWidth = sectionData.id == PropertySectionId::Identity ? 84.0F : 126.0F;
+      key->setMinWidth(keyWidth);
+      key->setMaxWidth(keyWidth);
+      row->addChild(std::move(key));
+      const bool expanded = m_expandedMetadata.contains(name);
+      auto val = makeReadOnlyValue(value, expanded, false);
+      auto* valueArea = val->inputArea();
+      row->addChild(std::move(val));
+      if (value.size() > 36) {
+        auto expand = std::make_unique<Button>();
+        expand->setText(expanded ? "Less" : "More");
+        expand->setVariant(ButtonVariant::Ghost);
+        expand->setControlHeight(Style::controlHeightSm);
+        expand->setOnClick([this, name] {
+          if (!m_expandedMetadata.erase(name))
+            m_expandedMetadata.insert(name);
+          m_contentDirty = true;
+          m_surface->requestLayout();
+        });
+        row->addChild(std::move(expand));
+      }
+      if (rowId == PropertyRowId::Location || rowId == PropertyRowId::FullPath || rowId == PropertyRowId::LinkTarget)
+        addPathCopyButton(*row, valueArea, name, value);
+      rows->addChild(std::move(row));
+    }
+    group->addChild(std::move(rows));
+    m_body->addChild(std::move(group));
+  }
+}
+
 void PropertiesWindow::rebuildTab() {
   if (m_copyMenu)
     m_copyMenu->close();
@@ -2076,558 +2724,16 @@ void PropertiesWindow::rebuildTab() {
   }
   while (!m_body->children().empty())
     m_body->removeChild(m_body->children().back().get());
-  const auto label = [](const std::string& text, bool subdued = false) {
-    auto result = std::make_unique<Label>();
-    result->setText(text);
-    result->setFontSize(Style::fontSizeBody * 0.92F);
-    if (subdued)
-      result->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
-    return result;
-  };
-  const auto section = [&](const std::string& text) {
-    auto result = std::make_unique<Flex>();
-    result->setDirection(FlexDirection::Vertical);
-    result->setAlign(FlexAlign::Stretch);
-    result->setGap(7.0F);
-    result->setPadding(3.0F, 2.0F);
-    auto title = label(text);
-    title->setFontWeight(FontWeight::SemiBold);
-    title->setColor(colorSpecFromRole(ColorRole::Primary));
-    result->addChild(std::move(title));
-    result->addChild(std::make_unique<Separator>());
-    return result;
-  };
-  const auto errorNote = [&](Flex& parent, const std::string& message, std::function<void()> dismiss) {
-    if (message.empty())
-      return;
-    auto row = std::make_unique<Flex>();
-    row->setDirection(FlexDirection::Horizontal);
-    row->setAlign(FlexAlign::Start);
-    row->setGap(6.0F);
-    auto text = label(message);
-    text->setColor(colorSpecFromRole(ColorRole::Error));
-    text->setFlexGrow(1.0F);
-    text->setMaxLines(0);
-    row->addChild(std::move(text));
-    auto button = std::make_unique<Button>();
-    button->setText("Dismiss");
-    button->setVariant(ButtonVariant::Ghost);
-    button->setControlHeight(Style::controlHeightSm);
-    button->setOnClick([this, dismiss = std::move(dismiss)] {
-      dismiss();
-      m_contentDirty = true;
-      m_surface->requestLayout();
-    });
-    row->addChild(std::move(button));
-    parent.addChild(std::move(row));
-  };
-  const auto readOnlyValue = [&](const std::string& value, bool expanded = false, bool prominent = false) {
-    auto field = std::make_unique<Input>();
-    field->setValue(value.empty() ? "Unavailable" : value);
-    const float fontSize = prominent ? Style::fontSizeBody : Style::fontSizeBody * 0.92F;
-    field->setFontSize(fontSize);
-    if (prominent)
-      field->setFontWeight(FontWeight::SemiBold);
-    field->setReadOnly(true);
-    field->setFrameVisible(false);
-    field->setHorizontalPadding(0.0F);
-    field->setMinLayoutWidth(0.0F);
-    field->setFlexGrow(1.0F);
-    field->setMultiline(expanded);
-    field->setControlHeight(Style::fontSizeBody * (expanded ? 6.0F : prominent ? 1.4F : 1.25F));
-    field->setOnCopyText(m_copyText);
-    m_readOnlyInputs.emplace(field->inputArea(), field.get());
-    return field;
-  };
-  const auto addPathCopy = [&](Flex& row, InputArea* valueArea, const std::string& name, const std::string& value) {
-    if (!m_copyText || value.size() <= 48)
-      return;
-    auto copy = std::make_unique<Button>();
-    copy->setGlyph("copy");
-    copy->setGlyphSize(12.0F);
-    copy->setVariant(ButtonVariant::Ghost);
-    copy->setControlHeight(24.0F);
-    copy->setPadding(3.0F);
-    copy->setTooltip("Copy " + name);
-    copy->setOpacity(0.0F);
-    copy->setTabStop(false);
-    auto* copyAction = copy.get();
-    valueArea->setOnEnter([copyAction](const InputArea::PointerData&) { copyAction->setOpacity(1.0F); });
-    valueArea->setOnLeave([copyAction] { copyAction->setOpacity(0.0F); });
-    copy->setOnEnter([copyAction] { copyAction->setOpacity(1.0F); });
-    copy->setOnLeave([copyAction] { copyAction->setOpacity(0.0F); });
-    copy->setOnClick([this, value] { m_copyText(value); });
-    row.addChild(std::move(copy));
-  };
-  const auto nameEditor = [&] {
-    auto editor = std::make_unique<Input>();
-    editor->setValue(m_nameDraft);
-    editor->setInvalid(!filemanager::validFileName(m_nameDraft));
-    editor->inputArea()->setTabFocusKey("properties-filename");
-    editor->setFontSize(Style::fontSizeTitle);
-    editor->setFontWeight(FontWeight::SemiBold);
-    editor->setControlHeight(Style::controlHeightSm);
-    editor->setMinLayoutWidth(0.0F);
-    editor->setEnabled(!m_applying && !m_refreshing && m_itemAvailable && m_path != m_path.root_path());
-    editor->setOnChange([this](const std::string& draft) {
-      m_nameDraft = draft;
-      if (m_nameInput)
-        m_nameInput->setInvalid(!filemanager::validFileName(draft));
-      m_discardRequested = false;
-      updateFooter();
-    });
-    editor->setOnCopyText(m_copyText);
-    editor->setOnSubmit([this](const std::string&) { confirmRename(); });
-    editor->setOnKeyEvent([this](std::uint32_t symbol, std::uint32_t) {
-      if (symbol != XKB_KEY_Escape || m_applying)
-        return false;
-      cancelNameEdit();
-      return true;
-    });
-    m_nameInput = editor.get();
-    m_readOnlyInputs.emplace(editor->inputArea(), editor.get()); // Copy also preserves the editable filename.
-    return editor;
-  };
 
   m_body->setGap(m_tab == 0 ? 8.0F : 12.0F);
-  const auto& lines = m_tab == 0 ? m_general : (m_tab == 1 ? m_permissions : m_details);
-  const auto lastSection =
-      std::find_if(lines.rbegin(), lines.rend(), [](const auto& sectionData) { return !sectionData.rows.empty(); });
   if (m_loading) {
-    m_body->addChild(label("Reading item metadata…", true));
+    m_body->addChild(makePropertyLabel("Reading item metadata…", true));
+  } else if (m_tab == 0) {
+    buildGeneralTab();
+  } else if (m_tab == 1) {
+    buildPermissionsTab();
   } else {
-    for (const auto& sectionData : lines) {
-      if (sectionData.rows.empty())
-        continue;
-      const bool generalIdentity = m_tab == 0 && sectionData.title == "Identity";
-      const bool generalSelection = m_tab == 0 && m_multipleSelection && sectionData.title == "Selection";
-      if (generalIdentity || generalSelection) {
-        auto identity = std::make_unique<Flex>();
-        identity->setDirection(FlexDirection::Horizontal);
-        identity->setAlign(FlexAlign::Center);
-        identity->setGap(14.0F);
-        identity->setPadding(2.0F, 2.0F);
-        auto icon = std::make_unique<FileIcon>();
-        if (generalSelection) {
-          icon->setFallbackGlyph("copy");
-        } else {
-          if (!m_volumeOnly)
-            icon->setFile(m_path, m_directory);
-          icon->setThemedIconNames(m_iconNames);
-        }
-        icon->setGlyphSize(52.0F);
-        m_icon = icon.get();
-        identity->addChild(std::move(icon));
-        const auto name = std::ranges::find(sectionData.rows, "Name", &std::pair<std::string, std::string>::first);
-        const bool editable = generalIdentity
-            && name != sectionData.rows.end()
-            && !m_volumeOnly
-            && filemanager::propertyNamePresentation(m_path == m_path.root_path(), name->second).editable;
-        if (editable && m_editingName) {
-          auto editor = nameEditor();
-          editor->setFlexGrow(1.0F);
-          identity->addChild(std::move(editor));
-        } else if (generalSelection || name != sectionData.rows.end()) {
-          auto nameRow = std::make_unique<Flex>();
-          nameRow->setDirection(FlexDirection::Horizontal);
-          nameRow->setAlign(FlexAlign::Center);
-          nameRow->setGap(6.0F);
-          nameRow->setFlexGrow(1.0F);
-          const auto displayText =
-              generalSelection ? m_displayName : filemanager::sanitizeFilenameForDisplay(name->second);
-          auto displayName = label(displayText);
-          displayName->setFontSize(Style::fontSizeTitle);
-          displayName->setFontWeight(FontWeight::SemiBold);
-          displayName->setMaxLines(1);
-          displayName->setTooltip(displayText);
-          m_filenameLabel = displayName.get();
-          nameRow->addChild(std::move(displayName));
-          if (editable && m_itemAvailable && !m_applying && !m_refreshing) {
-            auto pencil = std::make_unique<Button>();
-            pencil->setGlyph("pencil");
-            pencil->setGlyphSize(14.0F);
-            pencil->setVariant(ButtonVariant::Ghost);
-            pencil->setControlHeight(24.0F);
-            pencil->setPadding(4.0F);
-            pencil->setTooltip("Rename");
-            pencil->inputArea()->setTabFocusKey("properties-filename");
-            pencil->setOnClick([this] {
-              if (!m_itemAvailable || m_applying || m_refreshing)
-                return;
-              m_wayland.stopKeyRepeat();
-              m_editingName = m_focusNameEditor = true;
-              m_contentDirty = true;
-              m_surface->requestLayout();
-            });
-            nameRow->addChild(std::move(pencil));
-          }
-          identity->addChild(std::move(nameRow));
-        }
-        m_body->addChild(std::move(identity));
-        if (editable)
-          errorNote(*m_body, m_renameError, [this] { m_renameError.clear(); });
-      }
-      const bool sizeSection = sectionData.title == "Size and storage";
-      const auto sectionTitle = sizeSection && !m_mountTarget && !m_multipleSelection ? "Size" : sectionData.title;
-      auto group = section(sectionTitle);
-      if (m_tab == 0 && &sectionData == &*lastSection)
-        group->setPadding(3.0F, 2.0F, 0.0F, 2.0F);
-      if (m_tab == 0 && sizeSection && (m_directory || m_multipleSelection)) {
-        auto heading = std::make_unique<Flex>();
-        heading->setDirection(FlexDirection::Horizontal);
-        heading->setAlign(FlexAlign::Center);
-        heading->setGap(4.0F);
-        auto title = label(sectionTitle);
-        title->setFontWeight(FontWeight::SemiBold);
-        title->setColor(colorSpecFromRole(ColorRole::Primary));
-        // The section stretches this row to its full width; let the title absorb
-        // the remaining space so the scan controls stay at the far right.
-        title->setFlexGrow(1.0F);
-        heading->addChild(std::move(title));
-        auto refresh = std::make_unique<Button>();
-        refresh->setGlyph("refresh");
-        refresh->setGlyphSize(14.0F);
-        refresh->setVariant(ButtonVariant::Ghost);
-        refresh->setControlHeight(26.0F);
-        refresh->setPadding(5.0F);
-        refresh->setTooltip(m_multipleSelection ? "Refresh selection size" : "Refresh folder size");
-        refresh->setEnabled(!m_folderScanning);
-        refresh->setOnClick([this] {
-          if (!m_folderScanning) {
-            if (m_multipleSelection)
-              ensureSelectionSize();
-            else {
-              cancelFolderSize();
-              ensureFolderSize();
-            }
-          }
-        });
-        m_sizeRefreshButton = refresh.get();
-        heading->addChild(std::move(refresh));
-        auto stop = std::make_unique<Button>();
-        stop->setGlyph("stop");
-        stop->setGlyphSize(13.0F);
-        stop->setVariant(ButtonVariant::Ghost);
-        stop->setControlHeight(26.0F);
-        stop->setPadding(5.0F);
-        stop->setTooltip(m_multipleSelection ? "Stop selection size calculation" : "Stop folder size calculation");
-        stop->setEnabled(m_folderScanning);
-        stop->setOnClick([this] {
-          if (m_folderScanning && m_folderCancel) {
-            g_cancellable_cancel(m_folderCancel);
-            if (m_cancelProtectedFolderSize)
-              (void)m_cancelProtectedFolderSize();
-          }
-        });
-        m_sizeStopButton = stop.get();
-        heading->addChild(std::move(stop));
-        // Replace the standard title row while retaining the section divider.
-        group->removeChild(group->children().front().get());
-        group->insertChildAt(0, std::move(heading));
-      }
-      auto rows = std::make_unique<Flex>();
-      rows->setDirection(FlexDirection::Vertical);
-      rows->setAlign(FlexAlign::Stretch);
-      rows->setGap(m_tab == 0 ? 5.0F : 7.0F);
-      for (const auto& [name, value] : sectionData.rows) {
-        if (generalIdentity && name == "Name")
-          continue;
-        if (m_tab == 0 && name == "Scan details") {
-          const auto scan = filemanager::propertyScanPresentation(m_folderResult);
-          auto disclosure = std::make_unique<Flex>();
-          disclosure->setDirection(FlexDirection::Horizontal);
-          disclosure->setAlign(FlexAlign::Center);
-          disclosure->setGap(8.0F);
-          auto details = std::make_unique<Button>();
-          details->setText(std::string(m_folderDetailsExpanded ? "▾ " : "▸ ") + "Scan details");
-          details->setVariant(ButtonVariant::Ghost);
-          // Use the metadata label's typography, retaining the existing
-          // chevron size within the same text run and button layout.
-          const auto metadataLabel = label("Scan details", true);
-          const float chevronScale = details->label()->fontSize() / metadataLabel->fontSize();
-          details->setFontSize(metadataLabel->fontSize());
-          details->label()->setUseMarkup(true);
-          details->setText(
-              "<span size=\""
-              + std::to_string(chevronScale * 100.0F)
-              + "%\">"
-              + (m_folderDetailsExpanded ? "▾ " : "▸ ")
-              + "</span>Scan details"
-          );
-          auto typography = Button::defaultPalette(ButtonVariant::Ghost);
-          for (auto* state : {&typography.normal, &typography.hover, &typography.pressed, &typography.disabled})
-            state->label = colorSpecFromRole(ColorRole::OnSurfaceVariant);
-          if (typography.selected)
-            typography.selected->label = colorSpecFromRole(ColorRole::OnSurfaceVariant);
-          details->setCustomPalette(std::move(typography));
-          details->setControlHeight(Style::controlHeightSm);
-          details->setContentAlign(ButtonContentAlign::Start);
-          details->setOnClick([this] {
-            m_folderDetailsExpanded = !m_folderDetailsExpanded;
-            m_contentDirty = true;
-            m_surface->requestLayout();
-          });
-          disclosure->addChild(std::move(details));
-          auto summary = label(value, true);
-          summary->setFlexGrow(1.0F);
-          summary->setMinWidth(0.0F);
-          summary->setMaxLines(0);
-          disclosure->addChild(std::move(summary));
-          rows->addChild(std::move(disclosure));
-          if (m_folderDetailsExpanded) {
-            auto diagnosticRows = std::make_unique<Flex>();
-            diagnosticRows->setDirection(FlexDirection::Vertical);
-            diagnosticRows->setAlign(FlexAlign::Stretch);
-            diagnosticRows->setGap(5.0F);
-            diagnosticRows->setPadding(0.0F, 0.0F, 0.0F, 18.0F);
-            for (const auto& [diagnosticName, diagnosticValue] : scan.details) {
-              auto diagnosticRow = std::make_unique<Flex>();
-              diagnosticRow->setDirection(FlexDirection::Horizontal);
-              diagnosticRow->setAlign(FlexAlign::Start);
-              diagnosticRow->setGap(12.0F);
-              auto key = label(diagnosticName, true);
-              key->setMinWidth(126.0F);
-              key->setMaxWidth(126.0F);
-              key->setMaxLines(0);
-              diagnosticRow->addChild(std::move(key));
-              auto diagnostic = label(diagnosticValue, true);
-              diagnostic->setFlexGrow(1.0F);
-              diagnostic->setMinWidth(0.0F);
-              diagnostic->setMaxLines(0);
-              diagnosticRow->addChild(std::move(diagnostic));
-              diagnosticRows->addChild(std::move(diagnosticRow));
-            }
-            rows->addChild(std::move(diagnosticRows));
-          }
-          continue;
-        }
-
-        auto row = std::make_unique<Flex>();
-        row->setDirection(FlexDirection::Horizontal);
-        row->setAlign(FlexAlign::Center);
-        row->setGap(12.0F);
-        auto key = label(name, true);
-        const float keyWidth = m_tab == 0 ? 110.0F : sectionData.title == "Identity" ? 84.0F : 126.0F;
-        key->setMinWidth(keyWidth);
-        key->setMaxWidth(keyWidth);
-        row->addChild(std::move(key));
-        if (m_tab == 1
-            && !m_multipleSelection
-            && m_permissionEditable
-            && sectionData.title == "Ownership"
-            && (name == "Owner" || name == "Group")) {
-          const bool groupChoice = name == "Group";
-          const auto choices = groupChoice ? m_accounts.groups : m_accounts.users;
-          const auto current = groupChoice ? m_gid : m_uid;
-          const auto pending = groupChoice ? m_pendingGroup : m_pendingOwner;
-          auto select = std::make_unique<Select>();
-          select->setControlHeight(Style::controlHeightSm);
-          select->setFlexGrow(1.0F);
-          select->setFontSize(Style::fontSizeBody * 0.92F);
-          std::vector<std::string> options;
-          std::size_t selected = static_cast<std::size_t>(-1);
-          for (std::size_t i = 0; i < choices.size(); ++i) {
-            options.push_back(
-                choices[i].name + (groupChoice ? " (GID " : " (UID ") + std::to_string(choices[i].id) + ")"
-            );
-            if ((!pending.empty() && choices[i].name == pending) || (pending.empty() && choices[i].id == current))
-              selected = i;
-          }
-          select->setOptions(std::move(options));
-          if (selected != static_cast<std::size_t>(-1))
-            select->setSelectedIndexSilently(selected);
-          else {
-            select->clearSelection();
-            select->setPlaceholder(value);
-          }
-          select->setEnabled(
-              m_permissionEditable && !m_applying && !m_refreshing && !m_choicesLoading && !choices.empty()
-          );
-          select->setOnSelectionChanged([this, choices, groupChoice, current](std::size_t index, std::string_view) {
-            if (m_applying || index >= choices.size())
-              return;
-            auto& staged = groupChoice ? m_pendingGroup : m_pendingOwner;
-            staged = choices[index].id == current ? "" : choices[index].name;
-            m_recursive = false;
-            m_discardRequested = false;
-            updatePermissionControls();
-          });
-          m_ownershipSelects[groupChoice ? 1 : 0] = select.get();
-          row->addChild(std::move(select));
-          rows->addChild(std::move(row));
-          continue;
-        }
-        const bool application = m_tab == 0 && name == "Open with";
-        const bool expanded = m_tab == 2 && m_expandedMetadata.contains(name);
-        const bool prominentSize =
-            m_tab == 0 && sizeSection
-            && (name == "Size" || name == "Folder size" || name == "Link size" || name == "Total size");
-        auto val = readOnlyValue(
-            application && m_pendingApplication
-                ? std::string(g_app_info_get_display_name(m_pendingApplication.get())) + " (pending)"
-                : value,
-            expanded, prominentSize
-        );
-        auto* valueArea = val->inputArea();
-        row->addChild(std::move(val));
-        if (m_tab == 0 && (name == "Folder size" || name == "Total size") && m_folderScanning) {
-          auto spinner = std::make_unique<Spinner>();
-          spinner->setSpinnerSize(12.0F);
-          spinner->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
-          m_sizeSpinner = spinner.get();
-          row->addChild(std::move(spinner));
-        }
-        if (m_tab == 2 && value.size() > 36) {
-          auto expand = std::make_unique<Button>();
-          expand->setText(expanded ? "Less" : "More");
-          expand->setVariant(ButtonVariant::Ghost);
-          expand->setControlHeight(Style::controlHeightSm);
-          expand->setOnClick([this, name] {
-            if (!m_expandedMetadata.erase(name))
-              m_expandedMetadata.insert(name);
-            m_contentDirty = true;
-            m_surface->requestLayout();
-          });
-          row->addChild(std::move(expand));
-        }
-        if (application) {
-          auto change = std::make_unique<Button>();
-          change->setText("Change…");
-          change->setVariant(ButtonVariant::Outline);
-          change->setControlHeight(Style::controlHeightSm);
-          change->setEnabled(!m_applying && !m_refreshing && !m_choicesLoading && !m_applications.empty());
-          auto* action = change.get();
-          change->setOnClick([this, action] { chooseApplication(action); });
-          row->addChild(std::move(change));
-        }
-        if (name == "Location" || name == "Full path" || name == "Link target")
-          addPathCopy(*row, valueArea, name, value);
-        rows->addChild(std::move(row));
-        if (application)
-          errorNote(*rows, m_applicationError, [this] { m_applicationError.clear(); });
-      }
-      if (m_tab == 1 && sectionData.title == "Ownership") {
-        if (!m_permissionEditable && !m_permissionMessage.empty()) {
-          auto note = label(m_permissionMessage, true);
-          note->setMaxLines(0);
-          rows->addChild(std::move(note));
-        }
-        if (!m_modeAvailable || m_multipleSelection)
-          errorNote(*rows, m_permissionError, [this] { m_permissionError.clear(); });
-      }
-      group->addChild(std::move(rows));
-      if (m_tab == 0 && sectionData.title == "Identity") {
-        if (!m_mime.empty()) {
-          auto scope = label("Default application changes apply to all " + m_mime + " items.", true);
-          scope->setMaxLines(2);
-          group->addChild(std::move(scope));
-        }
-      }
-      if (m_tab == 0 && sectionData.title == "Size and storage" && m_mountTarget && m_capacity >= 0) {
-        auto capacity = std::make_unique<ProgressBar>();
-        capacity->setProgress(m_capacity);
-        capacity->setSize(0.0F, 8.0F);
-        capacity->setRadius(4.0F);
-        group->addChild(std::move(capacity));
-      }
-      m_body->addChild(std::move(group));
-    }
-    if (m_tab == 1 && !m_permissions.empty()) {
-      if (m_modeAvailable) {
-        auto access = section("Access permissions");
-        const char* names[] = {"Owner", "Group", "Others"};
-        const char* headings[] = {
-            "Read", "Write",
-            m_multipleSelection ? "Execute / Traverse"
-                : m_directory   ? "Traverse"
-                                : "Execute"
-        };
-        auto columns = std::make_unique<Flex>();
-        columns->setDirection(FlexDirection::Horizontal);
-        columns->setAlign(FlexAlign::Center);
-        columns->setGap(8.0F);
-        auto blank = std::make_unique<Flex>();
-        blank->setFlexGrow(1.0F);
-        columns->addChild(std::move(blank));
-        for (const auto* heading : headings) {
-          auto column = std::make_unique<Flex>();
-          column->setMinWidth(70);
-          column->setMaxWidth(70);
-          column->setJustify(FlexJustify::Center);
-          column->addChild(label(heading, true));
-          columns->addChild(std::move(column));
-        }
-        access->addChild(std::move(columns));
-        if (m_multipleSelection) {
-          auto mixed = label(m_permissionMessage, true);
-          mixed->setMaxLines(0);
-          access->addChild(std::move(mixed));
-        }
-        for (std::size_t rowIndex = 0; rowIndex < 3; ++rowIndex) {
-          auto row = std::make_unique<Flex>();
-          row->setDirection(FlexDirection::Horizontal);
-          row->setAlign(FlexAlign::Center);
-          row->setGap(6.0F);
-          auto name = label(names[rowIndex]);
-          name->setFlexGrow(1.0F);
-          row->setGap(8.0F);
-          row->addChild(std::move(name));
-          for (std::size_t bit = 0; bit < 3; ++bit) {
-            auto check = std::make_unique<Checkbox>();
-            const auto mask = (4U >> bit) << ((2 - rowIndex) * 3);
-            check->setOnChange([this, mask](bool checked) {
-              m_editedMode = checked ? m_editedMode | mask : m_editedMode & ~mask;
-              if (m_multipleSelection) {
-                m_selectionTouchedMode |= mask;
-                for (auto& item : m_selectionPermissionItems)
-                  item.applied = false;
-              }
-              m_discardRequested = false;
-              updatePermissionControls();
-            });
-            m_permissionChecks[rowIndex][bit] = check.get();
-            auto cell = std::make_unique<Flex>();
-            cell->setMinWidth(70);
-            cell->setMaxWidth(70);
-            cell->setJustify(FlexJustify::Center);
-            cell->addChild(std::move(check));
-            row->addChild(std::move(cell));
-          }
-          access->addChild(std::move(row));
-          if (rowIndex != 2)
-            access->addChild(std::make_unique<Separator>());
-        }
-        errorNote(*access, m_permissionError, [this] { m_permissionError.clear(); });
-        m_body->addChild(std::move(access));
-      }
-      if (m_directory && m_permissionEditable) {
-        auto contents = section("Apply to contents");
-        auto row = std::make_unique<Flex>();
-        row->setDirection(FlexDirection::Horizontal);
-        row->setAlign(FlexAlign::Center);
-        row->setGap(6.0F);
-        auto recursive = std::make_unique<Checkbox>();
-        m_recursiveCheck = recursive.get();
-        recursive->setOnChange([this](bool checked) {
-          m_recursive = checked;
-          for (auto& item : m_selectionPermissionItems)
-            if (item.directory)
-              item.applied = false;
-          m_discardRequested = false;
-          updatePermissionControls();
-        });
-        row->addChild(std::move(recursive));
-        auto text = label("Apply changes recursively to all files and folders");
-        text->setFlexGrow(1.0F);
-        text->setMaxLines(2);
-        row->addChild(std::move(text));
-        contents->addChild(std::move(row));
-        m_body->addChild(std::move(contents));
-      }
-
-    } else if (lines.empty()) {
-      m_body->addChild(label("No metadata available for this item.", true));
-    }
+    buildDetailsTab();
   }
   updatePermissionControls();
   if (m_sizeSpinner) {
@@ -2916,11 +3022,11 @@ void PropertiesWindow::handleKeyForRoot(const KeyboardEvent& event) {
       && !m_applying
       && !m_refreshing
       && !m_volumeOnly) {
-    const auto identity = std::ranges::find(m_general, "Identity", &Section::title);
+    const auto identity = std::ranges::find(m_general, PropertySectionId::Identity, &Section::id);
     if (identity != m_general.end()) {
-      const auto name = std::ranges::find(identity->rows, "Name", &std::pair<std::string, std::string>::first);
+      const auto name = std::ranges::find(identity->rows, PropertyRowId::Name, &PropertyRow::id);
       if (name != identity->rows.end()
-          && filemanager::propertyNamePresentation(m_path == m_path.root_path(), name->second).editable) {
+          && filemanager::propertyNamePresentation(m_path == m_path.root_path(), name->value).editable) {
         m_wayland.stopKeyRepeat();
         m_editingName = m_focusNameEditor = true;
         m_contentDirty = true;

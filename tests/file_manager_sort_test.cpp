@@ -76,8 +76,8 @@ public:
     auto& tab = m.activeTab();
     auto& session = tab.session;
     session.m_foldersFirst = session.m_hiddenLast = false;
-    tab.selectedPath = a.absPath;
-    tab.selectedPaths = {a.absPath.string()};
+    tab.m_selectedPath = a.absPath;
+    tab.m_selectedPaths = {a.absPath.string()};
     for (const auto& [id, first] : {std::pair{53, "a"}, {54, "b"}, {55, "a"}, {56, "a"}, {57, "b"}, {61, "b"}}) {
       session.m_entries = {a, b};
       m.restoreSelection();
@@ -85,7 +85,7 @@ public:
       clickSort(m, id);
       TEST_CHECK(session.m_entries.front().name == first);
       TEST_CHECK(m.m_grid->selectedIndex() && session.m_entries[*m.m_grid->selectedIndex()].absPath == a.absPath);
-      TEST_CHECK(tab.selectedPaths.contains(a.absPath.string()));
+      TEST_CHECK(tab.m_selectedPaths.contains(a.absPath.string()));
       clickSort(m, 62);
       TEST_CHECK(session.m_entries.back().name == first);
       TEST_CHECK(m.m_listHeader.m_sortOrder == FileDialogSortOrder::Descending);

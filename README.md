@@ -65,6 +65,8 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 - Mount management and filesystem capacity information.
 - Optional GIO/GVfs integration: `gvfs` provides `trash://` Wastebin browsing, GVfs volume/remote mounting, and FUSE mount paths, while protocol backends (such as `gvfs-smb`, `gvfs-mtp`, and `gvfs-nfs`) extend remote location support. When GVfs or individual backends are unavailable, local browsing, file operations, and UDisks2/systemd mount tracking continue working gracefully.
 
+On KDE Plasma, Wastebin browsing still needs the GVfs trash backend running on the user's D-Bus session. Dolphin uses KDE's KIO backend, so opening Wastebin there does not verify GVfs. Both can read the same Freedesktop home Wastebin when they run as the same user with the same XDG data directory. The Home Wastebin fallback moves files into that storage after a failed trash operation. Browsing and emptying still use GVfs.
+
 ### Tools & Integration
 
 - File, Edit, View, Tools and Help menus.

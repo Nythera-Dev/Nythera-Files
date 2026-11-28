@@ -162,14 +162,14 @@ public:
           FileEntry{.name = "alpha.txt", .absPath = fileA, .isDir = false, .size = 5, .type = "text/plain"},
           FileEntry{.name = "beta-link", .absPath = linkB, .isDir = false, .size = 8, .type = "text/plain"},
       };
-      tab.selectedPaths = {fileA.string()};
+      tab.m_selectedPaths = {fileA.string()};
       manager.updateStatusBar();
       TEST_CHECK(selectionPending.size() == 1 && selectionPending[0].first == fileA);
       TEST_CHECK(primary.text() == "alpha.txt");
       TEST_CHECK(!detail.text().empty());
 
       // Switch selection to linkB before fileA's query finishes.
-      tab.selectedPaths = {linkB.string()};
+      tab.m_selectedPaths = {linkB.string()};
       manager.updateStatusBar();
       TEST_CHECK(selectionPending.size() == 2 && selectionPending[1].first == linkB);
 
@@ -225,7 +225,7 @@ public:
           return true;
         };
         transientSession.m_path = dirA;
-        transientTab.selectedPaths = {fileA.string()};
+        transientTab.m_selectedPaths = {fileA.string()};
         transient->queryStatusFreeSpaceAsync(dirA);
         transientSession.queryDirectoryWritableAsync(dirA);
         transient->querySelectionInfoAsync(fileA);
@@ -255,7 +255,7 @@ public:
       session.m_entries = {
           FileEntry{.name = "beta-link", .absPath = linkB, .isDir = false, .size = 0, .type = {}},
       };
-      tab.selectedPaths = {linkB.string()};
+      tab.m_selectedPaths = {linkB.string()};
       manager.updateStatusBar();
       TEST_CHECK(waitFor([&] { return tab.m_selectionInfo.has_value() && tab.m_selectionInfo->path == linkB; }));
       TEST_CHECK(tab.m_selectionInfo->symlink);
@@ -279,7 +279,7 @@ public:
       attachStatusLabels(manager, primary, detail);
 
       std::vector<std::pair<std::filesystem::path, std::function<void(FileManager::PlacePathResolution)>>> placePending;
-      manager.m_places.m_placePathResolveHook = [&](const std::filesystem::path& p, auto done) {
+      manager.m_pathCache.m_resolveHook = [&](const std::filesystem::path& p, auto done) {
         placePending.emplace_back(p, std::move(done));
         return true;
       };
@@ -321,7 +321,7 @@ public:
       placePending[2].second(
           FileManager::PlacePathResolution{.exists = true, .isDirectory = true, .canonicalPath = realDir}
       );
-      TEST_CHECK(manager.m_places.samePersonalPlace(realDir, linkDir));
+      TEST_CHECK(manager.m_pathCache.samePersonalPlace(realDir, linkDir));
       TEST_CHECK(manager.m_places.m_savedPlaces.size() == 1);
       TEST_CHECK(manager.m_statusMessage == "This folder is already saved in Places");
 
@@ -329,7 +329,7 @@ public:
       const auto slowDir = root / "slow-place";
       manager.m_places.savePlace(slowDir);
       TEST_CHECK(placePending.size() == 4 && placePending[3].first == slowDir);
-      manager.m_places.cancelPathResolutions();
+      manager.m_pathCache.cancel();
       placePending[3].second(
           FileManager::PlacePathResolution{.exists = true, .isDirectory = true, .canonicalPath = slowDir}
       );
@@ -341,7 +341,7 @@ public:
       std::function<void(FileManager::PlacePathResolution)> latePlace;
       {
         auto transient = std::make_unique<FileManager>(dirA.string());
-        transient->m_places.m_placePathResolveHook = [&](const std::filesystem::path&, auto done) {
+        transient->m_pathCache.m_resolveHook = [&](const std::filesystem::path&, auto done) {
           latePlace = std::move(done);
           return true;
         };
@@ -489,17 +489,17 @@ public:
       // Lexical fast path requires no filesystem I/O.
       FileManager manager(linkTarget.string());
       manager.m_windowOpen = true;
-      TEST_CHECK(manager.m_places.sameDirectoryPathCached(realTarget, realTarget / ".") == true);
-      TEST_CHECK(!manager.m_places.sameDirectoryPathCached(linkTarget, realTarget).has_value());
+      TEST_CHECK(manager.m_pathCache.sameDirectoryPathCached(realTarget, realTarget / ".") == true);
+      TEST_CHECK(!manager.m_pathCache.sameDirectoryPathCached(linkTarget, realTarget).has_value());
 
       // Real async resolution confirms symlink equivalence and distinguishes different directories.
       std::optional<bool> sameViaSymlink;
-      manager.m_places.compareDirectoriesAsync(linkTarget, realTarget, [&](bool eq) { sameViaSymlink = eq; });
+      manager.m_pathCache.compareDirectoriesAsync(linkTarget, realTarget, [&](bool eq) { sameViaSymlink = eq; });
       TEST_CHECK(waitFor([&] { return sameViaSymlink.has_value(); }));
       TEST_CHECK(*sameViaSymlink);
 
       std::optional<bool> diffDirs;
-      manager.m_places.compareDirectoriesAsync(linkTarget, otherTarget, [&](bool eq) { diffDirs = eq; });
+      manager.m_pathCache.compareDirectoriesAsync(linkTarget, otherTarget, [&](bool eq) { diffDirs = eq; });
       TEST_CHECK(waitFor([&] { return diffDirs.has_value(); }));
       TEST_CHECK(!*diffDirs);
 
@@ -522,13 +522,13 @@ public:
           },
       };
       std::vector<std::pair<std::filesystem::path, std::function<void(FileManager::PlacePathResolution)>>> pendingCmp;
-      delayed.m_places.m_placePathResolveHook = [&](const std::filesystem::path& p, auto done) {
+      delayed.m_pathCache.m_resolveHook = [&](const std::filesystem::path& p, auto done) {
         pendingCmp.emplace_back(p, std::move(done));
         return true;
       };
 
       const std::uint64_t opId = 42;
-      delayed.m_transfers.m_pasteRequests[opId] = {
+      delayed.m_clipboard.m_pasteRequests[opId] = {
           delayedTab.id, realTarget, delayedSession.m_navigationGeneration, std::nullopt
       };
       FileOperationManager::Operation op;
@@ -543,7 +543,7 @@ public:
       );
       TEST_CHECK(!delayed.recordPasteCompletion(op));
       TEST_CHECK(pendingCmp.size() == 2);
-      TEST_CHECK(delayedTab.selectedPaths.empty());
+      TEST_CHECK(delayedTab.m_selectedPaths.empty());
 
       // Resolve both paths to the same canonical target: paste selection applies cleanly.
       pendingCmp[0].second(
@@ -552,14 +552,14 @@ public:
       pendingCmp[1].second(
           FileManager::PlacePathResolution{.exists = true, .isDirectory = true, .canonicalPath = realTarget}
       );
-      TEST_CHECK(delayedTab.selectedPaths == std::unordered_set<std::string>{(linkTarget / "pasted.txt").string()});
+      TEST_CHECK(delayedTab.m_selectedPaths == std::unordered_set<std::string>{(linkTarget / "pasted.txt").string()});
 
       // Navigation while comparison is pending must discard stale paste selection.
       pendingCmp.clear();
-      delayed.m_places.m_placePathCache.clear();
-      delayedTab.selectedPaths.clear();
+      delayed.m_pathCache.m_cache.clear();
+      delayedTab.m_selectedPaths.clear();
       const std::uint64_t opId2 = 43;
-      delayed.m_transfers.m_pasteRequests[opId2] = {
+      delayed.m_clipboard.m_pasteRequests[opId2] = {
           delayedTab.id, realTarget, delayedSession.m_navigationGeneration, std::nullopt
       };
       op.id = opId2;
@@ -572,7 +572,7 @@ public:
       pendingCmp[1].second(
           FileManager::PlacePathResolution{.exists = true, .isDirectory = true, .canonicalPath = realTarget}
       );
-      TEST_CHECK(delayedTab.selectedPaths.empty());
+      TEST_CHECK(delayedTab.m_selectedPaths.empty());
 
       // Destruction while comparison is pending must not block or UAF.
       std::vector<std::function<void(FileManager::PlacePathResolution)>> lateCmp;
@@ -580,11 +580,11 @@ public:
         auto transient = std::make_unique<FileManager>(linkTarget.string());
         transient->m_windowOpen = true;
         transient->activeSession().m_path = linkTarget;
-        transient->m_places.m_placePathResolveHook = [&](const std::filesystem::path&, auto done) {
+        transient->m_pathCache.m_resolveHook = [&](const std::filesystem::path&, auto done) {
           lateCmp.push_back(std::move(done));
           return true;
         };
-        transient->m_places.compareDirectoriesAsync(linkTarget, realTarget, [](bool) {});
+        transient->m_pathCache.compareDirectoriesAsync(linkTarget, realTarget, [](bool) {});
         TEST_CHECK(lateCmp.size() == 2);
       }
       for (auto& fn : lateCmp)
@@ -639,7 +639,7 @@ public:
       TEST_CHECK(symIt != session.m_entries.end() && symIt->isSymlink && !symIt->hasIdentity);
 
       // Matching regular file + directory restores selection synchronously from enumerated identity.
-      tab.selectedPaths.clear();
+      tab.m_selectedPaths.clear();
       tab.pendingPasteSelection = FileManager::PasteSelection{
           .request = {tab.id, enumDir, session.m_navigationGeneration, std::nullopt},
           .entries = {
@@ -652,10 +652,10 @@ public:
           },
       };
       manager.applyPendingPasteSelection();
-      TEST_CHECK(tab.selectedPaths == std::unordered_set<std::string>{regFile.string(), subDir.string()});
+      TEST_CHECK(tab.m_selectedPaths == std::unordered_set<std::string>{regFile.string(), subDir.string()});
 
       // Mismatched inode (e.g. replaced file) must NOT be selected by filename alone.
-      tab.selectedPaths.clear();
+      tab.m_selectedPaths.clear();
       tab.pendingPasteSelection = FileManager::PasteSelection{
           .request = {tab.id, enumDir, session.m_navigationGeneration, std::nullopt},
           .entries = {
@@ -665,10 +665,10 @@ public:
           },
       };
       manager.applyPendingPasteSelection();
-      TEST_CHECK(tab.selectedPaths.empty());
+      TEST_CHECK(tab.m_selectedPaths.empty());
 
       // Symlink selection resolves NOFOLLOW (device, inode) asynchronously and matches the symlink's own inode.
-      tab.selectedPaths.clear();
+      tab.m_selectedPaths.clear();
       tab.pendingPasteSelection = FileManager::PasteSelection{
           .request = {tab.id, enumDir, session.m_navigationGeneration, std::nullopt},
           .entries = {
@@ -678,10 +678,10 @@ public:
           },
       };
       manager.applyPendingPasteSelection();
-      TEST_CHECK(waitFor([&] { return tab.selectedPaths == std::unordered_set<std::string>{symFile.string()}; }));
+      TEST_CHECK(waitFor([&] { return tab.m_selectedPaths == std::unordered_set<std::string>{symFile.string()}; }));
 
       // Stale navigation generation must never restore selection.
-      tab.selectedPaths.clear();
+      tab.m_selectedPaths.clear();
       tab.pendingPasteSelection = FileManager::PasteSelection{
           .request = {tab.id, enumDir, session.m_navigationGeneration, std::nullopt},
           .entries = {
@@ -692,7 +692,7 @@ public:
       };
       ++session.m_navigationGeneration;
       manager.applyPendingPasteSelection();
-      TEST_CHECK(tab.selectedPaths.empty());
+      TEST_CHECK(tab.m_selectedPaths.empty());
     }
     // Link navigation uses the resolved target, and reveals only the selected
     // hidden entry without changing the current Show Hidden preference.
@@ -722,7 +722,7 @@ public:
 
       manager.goToLinkTarget(fileLink);
       TEST_CHECK(waitFor([&] { return session.path() == dirB && !session.loading(); }));
-      TEST_CHECK(tab.selectedPath == hiddenTarget && tab.selectedPaths == std::unordered_set{hiddenTarget.string()});
+      TEST_CHECK(tab.m_selectedPath == hiddenTarget && tab.m_selectedPaths == std::unordered_set{hiddenTarget.string()});
       TEST_CHECK(std::ranges::find(session.entries(), hiddenTarget, &FileEntry::absPath) != session.entries().end());
       TEST_CHECK(std::ranges::find(session.entries(), otherHidden, &FileEntry::absPath) == session.entries().end());
       TEST_CHECK(!session.showHidden());
@@ -731,7 +731,7 @@ public:
       TEST_CHECK(waitFor([&] { return session.path() == dirA && !session.loading(); }));
       manager.goToLinkTarget(folderLink);
       TEST_CHECK(waitFor([&] { return session.path() == dirB && !session.loading(); }));
-      TEST_CHECK(!tab.selectedPath && tab.selectedPaths.empty());
+      TEST_CHECK(!tab.m_selectedPath && tab.m_selectedPaths.empty());
       TEST_CHECK(std::ranges::find(session.entries(), hiddenTarget, &FileEntry::absPath) == session.entries().end());
     }
   }

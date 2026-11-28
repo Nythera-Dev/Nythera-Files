@@ -8,9 +8,9 @@
 
 const FileEntry* FileManager::selectedPreviewEntry() {
   auto& tab = activeTab();
-  if (!tab.capabilities().canGenerateThumbnails || tab.selectedPaths.size() != 1)
+  if (!tab.capabilities().canGenerateThumbnails || tab.selectionCount() != 1)
     return nullptr;
-  const std::filesystem::path selected(*tab.selectedPaths.begin());
+  const std::filesystem::path selected(*tab.selectedPaths().begin());
   if (!selected.is_absolute())
     return nullptr;
   const auto& entries = tab.session.entries();
@@ -57,7 +57,7 @@ void FileManager::openPreviewed(bool with) {
   const auto path = entry->absPath;
   if (with) {
     m_menus.setContextMenuTarget(path);
-    m_menus.openApplicationChooser();
+    m_launcher.openApplicationChooser(path);
   } else {
     activatePath(path);
   }
@@ -76,7 +76,7 @@ void FileManager::syncFilePreview(filemanager::FilePreview& preview, filemanager
     } else if (policy != filemanager::ThumbnailPolicy::Never) {
       const auto& entries = tab.session.entries();
       const auto index = static_cast<std::size_t>(entry - entries.data());
-      if (auto copy = protectedThumbnailPath(tab, *entry, index); copy && !copy->empty()) {
+      if (auto copy = m_protectedFiles.thumbnailPath(tab, *entry, index); copy && !copy->empty()) {
         source = std::move(*copy);
         protectedCopy = true;
       }
@@ -117,7 +117,7 @@ void FileManager::inspectThumbnailCache(bool clear) {
   }
   showDialog(
       "Clear Thumbnail Cache", "Remove thumbnails saved by Nythera Files from the shared cache?",
-      {{"Cancel", 0}, {"Clear", 1}}, [this, report](int response) {
+      {{"Cancel", 0, filemanager::DialogChoiceStyle::Cancel}, {"Clear", 1}}, [this, report](int response) {
         if (response == 1)
           m_pickerThumbnails.requestFreedesktopCacheInfo(true, report);
       }

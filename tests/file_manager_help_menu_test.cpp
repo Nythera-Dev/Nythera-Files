@@ -197,8 +197,8 @@ public:
     };
     session.m_directoryWritablePath = directory;
     session.m_directoryWritable = true;
-    tab.selectedPaths = {zip.native(), tgz.native()};
-    tab.selectedPath = zip;
+    tab.m_selectedPaths = {zip.native(), tgz.native()};
+    tab.m_selectedPath = zip;
     auto archiveMenu = manager.m_menus.archiveMenuEntries();
     TEST_CHECK(
         archiveMenu.size() == 2 && archiveMenu[0].id == kArchiveCompress && archiveMenu[1].id == kArchiveExtract
@@ -208,10 +208,10 @@ public:
     const auto tools = manager.m_menus.toolsMenuEntries();
     const auto extract = std::ranges::find(tools, kArchiveExtract, &ContextMenuControlEntry::id);
     TEST_CHECK(extract != tools.end() && extract->submenuEntries[2].id == kExtractTo);
-    tab.selectedPaths.insert(text.native());
+    tab.m_selectedPaths.insert(text.native());
     archiveMenu = manager.m_menus.archiveMenuEntries();
     TEST_CHECK(archiveMenu.size() == 1 && archiveMenu.front().id == kArchiveCompress);
-    tab.selectedPaths = {zip.native(), tgz.native()};
+    tab.m_selectedPaths = {zip.native(), tgz.native()};
 
     class Picker : public FileDialogPresenter {
     public:
@@ -380,8 +380,8 @@ public:
     modal.forceCloseImmediate();
     modal.m_presentToplevelForTest = {};
     modal.m_initialLayoutRendererForTest = nullptr;
-    tab.selectedPaths.clear();
-    tab.selectedPath.reset();
+    tab.m_selectedPaths.clear();
+    tab.m_selectedPath.reset();
     session.m_entries.clear();
   }
 #endif
@@ -576,7 +576,7 @@ public:
       session.closeMonitor();
       const auto firstFolder = browseDir / "New Folder";
       TEST_CHECK(std::filesystem::is_directory(firstFolder));
-      TEST_CHECK(tab.selectedPath && *tab.selectedPath == firstFolder);
+      TEST_CHECK(tab.m_selectedPath && *tab.m_selectedPath == firstFolder);
       TEST_CHECK(manager.m_pendingInlineRenamePath && *manager.m_pendingInlineRenamePath == firstFolder);
 
       manager.m_pendingInlineRenamePath.reset();
@@ -587,7 +587,7 @@ public:
       session.closeMonitor();
       const auto secondFolder = browseDir / "New Folder 2";
       TEST_CHECK(std::filesystem::is_directory(secondFolder));
-      TEST_CHECK(tab.selectedPath && *tab.selectedPath == secondFolder);
+      TEST_CHECK(tab.m_selectedPath && *tab.m_selectedPath == secondFolder);
       TEST_CHECK(manager.m_pendingInlineRenamePath && *manager.m_pendingInlineRenamePath == secondFolder);
 
       manager.m_pendingInlineRenamePath.reset();

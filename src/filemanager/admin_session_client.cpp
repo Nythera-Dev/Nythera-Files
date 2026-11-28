@@ -1,5 +1,7 @@
 #include "filemanager/admin_session_client.h"
 
+#include "filemanager/admin_helper_session.h"
+
 #include "filemanager/tab_presentation.h"
 
 #include "admin_helper_paths.h"
@@ -205,7 +207,7 @@ namespace filemanager {
 
     std::mutex mutex;
     std::deque<OutgoingItem> outgoingQueue;
-    std::array<AdminRequestId, file_operation_engine::kOperationSlots> activeOperations{};
+    std::array<AdminRequestId, admin_operation_concurrency::kOperationSlots> activeOperations{};
     bool stopRequested = false;
     bool gracefulStop = false;
     bool cancelledAuth = false;
@@ -1379,7 +1381,7 @@ namespace filemanager {
       return failure(AdminStatusCode::Unauthorized, "The originating Administrator session is no longer active.");
 
     auto worker = m_activeWorker;
-    const auto slot = file_operation_engine::operationSlot(request.kind, request.contentRevision);
+    const auto slot = admin_operation_concurrency::operationSlot(request.kind, request.contentRevision);
     {
       std::lock_guard lock(worker->mutex);
       if (worker->stopRequested)

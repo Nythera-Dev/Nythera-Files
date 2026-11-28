@@ -95,9 +95,9 @@ namespace filemanager {
 
     m_dialogHost.showDialog(
         "Wastebin Unavailable", std::move(headerMessage),
-        {{"Cancel", kCancelResponse},
+        {{"Cancel", kCancelResponse, filemanager::DialogChoiceStyle::Cancel},
          {"Move to Home Wastebin", kMoveToHomeResponse},
-         {"Permanently Delete…", kPermanentDeleteResponse}},
+         {"Permanently Delete…", kPermanentDeleteResponse, filemanager::DialogChoiceStyle::Destructive}},
         [this](int response) {
           if (!m_state)
             return;
@@ -110,7 +110,7 @@ namespace filemanager {
           else if (response == kPermanentDeleteResponse && deleteCb)
             deleteCb(std::move(sources));
         },
-        nullptr, false, false, std::move(custom)
+        nullptr, std::move(custom)
     );
   }
 

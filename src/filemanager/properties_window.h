@@ -70,9 +70,49 @@ public:
 private:
   friend class FileManagerTestAccess;
   void handleKeyForRoot(const KeyboardEvent& event);
+  enum class PropertySectionId {
+    None,
+    Identity,
+    Selection,
+    SizeAndStorage,
+    Timestamps,
+    Ownership,
+    SpecialPermissions,
+    Technical,
+    Filesystem,
+    OtherMetadata,
+  };
+  enum class PropertyRowId {
+    None,
+    Name,
+    Location,
+    FullPath,
+    LinkTarget,
+    OpenWith,
+    Size,
+    FolderSize,
+    LinkSize,
+    TotalSize,
+    SizeOnDisk,
+    Contents,
+    ScanDetails,
+    Owner,
+    Group,
+    FilesystemType,
+    MountPoint,
+    Capacity,
+    FreeSpace,
+    CustomMetadata,
+  };
+  struct PropertyRow {
+    PropertyRowId id = PropertyRowId::None;
+    std::string label;
+    std::string value;
+  };
   struct Section {
+    PropertySectionId id = PropertySectionId::None;
     std::string title;
-    std::vector<std::pair<std::string, std::string>> rows;
+    std::vector<PropertyRow> rows;
   };
   struct SelectionPermissionItem {
     std::filesystem::path path;
@@ -96,6 +136,13 @@ private:
   void createTabScroll();
   void positionTabTransition();
   void rebuildTab();
+  void buildGeneralTab();
+  void buildPermissionsTab();
+  void buildDetailsTab();
+  [[nodiscard]] std::unique_ptr<Input> makeReadOnlyValue(const std::string& value, bool expanded, bool prominent);
+  void addPathCopyButton(Flex& row, InputArea* valueArea, const std::string& name, const std::string& value);
+  void appendErrorNote(Flex& parent, const std::string& message, std::function<void()> dismiss);
+  [[nodiscard]] std::unique_ptr<Input> makeNameEditor();
   void ensureFolderSize();
   void ensureSelectionSize();
   void scanAdministratorSelectionItem(std::size_t index, std::shared_ptr<filemanager::FolderSizeResult> total);

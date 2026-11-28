@@ -106,8 +106,8 @@ public:
       TEST_CHECK(!timeout && finished && *finished);
       session.closeMonitor();
       TEST_CHECK(session.m_path == pictures);
-      TEST_CHECK(tab.selectedPaths == std::unordered_set<std::string>{(pictures / name).string()});
-      TEST_CHECK(tab.selectedPath == pictures / name);
+      TEST_CHECK(tab.m_selectedPaths == std::unordered_set<std::string>{(pictures / name).string()});
+      TEST_CHECK(tab.m_selectedPath == pictures / name);
       TEST_CHECK(std::filesystem::exists(source) == (action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY));
       grid.layout(renderer);
       manager.finishPendingTransferReveal(renderer);
@@ -123,14 +123,14 @@ public:
     std::filesystem::create_directory(unrelated);
     const auto name = "2026-11-17 22-10-26.mp4";
     std::filesystem::create_hard_link(root / name, unrelated / name);
-    tab.selectedPaths.clear();
-    tab.selectedPath.reset();
+    tab.m_selectedPaths.clear();
+    tab.m_selectedPath.reset();
     FileOperationManager::Operation other{.id = 9999};
     other.completedEntries = {identity(unrelated / name)};
-    manager.m_transfers.m_pasteRequests[other.id] = {tab.id, root, session.m_navigationGeneration};
+    manager.m_clipboard.m_pasteRequests[other.id] = {tab.id, root, session.m_navigationGeneration};
     TEST_CHECK(manager.recordPasteCompletion(other));
     manager.applyPendingPasteSelection();
-    TEST_CHECK(tab.selectedPaths.empty());
+    TEST_CHECK(tab.m_selectedPaths.empty());
     grid.bindScrollState(nullptr);
     manager.m_grid = nullptr;
     grid.setAdapter(nullptr);
@@ -156,7 +156,7 @@ public:
       if (!timedOut)
         g_source_remove(timer);
       TEST_CHECK(!timedOut);
-      TEST_CHECK(manager.m_transfers.m_pasteRequests.empty());
+      TEST_CHECK(manager.m_clipboard.m_pasteRequests.empty());
     };
     // Paths entered in the location bar (and supplied on the command line) may
     // end in a separator. GIO's actual destination paths do not retain it.
@@ -168,10 +168,10 @@ public:
         std::ofstream(source / name) << "clipboard transfer";
         const auto id = move ? manager.m_operations.move({(source / name).string()}, session.m_path.string())
                              : manager.m_operations.copy({(source / name).string()}, session.m_path.string());
-        manager.m_transfers.m_pasteRequests[id] = {tab.id, session.m_path, session.m_navigationGeneration};
+        manager.m_clipboard.m_pasteRequests[id] = {tab.id, session.m_path, session.m_navigationGeneration};
         waitForRefresh();
-        TEST_CHECK(tab.selectedPaths == std::unordered_set<std::string>{(root / name).string()});
-        TEST_CHECK(tab.selectedPath == root / name);
+        TEST_CHECK(tab.m_selectedPaths == std::unordered_set<std::string>{(root / name).string()});
+        TEST_CHECK(tab.m_selectedPath == root / name);
         TEST_CHECK(std::filesystem::exists(source / name) != move);
         // A same-directory refresh supersedes an in-flight monitor query. It
         // must keep the new selection after enumeration and metadata callbacks.
@@ -180,7 +180,7 @@ public:
         waitForRefresh();
         while (g_main_context_iteration(nullptr, FALSE)) {
         }
-        TEST_CHECK(tab.selectedPaths == std::unordered_set<std::string>{(root / name).string()});
+        TEST_CHECK(tab.m_selectedPaths == std::unordered_set<std::string>{(root / name).string()});
       }
     }
     // Exercise real multi-source completion: Keep Both, Skip and cancellation
@@ -203,12 +203,12 @@ public:
          (source / "batch-skipped.txt").string(), (source / "batch-cancelled.txt").string()},
         session.m_path.string()
     );
-    manager.m_transfers.m_pasteRequests[id] = {tab.id, session.m_path, session.m_navigationGeneration};
+    manager.m_clipboard.m_pasteRequests[id] = {tab.id, session.m_path, session.m_navigationGeneration};
     waitForRefresh();
     const std::unordered_set<std::string> expected{
         (root / "batch-first.txt").string(), (root / "batch-actual.txt").string()
     };
-    TEST_CHECK(tab.selectedPaths == expected);
+    TEST_CHECK(tab.m_selectedPaths == expected);
     manager.m_operations.setConflictResolver({});
     session.closeMonitor();
     manager.navigate(root, false);
@@ -344,27 +344,27 @@ public:
       finished.reset();
       receive(filemanager::encodeFileTransfer(sources, false), [&](bool success) { finished = success; });
       waitForDrop();
-      TEST_CHECK(tab.selectedPaths.size() == 2);
+      TEST_CHECK(tab.m_selectedPaths.size() == 2);
       TEST_CHECK(
-          tab.selectedPath
+          tab.m_selectedPath
           == root / (prefix + (manager.m_listHeader.m_sortOrder == FileDialogSortOrder::Ascending ? "a.txt" : "b.txt"))
       );
-      TEST_CHECK(manager.m_transfers.m_pasteRequests.empty());
+      TEST_CHECK(manager.m_clipboard.m_pasteRequests.empty());
       // A frame while a follow-up enumeration is pending must not consume the
       // reveal. New sorted entries can move the selected row after that frame.
       manager.enumerate(root);
       grid.layout(renderer);
       manager.finishPendingTransferReveal(renderer);
-      TEST_CHECK(tab.pendingPasteRevealPath == tab.selectedPath);
+      TEST_CHECK(tab.pendingPasteRevealPath == tab.m_selectedPath);
       waitForDrop();
       session.queryMonitoredFile(root / (prefix + "a.txt"));
       grid.layout(renderer);
       manager.finishPendingTransferReveal(renderer);
-      TEST_CHECK(tab.pendingPasteRevealPath == tab.selectedPath);
+      TEST_CHECK(tab.pendingPasteRevealPath == tab.m_selectedPath);
       waitForDrop();
       grid.layout(renderer);
       manager.finishPendingTransferReveal(renderer);
-      const auto first = std::ranges::find(session.m_entries, *tab.selectedPath, &FileEntry::absPath);
+      const auto first = std::ranges::find(session.m_entries, *tab.m_selectedPath, &FileEntry::absPath);
       const auto index = static_cast<std::size_t>(first - session.m_entries.begin());
       TEST_CHECK(grid.selectedIndex() == index);
       TEST_CHECK(grid.scrollView().scrollOffset() <= index * 30);
@@ -373,7 +373,7 @@ public:
       TEST_CHECK(grid.scrollView().userScrollGeneration() == 0);
       for (const auto& source : sources) {
         const auto destination = root / std::filesystem::path(source).filename();
-        TEST_CHECK(tab.selectedPaths.contains(destination.string()));
+        TEST_CHECK(tab.m_selectedPaths.contains(destination.string()));
         TEST_CHECK(std::filesystem::exists(destination));
         TEST_CHECK(std::filesystem::exists(source) == (action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY));
       }
@@ -401,7 +401,7 @@ public:
     waitForDrop();
     grid.layout(renderer);
     manager.finishPendingTransferReveal(renderer);
-    TEST_CHECK(tab.selectedPaths == std::unordered_set<std::string>{(root / manualSource.filename()).string()});
+    TEST_CHECK(tab.m_selectedPaths == std::unordered_set<std::string>{(root / manualSource.filename()).string()});
     TEST_CHECK(scroll.scrollOffset() == 0);
     TEST_CHECK(!tab.pendingPasteRevealPath);
 
@@ -422,7 +422,7 @@ public:
     grid.layout(renderer);
     manager.finishPendingTransferReveal(renderer);
     TEST_CHECK(scroll.scrollOffset() == manualOffset);
-    TEST_CHECK(tab.selectedPaths.contains((root / lateSource.filename()).string()));
+    TEST_CHECK(tab.m_selectedPaths.contains((root / lateSource.filename()).string()));
     TEST_CHECK(!tab.pendingPasteRevealPath);
     const auto beforeTouch = scroll.userScrollGeneration();
     scroll.viewportArea()->dispatchPress(10, 40, BTN_LEFT, true);
@@ -440,7 +440,7 @@ public:
     manager.navigate(root / "other", false);
     manager.navigate(root, false);
     waitForDrop();
-    const auto selectedBeforeDelayedDrop = tab.selectedPaths;
+    const auto selectedBeforeDelayedDrop = tab.m_selectedPaths;
     finished.reset();
     delayedReceive(filemanager::encodeFileTransfer({delayedSource.string()}, false), [&](bool success) {
       finished = success;
@@ -448,7 +448,7 @@ public:
     waitForDrop();
     TEST_CHECK(session.m_path == root);
     TEST_CHECK(std::filesystem::exists(root / "delayed-drop.txt"));
-    TEST_CHECK(tab.selectedPaths == selectedBeforeDelayedDrop);
+    TEST_CHECK(tab.m_selectedPaths == selectedBeforeDelayedDrop);
 
     // Unsupported authorities and cancelled reads never enqueue an operation.
     manager.m_transfers.m_dragTargetValid = true;
@@ -492,7 +492,7 @@ public:
     session.m_path = root;
     tab.viewState.sortField = manager.m_listHeader.m_sortField = FileDialogSortField::Name;
     tab.viewState.sortOrder = manager.m_listHeader.m_sortOrder = FileDialogSortOrder::Ascending;
-    manager.m_transfers.m_pasteRequests[1] = {tab.id, root, session.m_navigationGeneration};
+    manager.m_clipboard.m_pasteRequests[1] = {tab.id, root, session.m_navigationGeneration};
     FileOperationManager::Operation partial{.id = 1};
     partial.finished = true;
     partial.cancelled = true;
@@ -516,12 +516,12 @@ public:
       g_source_remove(timer);
     TEST_CHECK(!timedOut);
     session.closeMonitor();
-    TEST_CHECK(tab.selectedPaths.size() == 2);
-    TEST_CHECK(tab.selectedPaths.contains(first.string()));
-    TEST_CHECK(tab.selectedPaths.contains(second.string()));
-    TEST_CHECK(!tab.selectedPaths.contains(replaced.string()));
-    TEST_CHECK(!tab.selectedPaths.contains(cancelled.string()));
-    TEST_CHECK(tab.selectedPath == first);
+    TEST_CHECK(tab.m_selectedPaths.size() == 2);
+    TEST_CHECK(tab.m_selectedPaths.contains(first.string()));
+    TEST_CHECK(tab.m_selectedPaths.contains(second.string()));
+    TEST_CHECK(!tab.m_selectedPaths.contains(replaced.string()));
+    TEST_CHECK(!tab.m_selectedPaths.contains(cancelled.string()));
+    TEST_CHECK(tab.m_selectedPath == first);
 
     // Exercise the real grid's deferred scroll with the current sorted index.
     Adapter adapter(session.m_entries);
@@ -549,7 +549,7 @@ public:
     tab.pendingPasteSelection =
         FileManager::PasteSelection{{tab.id, root, session.m_navigationGeneration}, partial.completedEntries};
     manager.applyPendingPasteSelection();
-    TEST_CHECK(tab.selectedPath == second);
+    TEST_CHECK(tab.m_selectedPath == second);
     const auto descending = std::ranges::find(session.m_entries, second, &FileEntry::absPath);
     TEST_CHECK(grid.selectedIndex() == static_cast<std::size_t>(descending - session.m_entries.begin()));
     grid.bindScrollState(nullptr);
@@ -557,7 +557,7 @@ public:
     grid.setAdapter(nullptr);
 
     // Navigation away and back invalidates the request even at the same path.
-    manager.m_transfers.m_pasteRequests[2] = {tab.id, root, session.m_navigationGeneration};
+    manager.m_clipboard.m_pasteRequests[2] = {tab.id, root, session.m_navigationGeneration};
     std::filesystem::create_directory(root / "other");
     manager.navigate(root / "other", false);
     manager.navigate(root, false);
@@ -576,17 +576,17 @@ public:
       g_source_remove(navigationTimer);
     TEST_CHECK(!timedOut);
     session.closeMonitor();
-    const auto before = tab.selectedPaths;
+    const auto before = tab.m_selectedPaths;
     TEST_CHECK(session.m_path == root);
     partial.id = 2;
     TEST_CHECK(!manager.recordPasteCompletion(partial));
-    TEST_CHECK(tab.selectedPaths == before);
+    TEST_CHECK(tab.m_selectedPaths == before);
     tab.pendingPasteSelection =
         FileManager::PasteSelection{{tab.id, root, session.m_navigationGeneration - 1}, partial.completedEntries};
     manager.applyPendingPasteSelection();
-    TEST_CHECK(tab.selectedPaths == before);
+    TEST_CHECK(tab.m_selectedPaths == before);
     // Failed/skipped-only operations have no completed entries to select.
-    manager.m_transfers.m_pasteRequests[3] = {tab.id, root, session.m_navigationGeneration};
+    manager.m_clipboard.m_pasteRequests[3] = {tab.id, root, session.m_navigationGeneration};
     partial.id = 3;
     partial.completedEntries.clear();
     TEST_CHECK(!manager.recordPasteCompletion(partial));
@@ -747,8 +747,8 @@ public:
     manager.navigate(dstDir, false);
     waitForPredicate([&] { return !session.m_loading; });
     session.closeMonitor();
-    tab.selectedPath = dstDir / "existing.txt";
-    tab.selectedPaths = {(dstDir / "existing.txt").string()};
+    tab.m_selectedPath = dstDir / "existing.txt";
+    tab.m_selectedPaths = {(dstDir / "existing.txt").string()};
 
     // 1. Partial single-item cross-filesystem move: destination commits, source
     // removal fails. The directory view must refresh to show the new destination
@@ -772,8 +772,8 @@ public:
     TEST_CHECK(std::ranges::any_of(session.m_entries, [&](const FileEntry& entry) {
       return entry.absPath == partialDst;
     }));
-    TEST_CHECK(tab.selectedPath == dstDir / "existing.txt");
-    TEST_CHECK(tab.selectedPaths == std::unordered_set<std::string>{(dstDir / "existing.txt").string()});
+    TEST_CHECK(tab.m_selectedPath == dstDir / "existing.txt");
+    TEST_CHECK(tab.m_selectedPaths == std::unordered_set<std::string>{(dstDir / "existing.txt").string()});
     TEST_CHECK(manager.m_statusMessage == partialOp.status);
     TEST_CHECK(manager.m_statusMessage.find("Moved copy remains at ") != std::string::npos);
     TEST_CHECK(manager.m_statusMessage.find(partialDst.string()) != std::string::npos);
@@ -822,7 +822,7 @@ public:
     TEST_CHECK(session.m_enumerationGeneration == genBeforeNoChange);
     TEST_CHECK(!session.m_loading);
     TEST_CHECK(manager.m_statusMessage == noChangeOp.status);
-    TEST_CHECK(tab.selectedPath == dstDir / "existing.txt");
+    TEST_CHECK(tab.m_selectedPath == dstDir / "existing.txt");
 
     setFileOperationRenameNoReplaceHookForTesting({});
   }
@@ -863,21 +863,21 @@ public:
     waitForPredicate([&] { return !manager.activeSession().m_loading; });
 
     // 1. Setting cut paths marks only those paths as cut.
-    manager.m_transfers.setCutPaths({itemA.string(), itemB.string(), itemC.string()});
-    TEST_CHECK(manager.m_transfers.hasActiveCutItems());
-    TEST_CHECK(manager.m_transfers.isPathCut(itemA));
-    TEST_CHECK(manager.m_transfers.isPathCut(itemB));
-    TEST_CHECK(manager.m_transfers.isPathCut(itemC));
-    TEST_CHECK(!manager.m_transfers.isPathCut(itemUncut));
+    manager.m_clipboard.setCutPaths({itemA.string(), itemB.string(), itemC.string()});
+    TEST_CHECK(manager.m_clipboard.hasActiveCutItems());
+    TEST_CHECK(manager.m_clipboard.isPathCut(itemA));
+    TEST_CHECK(manager.m_clipboard.isPathCut(itemB));
+    TEST_CHECK(manager.m_clipboard.isPathCut(itemC));
+    TEST_CHECK(!manager.m_clipboard.isPathCut(itemUncut));
 
     // 2. Pressing Escape cancels the active cut state and restores full opacity.
     manager.handleWindowKeyEvent(KeyboardEvent{.sym = XKB_KEY_Escape, .pressed = true});
-    TEST_CHECK(!manager.m_transfers.hasActiveCutItems());
-    TEST_CHECK(!manager.m_transfers.isPathCut(itemA));
+    TEST_CHECK(!manager.m_clipboard.hasActiveCutItems());
+    TEST_CHECK(!manager.m_clipboard.isPathCut(itemA));
 
     // 3. Partial move failure removes cut dimming only for items actually moved
     //    (itemA), while keeping unmoved items (itemB, itemC) dimmed.
-    manager.m_transfers.setCutPaths({itemA.string(), itemB.string(), itemC.string()});
+    manager.m_clipboard.setCutPaths({itemA.string(), itemB.string(), itemC.string()});
     std::ofstream(dstDir / "beta.txt") << "collision blocks itemB";
     manager.m_operations.setConflictResolver([](const std::string&, const std::string&, bool, const auto&,
                                                 GCancellable*) {
@@ -886,8 +886,8 @@ public:
     const auto partialGen = manager.m_transfer.selectionGeneration();
     const auto partialId = manager.m_operations.move({itemA.string(), itemB.string(), itemC.string()}, dstDir.string());
     TEST_CHECK(partialId != 0);
-    manager.m_transfers.m_cutOperations[partialId] = partialGen;
-    manager.m_transfers.m_cutOperationSources[partialId] = {itemA.string(), itemB.string(), itemC.string()};
+    manager.m_clipboard.m_cutOperations[partialId] = partialGen;
+    manager.m_clipboard.m_cutOperationSources[partialId] = {itemA.string(), itemB.string(), itemC.string()};
     waitForPredicate([&] { return !manager.m_operations.active(); });
     manager.m_operations.setConflictResolver({});
 
@@ -895,21 +895,21 @@ public:
     TEST_CHECK(std::filesystem::exists(dstDir / "alpha.txt"));
     TEST_CHECK(std::filesystem::exists(itemB));
     TEST_CHECK(std::filesystem::exists(itemC));
-    TEST_CHECK(!manager.m_transfers.isPathCut(itemA));
-    TEST_CHECK(manager.m_transfers.isPathCut(itemB));
-    TEST_CHECK(manager.m_transfers.isPathCut(itemC));
+    TEST_CHECK(!manager.m_clipboard.isPathCut(itemA));
+    TEST_CHECK(manager.m_clipboard.isPathCut(itemB));
+    TEST_CHECK(manager.m_clipboard.isPathCut(itemC));
 
     // 4. Full move completion consumes the remaining cut items and clears dimming.
     std::filesystem::remove(dstDir / "beta.txt");
     const auto fullGen = manager.m_transfer.selectionGeneration();
     const auto fullId = manager.m_operations.move({itemB.string(), itemC.string()}, dstDir.string());
     TEST_CHECK(fullId != 0);
-    manager.m_transfers.m_cutOperations[fullId] = fullGen;
-    manager.m_transfers.m_cutOperationSources[fullId] = {itemB.string(), itemC.string()};
+    manager.m_clipboard.m_cutOperations[fullId] = fullGen;
+    manager.m_clipboard.m_cutOperationSources[fullId] = {itemB.string(), itemC.string()};
     waitForPredicate([&] { return !manager.m_operations.active(); });
-    TEST_CHECK(!manager.m_transfers.hasActiveCutItems());
-    TEST_CHECK(!manager.m_transfers.isPathCut(itemB));
-    TEST_CHECK(!manager.m_transfers.isPathCut(itemC));
+    TEST_CHECK(!manager.m_clipboard.hasActiveCutItems());
+    TEST_CHECK(!manager.m_clipboard.isPathCut(itemB));
+    TEST_CHECK(!manager.m_clipboard.isPathCut(itemC));
   }
 };
 

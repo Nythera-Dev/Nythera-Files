@@ -10,6 +10,7 @@
 #include "core/text_clipboard.h"
 #include "core/ui_phase.h"
 #include "cursor-shape-v1-client-protocol.h"
+#include "filemanager/byte_size_format.h"
 #include "filemanager/file_breadcrumbs.h"
 #include "filemanager/file_columns.h"
 #include "filemanager/file_creation.h"
@@ -156,7 +157,7 @@ public:
     const auto& tab = m_owner.activeTab();
     if (index >= tab.session.entries().size())
       return false;
-    return tab.selectedPaths.contains(tab.session.entries()[index].absPath.string());
+    return tab.isPathSelected(tab.session.entries()[index].absPath.string());
   }
   std::unique_ptr<Node> createTile() override {
     if (m_owner.m_listHeader.gridMode()) {
@@ -200,12 +201,14 @@ public:
     };
     const bool manageThumbnail =
         tab.hasActiveAdminSession() && m_owner.m_settings.thumbnailPolicy() != filemanager::ThumbnailPolicy::Never;
-    const auto protectedThumbnail = manageThumbnail ? m_owner.protectedThumbnailPath(tab, entry, index) : std::nullopt;
+    const auto protectedThumbnail =
+        manageThumbnail ? m_owner.m_protectedFiles.thumbnailPath(tab, entry, index) : std::nullopt;
     const bool cut =
-        !session.browsingTrash() && tab.capabilities().canMutate && m_owner.m_transfers.isPathCut(entry.absPath);
+        !session.browsingTrash() && tab.capabilities().canMutate && m_owner.m_clipboard.isPathCut(entry.absPath);
     const bool gridFocused =
         m_owner.m_grid != nullptr && m_owner.m_grid->focusArea() != nullptr && m_owner.m_grid->focusArea()->focused();
-    const bool itemFocused = m_owner.m_fileViewFocusVisible && gridFocused && m_owner.m_grid->selectedIndex() == index;
+    const bool itemFocused =
+        m_owner.m_selection.focusVisible() && gridFocused && m_owner.m_grid->selectedIndex() == index;
     if (m_owner.m_listHeader.gridMode()) {
       auto& tileNode = static_cast<FileEntryTile&>(tile);
       tileNode.setAllowThumbnailsAndMetadata(allowThumbnails);
@@ -247,7 +250,7 @@ public:
     const auto& entry = session.entries()[index];
     if (!m_owner.m_listHeader.gridMode() && m_owner.m_hoveredFileColumn && m_renderer) {
       const auto column = *m_owner.m_hoveredFileColumn;
-      const auto value = m_owner.fileColumnText(entry, column);
+      const auto value = filemanager::fileColumnText(session, entry, column);
       const auto width = m_owner.m_listHeader.listColumns()[column] - m_owner.m_listHeader.columnTextInset(column);
       if (!value.empty()
           && filemanager::measureListColumnText(*m_renderer, column, session.search().active(), value) > width)
@@ -325,18 +328,8 @@ namespace {
   };
 
   CompactSize compactSize(std::uint64_t bytes) {
-    constexpr std::array<std::string_view, 7> units{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
-    double value = static_cast<double>(bytes);
-    std::size_t index = 0;
-    while (value >= 1024.0 && index + 1 < units.size()) {
-      value /= 1024.0;
-      ++index;
-    }
-    if (value >= 10.0)
-      value = std::round(value);
-    else
-      value = std::round(value * 10.0) / 10.0;
-    return {value, std::string(units[index]), index};
+    const auto scaled = filemanager::compactBinaryByteSize(bytes);
+    return {scaled.value, std::string(scaled.unit), scaled.unitIndex};
   }
 
   void useSubtleSelection(Button& button, bool muted = false) {
@@ -385,24 +378,20 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
       .onBeforeTabSwitch =
           [this](filemanager::BrowserTab& outgoing, filemanager::BrowserTab&) {
             m_searchThumbnails.clear();
-            clearProtectedThumbnails();
+            m_protectedFiles.clearThumbnails();
             if (m_refreshAfterRename) {
               outgoing.needsRefresh = true;
               m_refreshAfterRename = false;
             }
             if (m_renamePath)
               cancelRename();
-            m_typeaheadQuery.clear();
             m_pendingInlineRenamePath.reset();
             m_inlineRenameTarget.reset();
             setLocationEditMode(false);
             cancelFileGesture();
             m_listHeader.cancelGesture();
             m_menus.closeContextMenu();
-            m_lastPointerIndex.reset();
-            m_rubberBaseline.clear();
-            m_rubberSelectedPath.reset();
-            m_rubberAnchor.reset();
+            m_selection.resetForTabSwitch();
             if (m_grid != nullptr)
               m_grid->resetTransientStateForDataSwap();
           },
@@ -429,15 +418,15 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
                 restoreSelection(false);
               }
               if (active.pendingPasteSelection && !active.session.loading())
-                m_transfers.applyPendingPasteSelection(active);
+                m_clipboard.applyPendingPasteSelection(active);
               if (active.pendingRevealOnActivate) {
                 active.pendingRevealOnActivate = false;
                 if (m_grid != nullptr
-                    && active.selectedPath
+                    && active.selectedPath()
                     && (!active.pendingDropScrollGeneration
                         || *active.pendingDropScrollGeneration == active.displayedScrollState().userScrollGeneration)) {
                   const auto entry =
-                      std::ranges::find(active.session.entries(), *active.selectedPath, &FileEntry::absPath);
+                      std::ranges::find(active.session.entries(), *active.selectedPath(), &FileEntry::absPath);
                   if (entry != active.session.entries().end())
                     m_grid->scrollToIndex(static_cast<std::size_t>(entry - active.session.entries().begin()));
                 }
@@ -497,9 +486,9 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               if (m_renamePath)
                 cancelRename();
               m_pendingInlineRenamePath.reset();
-              m_typeaheadQuery.clear();
+              m_selection.clearTypeahead();
             }
-            m_lastPointerIndex.reset();
+            m_selection.clearLastPointerIndex();
           },
       .onActiveBeforePathChange =
           [this](filemanager::BrowserTab&, const std::filesystem::path&) {
@@ -582,15 +571,16 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
               m_surface->requestLayout();
           },
       .onApplyPendingPasteSelection =
-          [this](filemanager::BrowserTab& tab) { m_transfers.applyPendingPasteSelection(tab); },
+          [this](filemanager::BrowserTab& tab) { m_clipboard.applyPendingPasteSelection(tab); },
       .onAnyBeforePathChange =
           [this](filemanager::BrowserTab& tab, const std::filesystem::path&) {
             (void)tab.adminSession.cancelAuthentication();
+            m_clipboard.onBeforePathChange(tab);
             m_transfers.onBeforePathChange(tab);
           },
       .onAnyEnumerateStarted =
           [this](filemanager::BrowserTab& tab, const std::filesystem::path&, bool) {
-            m_transfers.onEnumerateStarted(tab);
+            m_clipboard.onEnumerateStarted(tab);
             m_tabBar.markDirty();
             if (m_surface)
               m_surface->requestLayout();
@@ -613,7 +603,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
           },
       .onInvalidateMountCapacities =
           [this](const std::filesystem::path& path) { m_places.invalidateMountCapacitiesForPath(path); },
-      .onResolvePathAsync = [this](const std::filesystem::path& path) { m_places.resolvePathAsync(path, {}, false); },
+      .onResolvePathAsync = [this](const std::filesystem::path& path) { m_pathCache.resolveAsync(path); },
       .archivePassword = m_modalDialog.makeArchivePasswordResolver(),
   };
 }
@@ -646,21 +636,15 @@ FileManager::FileManager(std::string initialPath)
             }
             if (sameContext && operation.succeeded) {
               if (operation.kind == Kind::Rename) {
-                if (tab->selectedPaths.erase(operation.source))
-                  tab->selectedPaths.insert(operation.destination);
-                if (tab->selectedPath == operation.source)
-                  tab->selectedPath = operation.destination;
-                if (tab->selectionAnchor == operation.source)
-                  tab->selectionAnchor = operation.destination;
+                tab->renameSelectedPath(operation.source, operation.destination);
               } else if (operation.kind == Kind::CreateFolder || operation.kind == Kind::CreateFile) {
-                tab->selectedPath = operation.destination;
-                tab->selectedPaths = {operation.destination};
-                tab->selectionAnchor = operation.destination;
+                tab->selectSingle(operation.destination);
                 if (tab->active)
                   m_pendingInlineRenamePath = operation.destination;
               }
             }
             m_transfers.onOperationFinished(operation);
+            m_clipboard.onOperationFinished(operation);
             if (operation.mutated || operation.outcomeUncertain) {
               for (const auto& other : m_tabs.tabs()) {
                 if (!m_windowOpen || other->session.browsingTrash() || (other.get() == tab && !sameSession))
@@ -683,7 +667,7 @@ FileManager::FileManager(std::string initialPath)
               }
               m_places.refreshCapacities();
             }
-            if (!m_operations.active() && ((!m_windowOpen && m_transfers.pendingClipboardReads() == 0) || m_quitting))
+            if (!m_operations.active() && ((!m_windowOpen && m_clipboard.pendingClipboardReads() == 0) || m_quitting))
               m_running = false;
           }
           syncProgressWindow();
@@ -692,14 +676,8 @@ FileManager::FileManager(std::string initialPath)
         if (operation.finished) {
           setStatus(operation.status);
           if (operation.succeeded && operation.kind == FileOperationManager::Kind::Rename) {
-            for (const auto& tabPtr : m_tabs.tabs()) {
-              if (tabPtr->selectedPaths.erase(operation.source))
-                tabPtr->selectedPaths.insert(operation.destination);
-              if (tabPtr->selectedPath && *tabPtr->selectedPath == operation.source)
-                tabPtr->selectedPath = operation.destination;
-              if (tabPtr->selectionAnchor && *tabPtr->selectionAnchor == operation.source)
-                tabPtr->selectionAnchor = operation.destination;
-            }
+            for (const auto& tabPtr : m_tabs.tabs())
+              tabPtr->renameSelectedPath(operation.source, operation.destination);
           }
           if (m_inlineRenameTarget && m_inlineRenameTarget->operationId == operation.id) {
             const auto renameTarget = *m_inlineRenameTarget;
@@ -722,16 +700,15 @@ FileManager::FileManager(std::string initialPath)
               if (auto* originTab = m_tabs.findTab(createReq.tabId)) {
                 if (originTab->session.navigationGeneration() == createReq.navigation
                     && std::filesystem::path(operation.destination).parent_path() == originTab->session.path()) {
-                  originTab->selectedPath = operation.destination;
-                  originTab->selectedPaths.clear();
-                  originTab->selectedPaths.insert(operation.destination);
+                  originTab->selectSingle(operation.destination, false);
                   if (originTab->id == m_tabs.activeTabId())
                     m_pendingInlineRenamePath = operation.destination;
                 }
               }
             }
           }
-          const bool pastedEntries = m_transfers.onOperationFinished(operation);
+          m_transfers.onOperationFinished(operation);
+          const bool pastedEntries = m_clipboard.onOperationFinished(operation);
           const bool wastebinOperation = operation.kind == FileOperationManager::Kind::Restore
               || operation.kind == FileOperationManager::Kind::EmptyWastebin;
           const bool anyTrashChange = wastebinOperation
@@ -749,11 +726,14 @@ FileManager::FileManager(std::string initialPath)
                     return;
                   const auto prompt = filemanager::permanentDeletePrompt(sources, sources.size());
                   showDialog(
-                      "Permanently delete?", prompt, {{"Cancel", 0}, {"Delete", 1}},
+                      "Permanently delete?", prompt,
+                      {{"Cancel", 0, filemanager::DialogChoiceStyle::Cancel},
+                       {"Delete", 1, filemanager::DialogChoiceStyle::Destructive}},
                       [this, sources = std::move(sources)](int response) mutable {
                         if (response == 1 && m_windowOpen)
                           m_operations.removePermanently(std::move(sources));
-                      }
+                      },
+                      nullptr, filemanager::DialogStyle::Warning
                   );
                 }
             );
@@ -773,7 +753,7 @@ FileManager::FileManager(std::string initialPath)
                 return false;
               if (filemanager::normalizeTabPath(tabPath) == filemanager::normalizeTabPath(dir))
                 return true;
-              const auto same = m_places.sameDirectoryPathCached(tabPath, dir);
+              const auto same = m_pathCache.sameDirectoryPathCached(tabPath, dir);
               return same.value_or(true);
             };
             const auto srcParent = operation.source.empty() ? std::filesystem::path{}
@@ -806,7 +786,7 @@ FileManager::FileManager(std::string initialPath)
           }
           if (operation.succeeded || operation.mutated)
             m_places.refreshCapacities();
-          if (!m_operations.active() && !m_windowOpen && m_transfers.pendingClipboardReads() == 0)
+          if (!m_operations.active() && !m_windowOpen && m_clipboard.pendingClipboardReads() == 0)
             m_running = false;
           if (!m_operations.active() && m_quitting)
             m_running = false;
@@ -822,7 +802,7 @@ FileManager::FileManager(std::string initialPath)
       ),
       m_menus(
           m_wayland, m_renderContext, m_menuAnimations, m_dispatcher, m_settings, m_operations, m_tabs, m_listHeader,
-          m_places, m_checksumDialog, m_transfer,
+          m_places, m_checksumDialog, m_helpDialog, m_protectedFiles, m_launcher, m_clipboard, m_transfer,
           {
               .mainSurface = [this] { return m_surface.get(); },
               .lastInputSerial = [this] { return m_lastInputSerial; },
@@ -831,46 +811,99 @@ FileManager::FileManager(std::string initialPath)
               .isRenaming = [this] { return m_renamePath.has_value(); },
               .alwaysShowTabBar = [this] { return m_alwaysShowTabBar; },
               .openTabsInBackground = [this] { return m_openTabsInBackground; },
-              .pendingClipboardReads = [this] { return m_transfers.pendingClipboardReads(); },
               .canChangeSelection = [this] { return canChangeSelection(); },
-              .selectedPath = [this] { return activeTab().selectedPath; },
-              .selectedPaths = [this]() -> const std::unordered_set<std::string>& { return activeTab().selectedPaths; },
+              .selectedPath = [this] { return activeTab().selectedPath(); },
+              .selectedPaths = [this]() -> const std::unordered_set<std::string>& {
+                return activeTab().selectedPaths();
+              },
               .selectedPathsOrdered = [this] { return selectedPaths(); },
               .symlinkSelection = [this] { return symlinkSelection(); },
               .checksumMenuEntries = [this] { return checksumMenuEntries(); },
               .onSelectSingleForContextMenu =
-                  [this](std::size_t index) {
-                    auto& tab = activeTab();
-                    tab.selectedPaths.clear();
-                    tab.selectedPaths.insert(tab.session.entries()[index].absPath.string());
-                    tab.selectedPath = tab.session.entries()[index].absPath;
-                    tab.selectionAnchor = tab.selectedPath;
-                    m_restoringSelection = true;
-                    if (m_grid) {
-                      m_grid->setSelectedIndex(index, false);
-                      m_grid->notifyDataChanged();
-                    }
-                    m_restoringSelection = false;
-                    updateSelectionSummary();
-                  },
-              .onClearSelectionForEmptyMenu =
-                  [this] {
-                    auto& tab = activeTab();
-                    tab.selectedPaths.clear();
-                    tab.selectedPath.reset();
-                    tab.selectionAnchor.reset();
-                    if (m_grid)
-                      m_grid->setSelectedIndex(std::nullopt, false);
-                  },
+                  [this](std::size_t index) { m_selection.selectSingleForContextMenu(index); },
+              .onClearSelectionForEmptyMenu = [this] { m_selection.clearSelectionForEmptyMenu(); },
               .onStatus = [this](std::string text) { setStatus(std::move(text)); },
               .onRequestLayout =
                   [this] {
                     if (m_surface)
                       m_surface->requestLayout();
                   },
-              .hasProtectedCopy = [this](auto tab, const auto& path) { return protectedEdit(tab, path) != nullptr; },
-              .onOpenProtectedFile =
-                  [this](auto tab, const auto& path, auto launch) { openProtectedFile(tab, path, std::move(launch)); },
+              .activateArchiveAction = [this](int id) { return activateArchiveAction(id); },
+              .activateSearchScopeEntry = [this](
+                                              const ContextMenuControlEntry& entry
+                                          ) { return m_searchBarController.activateScopeEntry(entry); },
+              .activateSearchFilterEntry = [this](
+                                               const ContextMenuControlEntry& entry
+                                           ) { return m_searchBarController.activateFilterEntry(entry); },
+              .selectSearchMode = [this](filemanager::SearchMode mode) { selectSearchMode(mode); },
+              .enterAdministratorMode = [this](
+                                            filemanager::TabId tabId, std::optional<std::filesystem::path> target
+                                        ) { (void)enterAdministratorMode(tabId, std::move(target)); },
+              .showChecksumDialog = [this](bool verify) { showChecksumDialog(verify); },
+              .launchNewWindow = [this](const std::filesystem::path& path) { launchNewWindow(path); },
+              .activateSelected = [this] { activateSelected(); },
+              .activatePath = [this](const std::filesystem::path& path) { activatePath(path); },
+              .openArchiveMember =
+                  [this](const std::filesystem::path& member, bool withApp) { openArchiveMember(member, withApp); },
+              .pinPlace = [this](const std::filesystem::path& path) { pinPlace(path); },
+              .openProperties = [this](const std::filesystem::path& path) { openProperties(path); },
+              .openVolumeProperties =
+                  [this](const filemanager::Place& place) {
+                    if (!m_propertiesWindow)
+                      m_propertiesWindow = std::make_unique<PropertiesWindow>(
+                          m_wayland, m_renderContext, m_settings, m_operations, [this](std::string text) {
+                            writeDesktopClipboard(std::move(text), "text/plain;charset=utf-8");
+                          }
+                      );
+                    if (!m_propertiesWindow->openVolume(place, m_surface.get()))
+                      setStatus("Could not open Properties window");
+                  },
+              .requestQuit = [this] { requestQuit(m_surface.get()); },
+              .openNewTab = [this] { (void)openNewTab(); },
+              .reopenClosedTab = [this] { (void)reopenClosedTab(); },
+              .closeTab = [this](filemanager::TabId tabId) { (void)closeTab(tabId); },
+              .duplicateTab = [this](filemanager::TabId tabId) { (void)duplicateTab(tabId); },
+              .closeOtherTabs = [this](filemanager::TabId tabId) { (void)closeOtherTabs(tabId); },
+              .closeTabsToRight = [this](filemanager::TabId tabId) { (void)closeTabsToRight(tabId); },
+              .contextMenuTabId = [this] { return m_tabBar.contextMenuTabId(); },
+              .openFolderInNewTab = [this](
+                                        const std::filesystem::path& path, bool activate
+                                    ) { (void)openFolderInNewTab(path, activate); },
+              .openQuickLook = [this] { (void)openQuickLook(); },
+              .setPreviewMode = [this](filemanager::PreviewMode mode) { setPreviewMode(mode); },
+              .setThumbnailPolicy = [this](filemanager::ThumbnailPolicy policy) { setThumbnailPolicy(policy); },
+              .inspectThumbnailCache = [this](bool clear) { inspectThumbnailCache(clear); },
+              .goToLinkTarget = [this](const std::filesystem::path& link) { goToLinkTarget(link); },
+              .navigate = [this](const std::filesystem::path& path) { navigate(path); },
+              .navigateTrash = [this] { navigateTrash(); },
+              .enumerate = [this](const std::filesystem::path& path) { enumerate(path); },
+              .setAlwaysShowTabBar = [this](bool show) { setAlwaysShowTabBar(show); },
+              .setOpenTabsInBackground = [this](bool bg) { setOpenTabsInBackground(bg); },
+              .handleLocationInputAction = [this](int id) { handleLocationInputAction(id); },
+              .recordAdminTabUserActivity = [this](filemanager::BrowserTab& tab) { recordAdminTabUserActivity(tab); },
+              .changeSelection = [this](SelectionChange change) { changeSelection(change); },
+              .duplicateSelection = [this] { duplicateSelection(); },
+              .createSelectionSymlink = [this] { createSelectionSymlink(); },
+              .showSymlinkDialog = [this] { showSymlinkDialog(); },
+              .restoreWastebinSelection = [this](bool chooseDest) { restoreWastebinSelection(chooseDest); },
+              .confirmEmptyWastebin = [this] { confirmEmptyWastebin(); },
+              .copyToDesktopClipboard = [this](bool cut) { copyToDesktopClipboard(cut); },
+              .beginRename = [this] { beginRename(); },
+              .confirmPermanentDelete = [this] { confirmPermanentDelete(); },
+              .createNewItem = [this](int id) { createNewItem(id); },
+              .setGridMode = [this](bool grid) { setGridMode(grid); },
+              .adjustViewScale = [this](float scale) { adjustViewScale(scale); },
+              .setSortField = [this](FileDialogSortField field) { setSortField(field); },
+              .toggleSortOrder = [this] { toggleSortOrder(); },
+              .toggleSearchHidden = [this] { toggleSearchOption(&filemanager::SearchOptions::showHidden); },
+              .persistFileViewState = [this] { persistFileViewState(); },
+              .syncSortOrHiddenEntries =
+                  [this] {
+                    if (m_grid) {
+                      m_grid->notifyDataChanged();
+                      restoreSelection();
+                    }
+                  },
           }
       ),
       m_tabBar(
@@ -896,22 +929,13 @@ FileManager::FileManager(std::string initialPath)
                     if (m_surface)
                       m_surface->requestRedraw();
                   },
-              .canHandlePointer =
-                  [this] {
-                    return !m_transfers.isDragPending()
-                        && !m_transfers.isDraggingFiles()
-                        && !m_transfer.dragging()
-                        && !m_reorderId
-                        && !m_listHeader.gestureActive()
-                        && !m_resizingSidebar
-                        && !m_resizingStatus
-                        && !(m_grid && m_grid->rubberBandActive());
-                  },
+              .canHandlePointer = [this] { return !hasActiveGesture(true, true, false); },
               .pointerSerial = [this] { return m_pointerSerial; },
           }
       ),
       m_transfers(
-          m_wayland, m_renderContext, m_dispatcher, m_transfer, m_operations, m_tabs, m_places,
+          m_wayland, m_renderContext, m_dispatcher, m_transfer, m_operations, m_tabs, m_places, m_pathCache,
+          m_clipboard,
           {
               .mainSurface = [this] { return m_surface.get(); },
               .sceneRoot = [this] { return m_root.get(); },
@@ -922,58 +946,15 @@ FileManager::FileManager(std::string initialPath)
               .keyboardModifiers = [this] { return m_keyboardModifiers; },
               .pointerSerial = [this] { return m_pointerSerial; },
               .selectedPathsOrdered = [this] { return selectedOperationPaths(); },
-              .selectedPath = [this] { return activeTab().selectedPath; },
-              .onApplyPasteSelection =
-                  [this](
-                      filemanager::TabId tabId, std::unordered_set<std::string> paths, std::filesystem::path primary
-                  ) {
-                    if (auto* tab = m_tabs.findTab(tabId)) {
-                      tab->selectedPaths = std::move(paths);
-                      tab->selectedPath = primary;
-                      tab->selectionAnchor = tab->selectedPath;
-                      if (tabId == m_tabs.activeTabId())
-                        restoreSelection();
-                    }
-                  },
-              .onClickUnmovedDragItem =
-                  [this](std::size_t index, std::uint32_t clickTime) {
-                    if (!(m_keyboardModifiers & (KeyMod::Ctrl | KeyMod::Shift))) {
-                      auto& tab = activeTab();
-                      tab.selectedPaths = {tab.session.entries()[index].absPath.string()};
-                      tab.selectedPath = tab.session.entries()[index].absPath;
-                      if (m_grid)
-                        m_grid->notifyDataChanged();
-                      m_pointerClickTime = clickTime;
-                      activatePointerItem(index);
-                    } else {
-                      m_lastPointerIndex.reset();
-                    }
-                  },
-              .onCancelPlaceReorder =
-                  [this] {
-                    m_reorderId.reset();
-                    m_reorderBefore.reset();
-                    m_reordering = false;
-                  },
-              .onClearLastPointerIndex = [this] { m_lastPointerIndex.reset(); },
+              .selectedPath = [this] { return activeTab().selectedPath(); },
+              .onClickUnmovedDragItem = [this](
+                                            std::size_t index, std::uint32_t clickTime
+                                        ) { m_selection.handleUnmovedDragClick(index, clickTime); },
+              .onCancelPlaceReorder = [this] { m_places.cancelGesture(); },
+              .onClearLastPointerIndex = [this] { m_selection.clearLastPointerIndex(); },
               .onSynthesizeMotion = [this](const PointerEvent& motion) { handlePointer(motion); },
               .onUpdateNavigationControls = [this] { updateNavigationControls(); },
-              .onUpdateSelectionSummary = [this] { updateSelectionSummary(); },
-              .onCutStateChanged =
-                  [this] {
-                    if (m_grid)
-                      m_grid->notifyDataChanged();
-                    if (m_surface)
-                      m_surface->requestRedraw();
-                  },
               .onStatus = [this](std::string text) { setStatus(std::move(text)); },
-              .onMaybeStopMainLoop =
-                  [this] {
-                    if ((!m_windowOpen || m_quitting)
-                        && !m_operations.active()
-                        && m_transfers.pendingClipboardReads() == 0)
-                      m_running = false;
-                  },
               .fileDropTabAt = [this](float x, float y) { return m_tabBar.fileDropTabAt(x, y); },
           }
       ) {
@@ -994,48 +975,21 @@ FileManager::FileManager(std::string initialPath)
   installInputHooks();
 }
 
-bool FileManager::canChangeSelection() const {
-  return m_grid
-      && !activeSession().loading()
-      && !m_renamePath
-      && !m_transfers.isDragPending()
-      && !m_transfers.isDraggingFiles()
-      && !m_transfer.dragging()
-      && !m_reorderId
-      && !m_listHeader.gestureActive()
-      && !m_tabBar.gestureActive()
-      && !m_resizingSidebar
-      && !m_resizingStatus
-      && !m_grid->rubberBandActive();
+bool FileManager::hasActiveGesture(bool includeStatusResize, bool includeListHeader, bool includeTabBar) const {
+  return m_transfers.isDragPending()
+      || m_transfers.isDraggingFiles()
+      || m_transfer.dragging()
+      || m_places.gestureActive()
+      || (includeListHeader && m_listHeader.gestureActive())
+      || (includeTabBar && m_tabBar.gestureActive())
+      || m_resizingSidebar
+      || m_previewResize.has_value()
+      || (includeStatusResize && m_resizingStatus)
+      || (m_grid && m_grid->rubberBandActive());
 }
 
-void FileManager::changeSelection(SelectionChange change) {
-  if (!canChangeSelection())
-    return;
-  auto& tab = activeTab();
-  std::unordered_set<std::string> paths;
-  std::optional<std::filesystem::path> first;
-  if (change != SelectionChange::None) {
-    paths.reserve(tab.session.entries().size());
-    for (const auto& entry : tab.session.entries()) {
-      const auto path = entry.absPath.string();
-      if (change == SelectionChange::Invert && tab.selectedPaths.contains(path))
-        continue;
-      paths.insert(path);
-      if (!first)
-        first = entry.absPath;
-    }
-  }
-  if (!tab.selectedPath || !paths.contains(tab.selectedPath->string()))
-    tab.selectedPath = std::move(first);
-  tab.selectedPaths = std::move(paths);
-  tab.selectionAnchor = tab.selectedPath;
-  tab.session.clearChooseFirstAfterLoad();
-  restoreSelection();
-  m_grid->notifyDataChanged();
-  updateSelectionSummary();
-  if (m_surface)
-    m_surface->requestRedraw();
+bool FileManager::canChangeSelection() const {
+  return m_grid && !activeSession().loading() && !m_renamePath && !hasActiveGesture();
 }
 
 void FileManager::duplicateSelection() {
@@ -1049,9 +1003,10 @@ void FileManager::duplicateSelection() {
   if (paths.empty())
     return;
   if (const auto id = m_operations.duplicate(
-          std::move(paths), tab.session.path().string(), tab.administratorBrowsing ? &tab : nullptr
+          std::move(paths), tab.session.path().string(),
+          filemanager::adminOperationContext(tab.administratorBrowsing ? &tab : nullptr)
       ))
-    m_transfers.registerPasteRequest(id, PasteRequest{tab.id, tab.session.path(), tab.session.navigationGeneration()});
+    m_clipboard.registerPasteRequest(id, PasteRequest{tab.id, tab.session.path(), tab.session.navigationGeneration()});
 }
 
 void FileManager::createSelectionSymlink() {
@@ -1069,9 +1024,10 @@ void FileManager::createSelectionSymlink() {
   const auto extension = directory ? std::string::npos : name.find('.', 1);
   name.insert(extension == std::string::npos ? name.size() : extension, "-link");
   if (const auto id = m_operations.createSymlink(
-          path.string(), (tab.session.path() / name).string(), true, tab.administratorBrowsing ? &tab : nullptr
+          path.string(), (tab.session.path() / name).string(), true,
+          filemanager::adminOperationContext(tab.administratorBrowsing ? &tab : nullptr)
       ))
-    m_transfers.registerPasteRequest(id, PasteRequest{tab.id, tab.session.path(), tab.session.navigationGeneration()});
+    m_clipboard.registerPasteRequest(id, PasteRequest{tab.id, tab.session.path(), tab.session.navigationGeneration()});
 }
 
 FileManager::SymlinkDialogHandlers FileManager::makeSymlinkDialogHandlers() {
@@ -1116,11 +1072,11 @@ FileManager::SymlinkDialogHandlers FileManager::makeSymlinkDialogHandlers() {
           return Err{"The destination folder does not support file creation.", Field::None};
         const auto id = m_operations.createSymlink(
             filemanager::expandHomePath(target, g_get_home_dir()), destination.string(), false,
-            admin ? currentTab : nullptr
+            filemanager::adminOperationContext(admin ? currentTab : nullptr)
         );
         if (id == 0)
           return Err{"The symlink operation could not be started.", Field::None};
-        m_transfers.registerPasteRequest(id, request);
+        m_clipboard.registerPasteRequest(id, request);
         return std::nullopt;
       },
       .onBrowseTarget =
@@ -1235,7 +1191,7 @@ void FileManager::beginRenamePath(const std::filesystem::path& path) {
   const std::uint64_t entryInode = found->inode;
   const auto index = static_cast<std::size_t>(found - session.entries().begin());
   m_wayland.stopKeyRepeat();
-  m_typeaheadQuery.clear();
+  m_selection.clearTypeahead();
   m_grid->setSelectedIndex(index, false);
   m_grid->scrollToIndex(index);
   m_listHeader.revealColumn(FileColumn::Name);
@@ -1274,7 +1230,8 @@ void FileManager::beginRenamePath(const std::filesystem::path& path) {
             return;
           }
           if (const auto id = m_operations.renameChecked(
-                  path.string(), destination.string(), entryDevice, entryInode, {}, originTab
+                  path.string(), destination.string(), entryDevice, entryInode, {},
+                  filemanager::adminOperationContext(originTab)
               ))
             m_inlineRenameTarget = InlineRenameTarget{id, tabId, path};
           else
@@ -1313,7 +1270,7 @@ void FileManager::beginRenamePath(const std::filesystem::path& path) {
 
 void FileManager::cancelRename() {
   m_wayland.stopKeyRepeat();
-  m_typeaheadQuery.clear();
+  m_selection.clearTypeahead();
   if (m_renamePath && m_grid)
     m_grid->endInlineEdit(m_renamePath->string());
   m_renamePath.reset();
@@ -1396,9 +1353,10 @@ FileManager::~FileManager() {
   m_tabBar.detachUi();
   m_menus.closeContextMenu();
   m_transfers.shutdown();
-  m_customSearchChild.forceCloseImmediate();
+  m_clipboard.shutdown();
+  m_customSearches.forceCloseImmediate();
   m_modalDialog.forceCloseImmediate();
-  m_menus.closeApplicationPicker();
+  m_launcher.closeApplicationPicker();
   if (m_destinationPicker) {
     m_destinationPicker->closeFileDialogWithoutResult();
     FileDialog::cancelIfPending();
@@ -1406,12 +1364,14 @@ FileManager::~FileManager() {
     m_destinationPicker.reset();
   }
   m_places.shutdown();
+  m_protectedFiles.shutdown();
+  m_pathCache.cancel();
   m_tabs.shutdownAll();
   m_dispatcher.setTextInputContext(nullptr, nullptr);
   m_dispatcher.setSceneRoot(nullptr);
   if (m_surface)
     m_surface->setSceneRoot(nullptr);
-  m_selectionTimer.stop();
+  m_selection.shutdown();
   releaseSearchThumbnails();
   m_selectionPreview.detach();
   TooltipManager::instance().shutdown();
@@ -1436,13 +1396,12 @@ int FileManager::run() {
         m_tabBar.updateTheme();
         updateAdminHeaderUi();
         m_modalDialog.updateTheme();
-        m_customSearchChild.updateTheme();
+        m_customSearches.updateTheme();
         if (m_surface)
           m_surface->requestLayout();
         if (m_modalDialog.isOpen())
           m_modalDialog.requestLayout();
-        if (m_customSearchChild.isOpen())
-          m_customSearchChild.requestLayout();
+        m_customSearches.requestLayoutIfOpen();
       },
       "file-manager-theme"
   );
@@ -1455,7 +1414,7 @@ int FileManager::run() {
     if (!entered) {
       m_keyboardModifiers = 0;
       m_wayland.stopKeyRepeat();
-      m_typeaheadQuery.clear();
+      m_selection.clearTypeahead();
     } else {
       m_keyboardModifiers = m_wayland.keyboardModifiers();
     }
@@ -1472,7 +1431,7 @@ int FileManager::run() {
   TooltipManager::instance().setFreshHoverPolicy([this] {
     return m_menus.hasOpenPopup()
         || m_transfers.isDraggingFiles()
-        || m_reorderId.has_value()
+        || m_places.gestureActive()
         || m_transfers.isDragPending()
         || m_tabBar.gestureActive()
         || m_resizingSidebar
@@ -1496,9 +1455,9 @@ int FileManager::run() {
     }
     if (m_grid != nullptr && (previous == gridArea || next == gridArea)) {
       if (next == gridArea && m_wayland.lastInputSource() == WaylandSeat::InputSource::Keyboard)
-        m_fileViewFocusVisible = true;
+        m_selection.setFocusVisible(true);
       else if (next != gridArea)
-        m_fileViewFocusVisible = false;
+        m_selection.setFocusVisible(false);
       m_grid->notifyDataChanged();
       if (m_surface)
         m_surface->requestRedraw();
@@ -1508,8 +1467,8 @@ int FileManager::run() {
   m_surface->setRenderContext(&m_renderContext);
   m_surface->setAnimationManager(&m_menuAnimations);
   m_surface->setClosedCallback([this] {
-    m_customSearchChild.forceCloseImmediate();
-    if (m_refreshSearchProfileList)
+    m_customSearches.forceCloseImmediate();
+    if (m_modalDialog.isOpen())
       m_modalDialog.forceCloseImmediate();
     m_windowOpen = false;
     m_tabs.shutdownAll();
@@ -1560,19 +1519,10 @@ int FileManager::run() {
           self->m_adminFinishButton = nullptr;
           self->m_grid = nullptr;
           self->m_locationInput = nullptr;
-          self->m_searchBar = nullptr;
-          self->m_searchTools = nullptr;
-          self->m_searchFilterUi = {};
-          self->m_searchInput = nullptr;
-          self->m_searchButton = nullptr;
-          self->m_searchModeButton = nullptr;
-          self->m_searchScopeButton = nullptr;
+          self->m_searchBarController.detachUi();
           self->m_statusLabel = nullptr;
           self->m_statusDetailLabel = nullptr;
-          self->m_searchStatus = nullptr;
-          self->m_searchSpinner = nullptr;
-          self->m_searchStatusArea = nullptr;
-          if (!self->m_operations.active() && self->m_transfers.pendingClipboardReads() == 0)
+          if (!self->m_operations.active() && self->m_clipboard.pendingClipboardReads() == 0)
             self->m_running = false;
           return G_SOURCE_REMOVE;
         },
@@ -1631,12 +1581,10 @@ int FileManager::run() {
   m_destinationPicker = std::make_unique<FileDialogPopup>();
   m_destinationPicker->initialize(m_wayland, m_configService, m_renderContext, m_pickerHosts, m_pickerThumbnails);
   FileDialog::setPresenter(m_destinationPicker.get());
-  m_menus.initializePopups(m_configService, m_pickerHosts, [this](const ContextMenuControlEntry& entry) {
-    activateContextMenuEntry(entry);
-  });
+  m_menus.initializePopups(m_configService, m_pickerHosts);
 
   m_wayland.setPointerEventCallback([this](const PointerEvent& event) {
-    if (m_menus.handleAppPickerPointer(event))
+    if (m_launcher.handleAppPickerPointer(event))
       return;
     if (m_destinationPicker && m_destinationPicker->onPointerEvent(event))
       return;
@@ -1651,7 +1599,7 @@ int FileManager::run() {
   m_wayland.setKeyboardEventCallback([this](const KeyboardEvent& event) {
     if (event.pressed && !event.repeat)
       m_lastInputSerial = m_wayland.lastInputSerial();
-    if (m_menus.isApplicationPickerOpen() && m_menus.handleKeyboard(event))
+    if (m_launcher.isApplicationPickerOpen() && m_launcher.handleKeyboard(event))
       return;
     else if (m_destinationPicker && m_destinationPicker->handlesKeyboardForSurface(m_wayland.lastKeyboardSurface()))
       m_destinationPicker->onKeyboardEvent(event);
@@ -1667,7 +1615,7 @@ int FileManager::run() {
       m_propertiesWindow->handleKeyboard(event);
     else if (m_modalDialog.isOpen()) {
       // While a nested editor is open, the management surface stays visible but modal.
-      if (!m_customSearchChild.isOpen())
+      if (!m_customSearches.isChildOpen())
         m_modalDialog.handleKeyboard(event);
     } else if (m_progressWindow.ownsSurface(m_wayland.lastKeyboardSurface()))
       m_progressWindow.handleKeyboard(event);
@@ -1697,13 +1645,13 @@ int FileManager::run() {
           m_destinationPicker->closeFileDialogWithoutResult();
           FileDialog::cancelIfPending();
         }
-        m_menus.closeApplicationPicker();
+        m_launcher.closeApplicationPicker();
         m_tabBar.detachUi();
         cancelFileGesture();
         TooltipManager::instance().forceDestroy();
         m_dispatcher.setTextInputContext(nullptr, nullptr);
         m_dispatcher.setSceneRoot(nullptr);
-        m_customSearchChild.forceCloseImmediate();
+        m_customSearches.forceCloseImmediate();
         m_modalDialog.forceCloseImmediate();
         m_progressWindow.close();
         if (m_surface) {
@@ -1773,8 +1721,10 @@ void FileManager::confirmEmptyWastebin() {
       "Empty Wastebin?",
       "Permanently delete all items in Wastebin, including Wastebins on mounted filesystems?\n\n"
       "This cannot be undone. These items cannot be restored from Wastebin afterwards.",
-      {{"Cancel", 0}, {"Empty Wastebin", 1}},
-      [this, id = activeTab().id](int response) { emptyWastebinAfterConfirmation(id, response); }
+      {{"Cancel", 0, filemanager::DialogChoiceStyle::Cancel},
+       {"Empty Wastebin", 1, filemanager::DialogChoiceStyle::Destructive}},
+      [this, id = activeTab().id](int response) { emptyWastebinAfterConfirmation(id, response); }, nullptr,
+      filemanager::DialogStyle::Warning
   );
 }
 
@@ -1815,443 +1765,103 @@ void FileManager::pinPlace(const std::filesystem::path& path) {
   );
 }
 
-void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry) {
-  if (activateArchiveAction(entry.id) || activateSearchScopeEntry(entry) || activateSearchFilterEntry(entry))
+void FileManager::handleLocationInputAction(int id) {
+  if (m_locationInput == nullptr)
     return;
-  if (entry.id >= kFirstSearchMode
-      && entry.id < kFirstSearchMode + static_cast<int>(filemanager::kSearchModeLabels.size())) {
-    selectSearchMode(static_cast<filemanager::SearchMode>(entry.id - kFirstSearchMode));
+  switch (id) {
+  case kLocationCut:
+    m_locationInput->cutSelectedText();
+    break;
+  case kLocationCopy:
+    (void)m_locationInput->copySelectedText();
+    break;
+  case kLocationPaste:
+    pasteLocationFromClipboard();
+    break;
+  case kLocationSelectAll:
+    m_locationInput->selectAll();
+    break;
+  default:
+    break;
+  }
+}
+
+void FileManager::confirmPermanentDelete() {
+  const auto& tab = activeTab();
+  const auto& session = tab.session;
+  if (!tab.capabilities().canMutate) {
+    setStatus("This action is unavailable in Administrator Mode");
     return;
   }
+  auto targets = selectedOperationPaths();
+  if (targets.empty())
+    return;
+  const auto prompt = filemanager::permanentDeletePrompt(targets, targets.size());
+  showDialog(
+      "Permanently delete?", prompt,
+      {{"Cancel", 0, filemanager::DialogChoiceStyle::Cancel},
+       {"Delete", 1, filemanager::DialogChoiceStyle::Destructive}},
+      [this, tabId = tab.id, admin = tab.administratorBrowsing, generation = tab.adminSession.sessionGeneration(),
+       navigation = session.navigationGeneration(), targets = std::move(targets)](int response) mutable {
+        auto* origin = m_tabs.findTab(tabId);
+        if (response != 1 || !origin || origin->administratorBrowsing != admin)
+          return;
+        if (!admin) {
+          if (origin->capabilities().canMutate)
+            m_operations.removePermanently(std::move(targets));
+          return;
+        }
+        if (!origin->hasActiveAdminSession()
+            || origin->adminSession.sessionGeneration() != generation
+            || origin->session.navigationGeneration() != navigation)
+          return;
+        if (!origin->session.loading()) {
+          if (!origin->capabilities().canMutate)
+            setStatus("The folder is no longer writable.");
+          else if (!m_operations.removePermanently(std::move(targets), filemanager::adminOperationContext(origin)))
+            setStatus("Wait for the current Administrator operation to finish");
+          return;
+        }
+        // A refresh temporarily clears the directory writability cache. Ask the
+        // authenticated helper for current access before using the confirmed paths.
+        const auto directory = origin->session.path();
+        const auto alive = std::weak_ptr<bool>(m_alive);
+        if (!origin->adminSession.statInfoAsync(
+                directory, true,
+                [this, alive, tabId, generation, navigation, directory, targets = std::move(targets)](
+                    bool ok, const filemanager::AdminStatRecord& record, filemanager::AdminStatusCode,
+                    const std::string& reason
+                ) mutable {
+                  const auto token = alive.lock();
+                  if (!token || !*token)
+                    return;
+                  auto context = filemanager::adminOperationContext(m_tabs.findTab(tabId));
+                  if (!context
+                      || !context->active
+                      || context->origin.sessionGeneration != generation
+                      || context->origin.navigation != navigation
+                      || context->origin.directory != directory)
+                    return;
+                  if (!ok || !record.exists || !record.isDir || !record.writable) {
+                    setStatus(reason.empty() ? "The folder is no longer writable." : reason);
+                    return;
+                  }
+                  context->canMutate = true;
+                  if (!m_operations.removePermanently(std::move(targets), context))
+                    setStatus("Wait for the current Administrator operation to finish");
+                }
+            ))
+          setStatus("Could not verify access for the Administrator operation");
+      },
+      nullptr, filemanager::DialogStyle::Warning
+  );
+}
+
+void FileManager::createNewItem(int id) {
   auto& tab = activeTab();
   auto& session = tab.session;
   const auto caps = tab.capabilities();
-  if (entry.id == kSaveProtectedChanges) {
-    if (tab.selectedPath && tab.selectedPaths.size() == 1)
-      saveProtectedChanges(*tab.selectedPath);
-    return;
-  }
-  if (entry.id == kActAsAdministrator) {
-    (void)enterAdministratorMode(tab.id);
-    return;
-  }
-  if (entry.id == kOpenFolderAsAdministrator) {
-    if (m_menus.contextMenuTarget())
-      (void)enterAdministratorMode(tab.id, *m_menus.contextMenuTarget());
-    return;
-  }
-  if (entry.id == kCalculateChecksum || entry.id == kVerifyChecksum) {
-    if (entry.enabled && caps.canChecksum)
-      showChecksumDialog(entry.id == kVerifyChecksum);
-    return;
-  }
-  if (m_helpDialog.handleMenuAction(entry.id))
-    return;
-  if (entry.id >= kFirstExternalToolApp) {
-    if (!caps.canRunExternalTools) {
-      setStatus("External tools are disabled in Administrator Mode");
-      return;
-    }
-    m_menus.launchExternalTool(static_cast<std::size_t>(entry.id - kFirstExternalToolApp));
-    return;
-  }
-  if (entry.id >= 30001 && entry.id <= kShowMenuBar) {
-    switch (entry.id) {
-    case 30001:
-      if (!session.browsingTrash())
-        launchNewWindow(session.browsingArchive() ? session.path().parent_path() : session.path());
-      break;
-    case 30002:
-      activateSelected();
-      break;
-    case 30003:
-      if (session.browsingArchive()) {
-        if (tab.selectedPath)
-          openArchiveMember(*tab.selectedPath, true);
-        break;
-      }
-      if (!caps.canLaunchApps) {
-        setStatus("Opening files with external applications is disabled in Administrator Mode");
-        return;
-      }
-      if (tab.selectedPath) {
-        m_menus.setContextMenuTarget(*tab.selectedPath);
-        m_menus.openApplicationChooser();
-      }
-      break;
-    case 30004:
-      if (!session.browsingArchive() && tab.selectedPath)
-        launchNewWindow(*tab.selectedPath);
-      break;
-    case 30005:
-      if (!caps.canPinToPlaces) {
-        setStatus("Pinning locations to Places is disabled in Administrator Mode");
-        return;
-      }
-      if (tab.selectedPath)
-        pinPlace(*tab.selectedPath);
-      break;
-    case 30006:
-      if (!caps.canOpenProperties) {
-        setStatus("Properties is unavailable in Administrator Mode");
-        return;
-      }
-      if (tab.selectedPath && !tab.selectedPaths.empty())
-        openProperties(*tab.selectedPath);
-      break;
-    case 30007:
-      requestQuit(m_surface.get());
-      break;
-    case kShowMenuBar:
-      m_menus.toggleMenuBarVisibility();
-      break;
-    }
-    return;
-  }
-  switch (entry.id) {
-  case kNewTab:
-  case kTabContextNew:
-    openNewTab();
-    return;
-  case kReopenClosedTab:
-    (void)reopenClosedTab();
-    return;
-  case kCloseTab:
-    (void)closeTab(tab.id);
-    return;
-  case filemanager::kQuickLookMenuId:
-    (void)openQuickLook();
-    return;
-  case kPreviewHidden:
-    setPreviewMode(filemanager::PreviewMode::Hidden);
-    return;
-  case kPreviewInformation:
-    setPreviewMode(filemanager::PreviewMode::Information);
-    return;
-  case kPreviewFull:
-    setPreviewMode(filemanager::PreviewMode::Full);
-    return;
-  case kThumbnailsNever:
-    setThumbnailPolicy(filemanager::ThumbnailPolicy::Never);
-    return;
-  case kThumbnailsLocal:
-    setThumbnailPolicy(filemanager::ThumbnailPolicy::Local);
-    return;
-  case kThumbnailsAll:
-    setThumbnailPolicy(filemanager::ThumbnailPolicy::All);
-    return;
-  case kInspectThumbnailCache:
-    inspectThumbnailCache(false);
-    return;
-  case kClearThumbnailCache:
-    inspectThumbnailCache(true);
-    return;
-  case filemanager::kGoToLinkTargetMenuId:
-    if (m_menus.contextMenuTarget())
-      goToLinkTarget(*m_menus.contextMenuTarget());
-    return;
-  case kOpenContainingFolder:
-    if (const auto& target = m_menus.contextMenuTarget(); session.search().active()
-        && target
-        && std::ranges::find(session.entries(), *target, &FileEntry::absPath) != session.entries().end()) {
-      navigate(target->parent_path());
-    }
-    return;
-  case kOpenFolderInNewTab:
-    if (session.browsingArchive())
-      return;
-    if (m_menus.contextMenuTarget() && !session.browsingTrash())
-      openFolderInNewTab(*m_menus.contextMenuTarget(), !m_openTabsInBackground);
-    return;
-  case kFileOpenInNewTab:
-    if (!session.browsingTrash() && tab.selectedPath) {
-      const auto found = std::ranges::find(session.entries(), *tab.selectedPath, &FileEntry::absPath);
-      if (found != session.entries().end() && found->isDir) {
-        if (session.browsingArchive())
-          m_tabs.openTab({session.path(), found->absPath.native()}, tab.viewState, !m_openTabsInBackground);
-        else
-          openFolderInNewTab(*tab.selectedPath, !m_openTabsInBackground);
-      }
-    }
-    return;
-  case kAlwaysShowTabBar:
-    setAlwaysShowTabBar(!m_alwaysShowTabBar);
-    return;
-  case kOpenTabsInBackground:
-    setOpenTabsInBackground(!m_openTabsInBackground);
-    return;
-  case kTabContextDuplicate:
-    (void)duplicateTab(m_tabBar.contextMenuTabId());
-    return;
-  case kTabContextClose:
-    (void)closeTab(m_tabBar.contextMenuTabId());
-    return;
-  case kTabContextCloseOthers:
-    (void)closeOtherTabs(m_tabBar.contextMenuTabId());
-    return;
-  case kTabContextCloseRight:
-    (void)closeTabsToRight(m_tabBar.contextMenuTabId());
-    return;
-  default:
-    break;
-  }
-  if (entry.id == kPlaceOpenInNewTab && m_places.placeMenuTarget()) {
-    const auto place = *m_places.placeMenuTarget();
-    const bool activate = !m_openTabsInBackground;
-    if (place.identity == "personal:trash")
-      openFolderInNewTab(std::filesystem::path("trash:/"), activate);
-    else if (place.mounted && !place.path.empty())
-      openFolderInNewTab(place.path, activate);
-    return;
-  }
-  if (entry.id >= 20000 && m_menus.contextMenuTarget()) {
-    if (!caps.canLaunchApps) {
-      setStatus("Opening files with external applications is disabled in Administrator Mode");
-      return;
-    }
-    const auto index = static_cast<std::size_t>(entry.id - 20000);
-    if (!m_menus.launchOpenWithApp(index))
-      setStatus("That application is no longer available");
-    return;
-  }
-  if (entry.id == 81) {
-    if (session.browsingArchive())
-      return;
-    if (!caps.canLaunchApps) {
-      setStatus("Opening files with external applications is disabled in Administrator Mode");
-      return;
-    }
-    m_menus.openApplicationChooser();
-    return;
-  }
-  if (entry.id >= 90 && entry.id <= 93 && m_locationInput != nullptr) {
-    switch (entry.id) {
-    case 90: // Cut
-      m_locationInput->cutSelectedText();
-      break;
-    case 91: // Copy
-      (void)m_locationInput->copySelectedText();
-      break;
-    case 92: // Paste
-      pasteLocationFromClipboard();
-      break;
-    case 93: // Select all
-      m_locationInput->selectAll();
-      break;
-    }
-    return;
-  }
-  const bool createsItem = entry.id >= 111 && entry.id <= kSelectionSymlink;
-  if (m_places.hasActiveDeviceOperations()
-      && ((entry.id >= 1 && entry.id <= 6)
-          || createsItem
-          || entry.id == kDuplicate
-          || entry.id == kUndo
-          || entry.id == kRedo)) {
-    setStatus("Wait for the device operation to finish");
-    return;
-  }
-  if (m_operations.replaying()
-      && ((entry.id >= 3 && entry.id <= 6)
-          || (entry.id >= 70 && entry.id <= 72)
-          || createsItem
-          || entry.id == kDuplicate)) {
-    setStatus("Wait for Undo or Redo to finish");
-    return;
-  }
-  switch (entry.id) {
-  case kSelectAll:
-    recordAdminTabUserActivity(tab);
-    changeSelection(SelectionChange::All);
-    return;
-  case kDeselectAll:
-    recordAdminTabUserActivity(tab);
-    changeSelection(SelectionChange::None);
-    return;
-  case kInvertSelection:
-    recordAdminTabUserActivity(tab);
-    changeSelection(SelectionChange::Invert);
-    return;
-  case kDuplicate:
-    if (!caps.canCreate || !caps.canMutate) {
-      setStatus("This action is unavailable in Administrator Mode");
-      return;
-    }
-    duplicateSelection();
-    return;
-  case kSelectionSymlink:
-    if (!caps.canCreate || !caps.canMutate) {
-      setStatus("This action is unavailable in Administrator Mode");
-      return;
-    }
-    createSelectionSymlink();
-    return;
-  case kManualSymlink:
-    if (!caps.canCreate || !caps.canMutate) {
-      setStatus("This action is unavailable in Administrator Mode");
-      return;
-    }
-    showSymlinkDialog();
-    return;
-  case kUndo:
-  case kRedo:
-    if (!caps.canUndo) {
-      setStatus("Undo and Redo are unavailable in Administrator Mode");
-      return;
-    }
-    if (!m_modalDialog.isOpen() && !m_renamePath && !m_transfer.busy() && m_transfers.pendingClipboardReads() == 0) {
-      if (entry.id == kUndo && m_operations.canUndo())
-        m_operations.undo();
-      else if (entry.id == kRedo && m_operations.canRedo())
-        m_operations.redo();
-    }
-    return;
-  default:
-    break;
-  }
-  if (entry.id == 70 || entry.id == 71) {
-    restoreWastebinSelection(entry.id == 71);
-    return;
-  }
-  if (entry.id == 72) {
-    confirmEmptyWastebin();
-    return;
-  }
-  if (entry.id == 20) {
-    if (!caps.canPinToPlaces) {
-      setStatus("Pinning locations to Places is disabled in Administrator Mode");
-      return;
-    }
-    if (m_menus.contextMenuTarget())
-      pinPlace(*m_menus.contextMenuTarget());
-    return;
-  }
-  if (entry.id == 60 && !session.browsingArchive() && m_menus.contextMenuTarget()) {
-    launchNewWindow(*m_menus.contextMenuTarget());
-    return;
-  }
-  if (entry.id == 59) {
-    if (m_menus.contextMenuTarget()) {
-      writeDesktopClipboard(m_menus.contextMenuTarget()->string(), "text/plain;charset=utf-8");
-    } else {
-      const auto paths = selectedPaths();
-      if (paths.size() == 1)
-        writeDesktopClipboard(paths.front(), "text/plain;charset=utf-8");
-    }
-    return;
-  }
-  if (entry.id == 21) {
-    if (!caps.canPinToPlaces) {
-      setStatus("Pinning locations to Places is disabled in Administrator Mode");
-      return;
-    }
-    pinPlace(session.path());
-    return;
-  }
-  if (entry.id == 38) {
-    m_places.toggleShowHiddenMounts();
-    return;
-  }
-  if ((entry.id == 36 || entry.id == 37) && m_places.placeMenuTarget()) {
-    m_places.setPlaceHidden(*m_places.placeMenuTarget(), entry.id == 36);
-    return;
-  }
-  if ((entry.id == 39 || entry.id == 40) && m_places.placeMenuTarget()) {
-    const auto place = *m_places.placeMenuTarget();
-    if (entry.id == 40) {
-      if (place.mounted && !place.path.empty())
-        launchNewWindow(place.path);
-    } else if (!caps.canOpenProperties) {
-      setStatus("Properties is unavailable in Administrator Mode");
-    } else if (place.mounted && !place.path.empty()) {
-      openProperties(place.path);
-    } else {
-      if (!m_propertiesWindow)
-        m_propertiesWindow = std::make_unique<PropertiesWindow>(
-            m_wayland, m_renderContext, m_settings, m_operations,
-            [this](std::string text) { writeDesktopClipboard(std::move(text), "text/plain;charset=utf-8"); }
-        );
-      if (!m_propertiesWindow->openVolume(place, m_surface.get()))
-        setStatus("Could not open Properties window");
-    }
-    return;
-  }
-  if (entry.id >= 30 && entry.id <= 35 && m_places.placeMenuTarget()) {
-    auto place = *m_places.placeMenuTarget();
-    if (entry.id == 30) {
-      if (place.identity == "personal:trash")
-        navigateTrash();
-      else if (place.mounted && !place.path.empty())
-        navigate(place.path);
-    } else if (entry.id == 31) {
-      m_places.removeSavedPlace(place.identity);
-    } else if (entry.id == 32) {
-      if (!caps.canPinToPlaces) {
-        setStatus("Pinning locations to Places is disabled in Administrator Mode");
-        return;
-      }
-      pinPlace(place.path);
-    } else {
-      m_places.operatePlace(
-          place,
-          entry.id == 33       ? filemanager::PlaceOperation::Mount
-              : entry.id == 34 ? filemanager::PlaceOperation::Unmount
-                               : filemanager::PlaceOperation::Eject
-      );
-    }
-    return;
-  }
-  if (entry.id == 10) {
-    if (m_menus.contextMenuTarget())
-      activatePath(*m_menus.contextMenuTarget());
-  } else if (entry.id == 22) {
-    if (!caps.canOpenProperties) {
-      setStatus("Properties is unavailable in Administrator Mode");
-      return;
-    }
-    if (m_menus.contextMenuTarget() && !tab.selectedPaths.empty())
-      openProperties(*m_menus.contextMenuTarget());
-  } else if (entry.id == 1)
-    copyToDesktopClipboard(false);
-  else if (entry.id == 2)
-    copyToDesktopClipboard(true);
-  else if (entry.id == 3)
-    pasteClipboard();
-  else if (entry.id == 4)
-    beginRename();
-  else if (entry.id == 5 && !session.browsingTrash()) {
-    if (!caps.canMutate || !caps.canTrash) {
-      setStatus("This action is unavailable in Administrator Mode");
-      return;
-    }
-    auto targets = selectedOperationPaths();
-    if (!targets.empty())
-      m_operations.trash(std::move(targets));
-  } else if (entry.id == 6 && !session.browsingTrash()) {
-    if (!caps.canMutate) {
-      setStatus("This action is unavailable in Administrator Mode");
-      return;
-    }
-    auto targets = selectedOperationPaths();
-    if (!targets.empty()) {
-      const auto prompt = filemanager::permanentDeletePrompt(targets, targets.size());
-      showDialog(
-          "Permanently delete?", prompt, {{"Cancel", 0}, {"Delete", 1}},
-          [this, tabId = tab.id, admin = tab.administratorBrowsing, generation = tab.adminSession.sessionGeneration(),
-           navigation = session.navigationGeneration(), targets = std::move(targets)](int response) mutable {
-            auto* origin = m_tabs.findTab(tabId);
-            if (response != 1 || !origin || !origin->capabilities().canMutate || origin->administratorBrowsing != admin)
-              return;
-            if (admin
-                && (origin->adminSession.sessionGeneration() != generation
-                    || origin->session.navigationGeneration() != navigation))
-              return;
-            if (!m_operations.removePermanently(std::move(targets), admin ? origin : nullptr) && admin)
-              setStatus("Wait for the current Administrator operation to finish");
-          }
-      );
-    }
-  } else if (entry.id >= 114 && entry.id <= 116) {
+  if (id >= kCreateDocument && id <= kCreatePresentation) {
     if (!caps.canCreate) {
       setStatus("This action is unavailable in Administrator Mode");
       return;
@@ -2260,15 +1870,17 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
       setStatus("This directory does not support file creation");
       return;
     }
-    const int id = entry.id;
-    const char* extension = id == 114 ? ".odt" : id == 115 ? ".ods" : ".odp";
-    const char* asset = id == 114 ? "templates/filemanager/office/blank.odt"
-        : id == 115               ? "templates/filemanager/office/blank.ods"
-                                  : "templates/filemanager/office/blank.odp";
-    const std::string defaultName = id == 114 ? "New Document" : id == 115 ? "New Spreadsheet" : "New Presentation";
+    const char* extension = id == kCreateDocument ? ".odt" : id == kCreateSpreadsheet ? ".ods" : ".odp";
+    const char* asset = id == kCreateDocument ? "templates/filemanager/office/blank.odt"
+        : id == kCreateSpreadsheet            ? "templates/filemanager/office/blank.ods"
+                                              : "templates/filemanager/office/blank.odp";
+    const std::string defaultName = id == kCreateDocument ? "New Document"
+        : id == kCreateSpreadsheet                        ? "New Spreadsheet"
+                                                          : "New Presentation";
     if (tab.administratorBrowsing) {
       if (!m_operations.createFileFromTemplate(
-              paths::assetPath(asset).string(), (session.path() / (defaultName + extension)).string(), &tab
+              paths::assetPath(asset).string(), (session.path() / (defaultName + extension)).string(),
+              filemanager::adminOperationContext(&tab)
           ))
         setStatus("Wait for the current Administrator operation to finish");
       return;
@@ -2284,122 +1896,45 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
         opId != 0) {
       m_createRequests[opId] = CreateRequest{tab.id, session.navigationGeneration(), *destination};
     }
-  } else if (entry.id >= 111 && entry.id <= 113) {
-    if (tab.administratorBrowsing) {
-      if (!caps.canCreateBasic) {
-        setStatus(
-            session.loading() ? "Wait for the folder listing to finish"
-                              : "This directory does not support file creation"
-        );
-        return;
-      }
-      const auto directory = session.path();
-      const auto id = entry.id == 111
-          ? m_operations.createFolder((directory / "New Folder").string(), &tab)
-          : m_operations.createFile((directory / (entry.id == 113 ? "New File.txt" : "New File")).string(), &tab);
-      if (!id)
-        setStatus("Wait for the current Administrator operation to finish");
-      return;
-    }
-    if (!caps.canCreate) {
-      setStatus("This action is unavailable in Administrator Mode");
-      return;
-    }
-    if (session.browsingTrash() || !currentDirectoryWritable()) {
-      setStatus("This directory does not support file creation");
-      return;
-    }
-    const int id = entry.id;
-    const std::string defaultName = id == 111 ? "New Folder" : "New File";
-    std::error_code error;
-    auto destination = filemanager::creationDestination(session.path(), defaultName, id == 113, error);
-    if (!destination) {
-      setStatus(error ? error.message() : "Could not choose a filename");
-      return;
-    }
-    const auto opId =
-        id == 111 ? m_operations.createFolder(destination->string()) : m_operations.createFile(destination->string());
-    if (opId != 0)
-      m_createRequests[opId] = CreateRequest{tab.id, session.navigationGeneration(), *destination};
-  } else if (entry.id == 13) {
-    if (session.browsingArchive())
-      session.reloadArchive();
-    else
-      enumerate(session.path());
-  } else if (entry.id == 14 || entry.id == kListView || entry.id == kGridView) {
-    recordAdminTabUserActivity(tab);
-    setGridMode(entry.id == 14 ? !m_listHeader.gridMode() : entry.id == kGridView);
-  } else if (entry.id >= kZoomIn && entry.id <= kResetZoom) {
-    recordAdminTabUserActivity(tab);
-    adjustViewScale(
-        entry.id == kResetZoom ? filemanager::kFileViewDefaultScale
-                               : m_listHeader.viewScale()
-                + (entry.id == kZoomIn ? filemanager::kFileViewZoomStep : -filemanager::kFileViewZoomStep)
-    );
-  } else if (entry.id == kFitAllColumns) {
-    m_listHeader.requestFit(std::nullopt);
-  } else if (
-      entry.id >= kFirstFitColumn && entry.id < kFirstFitColumn + static_cast<int>(filemanager::kFileColumns.size())
-  ) {
-    m_listHeader.requestFit(static_cast<FileColumn>(entry.id - kFirstFitColumn));
-  } else if (
-      entry.id >= kFirstColumnAction
-      && entry.id < kFirstColumnAction + static_cast<int>(filemanager::kFileColumns.size())
-  ) {
-    recordAdminTabUserActivity(tab);
-    const auto column = static_cast<FileColumn>(entry.id - kFirstColumnAction);
-    if (column != FileColumn::Name && !(m_listHeader.searchView() && column == FileColumn::Accessed)) {
-      auto& visible = m_listHeader.columnLayout().visible[columnIndex(column)];
-      visible = !visible;
-      if (column == FileColumn::Size && !visible) {
-        if (session.search().active()) {
-          session.updateVisibleSearchFolders({});
-        } else {
-          for (const auto& tabPtr : m_tabs.tabs())
-            tabPtr->session.clearFolderCounts();
-        }
-      }
-      if (!m_listHeader.gridMode())
-        m_listHeader.updateColumnHeaders();
-      m_listHeader.persistColumnLayout();
-    }
-  } else if (entry.id >= 53 && entry.id <= 57) {
-    recordAdminTabUserActivity(tab);
-    const auto field = static_cast<FileDialogSortField>(entry.id - 53);
-    if (field != m_listHeader.sortField())
-      setSortField(field);
-  } else if (entry.id == 61 || (entry.id == 63 && m_listHeader.searchView())) {
-    recordAdminTabUserActivity(tab);
-    const auto field = entry.id == 63 ? FileDialogSortField::Location : FileDialogSortField::Type;
-    if (m_listHeader.sortField() != field)
-      setSortField(field);
-  } else if (entry.id == 58 || entry.id == 62) {
-    recordAdminTabUserActivity(tab);
-    const auto requested = entry.id == 58 ? FileDialogSortOrder::Ascending : FileDialogSortOrder::Descending;
-    if (m_listHeader.sortOrder() != requested)
-      toggleSortOrder();
-  } else if (entry.id == 50) {
-    recordAdminTabUserActivity(tab);
-    if (session.search().active()) {
-      toggleSearchOption(&filemanager::SearchOptions::showHidden);
-    } else {
-      session.setShowHidden(!session.showHidden());
-      persistFileViewState();
-      enumerate(session.path());
-    }
-  } else if (entry.id == 51 || entry.id == 52) {
-    recordAdminTabUserActivity(tab);
-    if (entry.id == 51)
-      session.setFoldersFirst(!session.foldersFirst());
-    else
-      session.setHiddenLast(!session.hiddenLast());
-    persistFileViewState();
-    session.sortEntries(true);
-    if (m_grid) {
-      m_grid->notifyDataChanged();
-      restoreSelection();
-    }
+    return;
   }
+  if (tab.administratorBrowsing) {
+    if (!caps.canCreateBasic) {
+      setStatus(
+          session.loading() ? "Wait for the folder listing to finish" : "This directory does not support file creation"
+      );
+      return;
+    }
+    const auto directory = session.path();
+    const auto opId = id == kCreateFolder
+        ? m_operations.createFolder((directory / "New Folder").string(), filemanager::adminOperationContext(&tab))
+        : m_operations.createFile(
+              (directory / (id == kCreateTextFile ? "New File.txt" : "New File")).string(),
+              filemanager::adminOperationContext(&tab)
+          );
+    if (!opId)
+      setStatus("Wait for the current Administrator operation to finish");
+    return;
+  }
+  if (!caps.canCreate) {
+    setStatus("This action is unavailable in Administrator Mode");
+    return;
+  }
+  if (session.browsingTrash() || !currentDirectoryWritable()) {
+    setStatus("This directory does not support file creation");
+    return;
+  }
+  const std::string defaultName = id == kCreateFolder ? "New Folder" : "New File";
+  std::error_code error;
+  auto destination = filemanager::creationDestination(session.path(), defaultName, id == kCreateTextFile, error);
+  if (!destination) {
+    setStatus(error ? error.message() : "Could not choose a filename");
+    return;
+  }
+  const auto opId = id == kCreateFolder ? m_operations.createFolder(destination->string())
+                                        : m_operations.createFile(destination->string());
+  if (opId != 0)
+    m_createRequests[opId] = CreateRequest{tab.id, session.navigationGeneration(), *destination};
 }
 
 void FileManager::openProperties(const std::filesystem::path& path) {
@@ -2600,52 +2135,6 @@ void FileManager::launchNewWindow(const std::filesystem::path& path) {
   }
 }
 
-void FileManager::restoreSelection(bool chooseFirst) {
-  if (m_grid == nullptr)
-    return;
-  auto& tab = activeTab();
-  auto& session = tab.session;
-  const auto setGridSelection = [this, &tab](std::optional<std::size_t> index) {
-    m_restoringSelection = true;
-    // Metadata/monitor refreshes before the next layout must not cancel the
-    // paste's pending reveal in VirtualGridView.
-    const bool revealLink = index && tab.linkTargetToReveal && tab.selectedPath == tab.linkTargetToReveal;
-    if (revealLink || !tab.session.loading())
-      tab.linkTargetToReveal.reset();
-    const bool reveal = revealLink
-        || (index
-            && tab.pendingPasteRevealPath
-            && tab.selectedPath == tab.pendingPasteRevealPath
-            && !tab.pendingDropScrollGeneration);
-    m_grid->setSelectedIndex(index, reveal);
-    m_restoringSelection = false;
-  };
-  if (tab.selectedPath.has_value()) {
-    const auto index = m_grid->selectedIndex();
-    if (index && *index < session.entries().size() && session.entries()[*index].absPath == *tab.selectedPath) {
-      setGridSelection(index);
-      return;
-    }
-    const auto selected = std::ranges::find(session.entries(), *tab.selectedPath, &FileEntry::absPath);
-    if (selected != session.entries().end()) {
-      setGridSelection(static_cast<std::size_t>(selected - session.entries().begin()));
-      return;
-    }
-    if (session.search().status() == filemanager::FileSearchSession::Status::Searching) {
-      setGridSelection(std::nullopt);
-      return;
-    }
-    if (session.loading())
-      return;
-    tab.selectedPath.reset();
-  }
-  if (chooseFirst && !session.entries().empty()) {
-    setGridSelection(0);
-    return;
-  }
-  setGridSelection(std::nullopt);
-}
-
 void FileManager::activateSelected() {
   if (m_grid == nullptr)
     return;
@@ -2654,180 +2143,6 @@ void FileManager::activateSelected() {
   if (!selected || *selected >= entries.size())
     return;
   activatePath(entries[*selected].absPath);
-}
-
-FileManager::ProtectedCopy::~ProtectedCopy() {
-  if (!temporary.empty()) {
-    unlink(temporary.c_str());
-    rmdir(temporary.parent_path().c_str());
-  }
-}
-
-std::shared_ptr<FileManager::ProtectedCopy>
-FileManager::protectedEdit(filemanager::TabId tab, const std::filesystem::path& path) const {
-  const auto found = std::ranges::find_if(m_protectedEdits, [&](const auto& copy) {
-    return copy->tabId == tab && copy->original == path;
-  });
-  return found == m_protectedEdits.end() ? nullptr : *found;
-}
-
-std::function<bool()> FileManager::requestProtectedCopy(
-    filemanager::BrowserTab& tab, const std::filesystem::path& path, ProtectedCopyReady ready, bool thumbnail
-) {
-  using namespace filemanager;
-  g_autoptr(GError) error = nullptr;
-  g_autofree char* directory = g_dir_make_tmp("nythera-protected-XXXXXX", &error);
-  if (!directory) {
-    ready(nullptr, error ? error->message : "Could not create a temporary copy directory.");
-    return {};
-  }
-  auto copy = std::make_shared<ProtectedCopy>();
-  copy->tabId = tab.id;
-  copy->original = path;
-  copy->temporary = std::filesystem::path(directory) / path.filename();
-  const int fd = open(copy->temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  if (fd < 0) {
-    ready(nullptr, "Could not create the temporary copy.");
-    return {};
-  }
-  close(fd);
-  const auto generation = tab.adminSession.sessionGeneration();
-  auto transfer = tab.adminSession.runOperation(
-      {.kind = file_operation_engine::Kind::ExportProtectedFile,
-       .sources = {path.string()},
-       .destination = copy->temporary.string(),
-       .contentRevision = thumbnail ? "thumbnail" : ""},
-      generation, nullptr,
-      [this, alive = std::weak_ptr<bool>(m_alive), copy, generation,
-       ready = std::move(ready)](AdminServerFrame result) {
-        const auto token = alive.lock();
-        if (!token || !*token)
-          return;
-        const auto* origin = m_tabs.findTab(copy->tabId);
-        if (!origin || !origin->hasActiveAdminSession() || origin->adminSession.sessionGeneration() != generation) {
-          ready(nullptr, "The originating Administrator session ended.");
-          return;
-        }
-        if (result.status != AdminStatusCode::Ok || result.customDescription.empty()) {
-          ready(nullptr, result.detail.empty() ? "Could not read the protected file." : result.detail);
-          return;
-        }
-        copy->revision = std::move(result.customDescription);
-        ready(copy, {});
-      }
-  );
-  return std::move(transfer.cancel);
-}
-
-void FileManager::clearProtectedThumbnails() {
-  ++m_protectedThumbnailRevision;
-  m_protectedThumbnailTab = filemanager::kInvalidTabId;
-  m_protectedThumbnailRetry.stop();
-  m_protectedThumbnailPending = false;
-  if (auto cancel = std::exchange(m_cancelProtectedThumbnail, {}))
-    (void)cancel();
-  m_protectedThumbnails.clear();
-}
-
-std::optional<std::string>
-FileManager::protectedThumbnailPath(filemanager::BrowserTab& tab, const FileEntry& entry, std::size_t index) {
-  if (!tab.hasActiveAdminSession()
-      || entry.isDir
-      || entry.isSymlink
-      || !DirectoryScanner::isThumbnailPath(entry.absPath)
-      || filemanager::userCanReadPath(entry.absPath))
-    return std::nullopt;
-  const auto maximum = DirectoryScanner::isSvgPath(entry.absPath) ? ThumbnailService::kMaxSvgSourceBytes
-                                                                  : ThumbnailService::kMaxSourceFileBytes;
-  if (!m_grid || entry.size == 0 || entry.size > maximum)
-    return std::string{};
-  if (m_protectedThumbnailTab != tab.id || m_protectedThumbnailListing != tab.session.enumerationGeneration()) {
-    clearProtectedThumbnails();
-    m_protectedThumbnailTab = tab.id;
-    m_protectedThumbnailListing = tab.session.enumerationGeneration();
-  }
-  std::erase_if(m_protectedThumbnails, [this](const auto& item) { return !m_grid->inVisiblePool(item.first); });
-  if (const auto cached = m_protectedThumbnails.find(index);
-      cached != m_protectedThumbnails.end() && cached->second.path == entry.absPath)
-    return cached->second.copy ? cached->second.copy->temporary.string() : std::string{};
-  if (!m_protectedThumbnailPending && !m_protectedThumbnailRetry.active()) {
-    m_protectedThumbnailPending = true;
-    m_cancelProtectedThumbnail = requestProtectedCopy(
-        tab, entry.absPath,
-        [this, index, path = entry.absPath, revision = m_protectedThumbnailRevision](auto copy, const auto& error) {
-          if (revision != m_protectedThumbnailRevision)
-            return;
-          m_cancelProtectedThumbnail = {};
-          m_protectedThumbnailPending = false;
-          if (error != "Another shared operation is active.")
-            m_protectedThumbnails.insert_or_assign(index, ProtectedThumbnail{path, std::move(copy)});
-          // Rebind outside the adapter's layout pass and let the next visible item
-          // submit after this read's terminal frame.
-          m_protectedThumbnailRetry.start(std::chrono::milliseconds(error.empty() ? 0 : 150), [this] {
-            if (m_grid) {
-              m_grid->notifyDataChanged();
-              restoreSelection();
-            }
-          });
-        },
-        true
-    );
-  }
-  return std::string{};
-}
-
-void FileManager::openProtectedFile(
-    filemanager::TabId tabId, const std::filesystem::path& path,
-    std::function<void(const std::filesystem::path&)> launch
-) {
-  auto* tab = m_tabs.findTab(tabId);
-  if (!tab || !tab->hasActiveAdminSession())
-    return;
-  if (const auto copy = protectedEdit(tabId, path)) {
-    launch(copy->temporary);
-    return;
-  }
-  requestProtectedCopy(*tab, path, [this, tabId, launch = std::move(launch)](auto copy, const auto& error) {
-    if (!copy) {
-      if (auto* origin = m_tabs.findTab(tabId); origin && !origin->active)
-        origin->lastStatusMessage = error;
-      else if (tabId == m_tabs.activeTabId())
-        setStatus(error);
-      return;
-    }
-    m_protectedEdits.push_back(copy);
-    launch(copy->temporary);
-  });
-}
-
-void FileManager::saveProtectedChanges(const std::filesystem::path& path) {
-  using namespace filemanager;
-  auto& tab = activeTab();
-  const auto copy = protectedEdit(tab.id, path);
-  if (!copy || !tab.hasActiveAdminSession())
-    return;
-  [[maybe_unused]] const auto transfer = tab.adminSession.runOperation(
-      {.kind = file_operation_engine::Kind::SaveProtectedFile,
-       .sources = {copy->temporary.string()},
-       .destination = copy->original.string(),
-       .contentRevision = copy->revision},
-      tab.adminSession.sessionGeneration(), nullptr,
-      [this, alive = std::weak_ptr<bool>(m_alive), copy](AdminServerFrame result) {
-        const auto token = alive.lock();
-        if (!token || !*token)
-          return;
-        if (result.status == AdminStatusCode::Ok) {
-          copy->revision = std::move(result.customDescription);
-          if (auto* origin = m_tabs.findTab(copy->tabId);
-              origin && origin->session.path() == copy->original.parent_path())
-            origin->session.refreshPreservingSelection();
-        }
-        if (copy->tabId == m_tabs.activeTabId())
-          setStatus(result.detail);
-        else if (auto* origin = m_tabs.findTab(copy->tabId))
-          origin->lastStatusMessage = result.detail;
-      }
-  );
 }
 
 void FileManager::goToLinkTarget(const std::filesystem::path& link) {
@@ -2850,9 +2165,7 @@ void FileManager::goToLinkTarget(const std::filesystem::path& link) {
 
   // Navigation clears the prior selection before its asynchronous listing.
   navigate(target->path.parent_path(), true, target->path.filename().native());
-  tab.selectedPath = target->path;
-  tab.selectedPaths = {target->path.string()};
-  tab.selectionAnchor = target->path;
+  tab.selectSingle(target->path);
   tab.linkTargetToReveal = target->path;
 }
 
@@ -2891,10 +2204,7 @@ void FileManager::activatePath(const std::filesystem::path& path) {
     return;
   }
   if (tab.administratorBrowsing && !filemanager::userCanReadPath(path)) {
-    openProtectedFile(tab.id, path, [this, id = tab.id](const auto& temporary) {
-      g_autoptr(GFile) file = g_file_new_for_path(temporary.c_str());
-      launchFileUri(id, file, "Opened a temporary copy. Use Save Changes Back to update the original.");
-    });
+    m_launcher.openProtectedFileWithDefault(tab.id, path);
     return;
   }
   if (session.browsingTrash() && !session.trashUris().contains(entry.absPath.string())) {
@@ -2904,55 +2214,7 @@ void FileManager::activatePath(const std::filesystem::path& path) {
   g_autoptr(GFile) file = session.browsingTrash()
       ? g_file_new_for_uri(session.trashUris().at(entry.absPath.string()).c_str())
       : g_file_new_for_path(entry.absPath.c_str());
-  launchFileUri(tab.id, file);
-}
-
-void FileManager::launchFileUri(filemanager::TabId tabId, GFile* file, std::string success) {
-  char* uri = g_file_get_uri(file);
-  struct LaunchRequest {
-    FileManager* manager;
-    std::weak_ptr<bool> alive;
-    filemanager::TabId tabId;
-    std::string success;
-  };
-  g_app_info_launch_default_for_uri_async(
-      uri, nullptr, nullptr,
-      [](GObject*, GAsyncResult* result, gpointer data) {
-        std::unique_ptr<LaunchRequest> request(static_cast<LaunchRequest*>(data));
-        GError* error = nullptr;
-        const bool launched = g_app_info_launch_default_for_uri_finish(result, &error);
-        if (const auto locked = request->alive.lock(); locked && *locked) {
-          std::string message = !launched ? (error == nullptr ? "Could not open this file" : error->message)
-                                          : std::move(request->success);
-          if (request->tabId == request->manager->m_tabs.activeTabId())
-            request->manager->setStatus(std::move(message));
-          else if (auto* originTab = request->manager->m_tabs.findTab(request->tabId))
-            originTab->lastStatusMessage = std::move(message);
-        }
-        g_clear_error(&error);
-      },
-      new LaunchRequest{this, m_alive, tabId, std::move(success)}
-  );
-  g_free(uri);
-}
-
-void FileManager::activatePointerItem(std::size_t index) {
-  if (!m_grid || index >= activeSession().entries().size())
-    return;
-  // Administrator clicks arrive directly from the grid, without the drag handler's modifier check.
-  if (activeTab().hasActiveAdminSession() && (m_keyboardModifiers & (KeyMod::Ctrl | KeyMod::Shift))) {
-    m_lastPointerIndex.reset();
-    return;
-  }
-  m_grid->setSelectedIndex(index, false);
-  const std::uint32_t elapsed = m_pointerClickTime - m_lastPointerClickTime;
-  if (m_lastPointerIndex == index && elapsed <= 500U) {
-    m_lastPointerIndex.reset();
-    activateSelected();
-    return;
-  }
-  m_lastPointerIndex = index;
-  m_lastPointerClickTime = m_pointerClickTime;
+  m_launcher.launchFileUri(tab.id, file);
 }
 
 void FileManager::setStatus(std::string text) {
@@ -2998,8 +2260,8 @@ void FileManager::updateStatusBar() {
   std::string freeSpace;
   if (!m_statusMessage.empty() && std::chrono::steady_clock::now() < m_statusMessageUntil) {
     primary = m_statusMessage;
-  } else if (tab.selectedPaths.size() == 1) {
-    const std::filesystem::path path(*tab.selectedPaths.begin());
+  } else if (tab.selectionCount() == 1) {
+    const std::filesystem::path path(*tab.selectedPaths().begin());
     const auto entry = std::ranges::find(session.entries(), path, &FileEntry::absPath);
     const std::string name = entry == session.entries().end() ? path.filename().string() : entry->name;
     primary = filemanager::sanitizeFilenameForDisplay(name);
@@ -3034,12 +2296,12 @@ void FileManager::updateStatusBar() {
     }
     if (session.search().active())
       details += "  |  " + filemanager::sanitizeFilenameForDisplay(path.parent_path().string());
-  } else if (!tab.selectedPaths.empty()) {
+  } else if (tab.hasSelection()) {
     cancelSelectionInfoQuery();
     std::size_t folders = 0, files = 0;
     std::uint64_t bytes = 0;
     bool hasSize = false;
-    for (const auto& selected : tab.selectedPaths) {
+    for (const auto& selected : tab.selectedPaths()) {
       const auto found = std::ranges::find(session.entries(), std::filesystem::path(selected), &FileEntry::absPath);
       if (found == session.entries().end())
         continue;
@@ -3051,7 +2313,7 @@ void FileManager::updateStatusBar() {
         hasSize = true;
       }
     }
-    primary = formatCount(tab.selectedPaths.size()) + " selected";
+    primary = formatCount(tab.selectionCount()) + " selected";
     details = formatCount(folders) + " folders, " + formatCount(files) + " files";
     if (hasSize) {
       const auto size = compactSize(bytes);
@@ -3399,8 +2661,7 @@ void FileManager::finishAdministratorMode(filemanager::TabId tabId, std::string 
   auto* tab = m_tabs.findTab(tabId);
   if (tab == nullptr)
     return;
-  if (tabId == m_protectedThumbnailTab)
-    clearProtectedThumbnails();
+  m_protectedFiles.clearThumbnailsForTab(tabId);
   if (m_propertiesWindow && m_propertiesWindow->usesAdministratorTab(*tab))
     m_propertiesWindow->close();
   if (tabId == m_tabs.activeTabId()) {
@@ -3646,7 +2907,7 @@ void FileManager::setLocationEditMode(bool editing, bool preserveOutsideClickFoc
   ++m_locationEditGeneration;
   m_editingLocation = editing;
   m_wayland.stopKeyRepeat();
-  m_typeaheadQuery.clear();
+  m_selection.clearTypeahead();
   if (m_locationInput != nullptr) {
     m_locationInput->setVisible(editing);
     m_locationInput->setParticipatesInLayout(editing);
@@ -3755,23 +3016,7 @@ std::unique_ptr<Flex> FileManager::buildStatusRow(float fontSize) {
   m_statusDetailLabel = static_cast<Label*>(summary->addChild(std::move(detail)));
   statusRow->addChild(std::move(summary));
 
-  auto search = std::make_unique<Flex>();
-  search->setGap(Style::spaceXs);
-  search->setMirrorInRtl(false);
-  auto spinner = std::make_unique<Spinner>();
-  spinner->setSpinnerSize(fontSize);
-  spinner->setVisible(false);
-  m_searchSpinner = static_cast<Spinner*>(search->addChild(std::move(spinner)));
-  m_searchSpinner->setAnimationManager(&m_menuAnimations);
-  auto status = std::make_unique<Label>();
-  status->setFontSize(fontSize);
-  status->setMaxLines(1);
-  status->setEllipsize(TextEllipsize::End);
-  status->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
-  status->setVisible(false);
-  m_searchStatus = static_cast<Label*>(search->addChild(std::move(status)));
-  m_searchStatusArea = static_cast<Flex*>(statusRow->addChild(std::move(search)));
-  m_searchStatusArea->setVisible(false);
+  m_searchBarController.attachStatusArea(*statusRow, fontSize);
 
   return statusRow;
 }
@@ -3861,32 +3106,8 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     auto navigation = std::make_unique<Flex>();
     navigation->setAlign(FlexAlign::Center);
     navigation->setGap(2.0F);
-    navigation->addChild(makeButton(
-        "‹",
-        [this] {
-          auto& session = activeSession();
-          if (session.backHistory().empty())
-            return;
-          auto path = session.backHistory().back();
-          session.backHistory().pop_back();
-          session.forwardHistory().push_back(session.location());
-          navigateLocation(std::move(path), false);
-        },
-        &m_backButton
-    ));
-    navigation->addChild(makeButton(
-        "›",
-        [this] {
-          auto& session = activeSession();
-          if (session.forwardHistory().empty())
-            return;
-          auto path = session.forwardHistory().back();
-          session.forwardHistory().pop_back();
-          session.backHistory().push_back(session.location());
-          navigateLocation(std::move(path), false);
-        },
-        &m_forwardButton
-    ));
+    navigation->addChild(makeButton("‹", [this] { navigateBack(); }, &m_backButton));
+    navigation->addChild(makeButton("›", [this] { navigateForward(); }, &m_forwardButton));
     navigation->addChild(makeButton("↑", [this] { navigateUp(); }, &m_upButton));
 
     auto locationBar = std::make_unique<Flex>();
@@ -3929,15 +3150,19 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     crumb->setMinHeight(kToolbarHeight);
     m_breadcrumbBar = static_cast<Flex*>(locationBar->addChild(std::move(crumb)));
     navigation->addChild(std::move(locationBar));
-    navigation->addChild(makeButton("↻", [this] { activateContextMenuEntry({.id = 13}); }, &m_refreshButton));
-    auto searchButton = makeButton("", [this] { toggleSearch(); }, &m_searchButton);
+    navigation->addChild(
+        makeButton("↻", [this] { activateContextMenuEntry({.id = filemanager::menu_id::kRefresh}); }, &m_refreshButton)
+    );
+    Button* searchBtn = nullptr;
+    auto searchButton = makeButton("", [this] { toggleSearch(); }, &searchBtn);
     searchButton->setGlyph("search");
     searchButton->setTooltip("Search (Ctrl+F)");
+    m_searchBarController.setSearchButton(searchBtn);
     navigation->addChild(std::move(searchButton));
     mainPane->addChild(std::move(navigation));
 
     mainPane->addChild(m_tabBar.buildUi());
-    buildSearchBar(*mainPane, toolbarGap - paneGap);
+    m_searchBarController.buildSearchBar(*mainPane, toolbarGap - paneGap);
 
     auto fileViewRow = std::make_unique<Flex>();
     fileViewRow->setAlign(FlexAlign::Stretch);
@@ -3987,112 +3212,10 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_grid->bindScrollState(&activeTab().displayedScrollState());
     m_listHeader.updateColumnHeaders();
     m_grid->setOnRubberBandSelection([this](const std::vector<std::size_t>& hits, bool finished, bool cancelled) {
-      auto& tab = activeTab();
-      const auto& entries = tab.session.entries();
-      if (cancelled) {
-        tab.selectedPaths = m_rubberBaseline;
-        tab.selectedPath = m_rubberSelectedPath;
-        tab.selectionAnchor = m_rubberAnchor;
-      } else {
-        const bool ctrl = m_rubberModifiers & KeyMod::Ctrl;
-        const bool shift = m_rubberModifiers & KeyMod::Shift;
-        tab.selectedPaths = (ctrl || shift) ? m_rubberBaseline : std::unordered_set<std::string>{};
-        for (const auto index : hits) {
-          if (index >= entries.size())
-            continue;
-          const auto path = entries[index].absPath.string();
-          if (ctrl && m_rubberBaseline.contains(path))
-            tab.selectedPaths.erase(path);
-          else
-            tab.selectedPaths.insert(path);
-        }
-        if (shift && !hits.empty() && m_rubberAnchor) {
-          const auto anchor = std::ranges::find(entries, *m_rubberAnchor, &FileEntry::absPath);
-          if (anchor != entries.end()) {
-            const auto index = static_cast<std::size_t>(anchor - entries.begin());
-            const auto endpoint = hits.back();
-            for (auto i = std::min(index, endpoint); i <= std::max(index, endpoint) && i < entries.size(); ++i)
-              tab.selectedPaths.insert(entries[i].absPath.string());
-          }
-        }
-        if (!hits.empty() && hits.back() < entries.size())
-          tab.selectedPath = entries[hits.back()].absPath;
-        else if (tab.selectedPaths.empty())
-          tab.selectedPath.reset();
-        if (finished && !ctrl && !shift)
-          tab.selectionAnchor = tab.selectedPath;
-      }
-      m_restoringSelection = true;
-      const auto selected =
-          tab.selectedPath ? std::ranges::find(entries, *tab.selectedPath, &FileEntry::absPath) : entries.end();
-      m_grid->setSelectedIndex(
-          selected == entries.end() ? std::nullopt : std::optional<std::size_t>(selected - entries.begin()), false
-      );
-      m_restoringSelection = false;
-      m_grid->notifyDataChanged();
-      updateSelectionSummary();
-      if (finished) {
-        m_rubberBaseline.clear();
-        m_selectionTimer.stop();
-      }
-      if (m_surface)
-        m_surface->requestRedraw();
+      m_selection.handleRubberBandSelection(hits, finished, cancelled);
     });
     m_grid->setOnSelectionChanged([this](std::optional<std::size_t> index) {
-      if (m_restoringSelection)
-        return;
-      m_typeaheadQuery.clear();
-      m_fileViewFocusVisible = false;
-      auto& tab = activeTab();
-      recordAdminTabUserActivity(tab);
-      const auto& entries = tab.session.entries();
-      if (index.has_value() && *index < entries.size()) {
-        const auto previousPath = tab.selectedPath;
-        tab.selectedPath = entries[*index].absPath;
-        const auto path = entries[*index].absPath.string();
-        const bool ctrl = (m_keyboardModifiers & KeyMod::Ctrl) != 0U;
-        const bool shift = (m_keyboardModifiers & KeyMod::Shift) != 0U;
-        if (ctrl && shift) {
-          if (!tab.selectionAnchor)
-            tab.selectionAnchor = previousPath ? previousPath : entries[*index].absPath;
-          const auto anchor = std::ranges::find(entries, *tab.selectionAnchor, &FileEntry::absPath);
-          const auto anchorIndex =
-              anchor != entries.end() ? static_cast<std::size_t>(anchor - entries.begin()) : *index;
-          const auto first = std::min(anchorIndex, *index);
-          const auto last = std::max(anchorIndex, *index);
-          for (auto selected = first; selected <= last; ++selected)
-            tab.selectedPaths.insert(entries[selected].absPath.string());
-        } else if (ctrl) {
-          if (!tab.selectedPaths.erase(path))
-            tab.selectedPaths.insert(path);
-          tab.selectionAnchor = entries[*index].absPath;
-        } else if (shift) {
-          if (!tab.selectionAnchor)
-            tab.selectionAnchor = previousPath ? previousPath : entries[*index].absPath;
-          const auto anchor = std::ranges::find(entries, *tab.selectionAnchor, &FileEntry::absPath);
-          if (anchor != entries.end()) {
-            const auto anchorIndex = static_cast<std::size_t>(anchor - entries.begin());
-            const auto first = std::min(anchorIndex, *index);
-            const auto last = std::max(anchorIndex, *index);
-            tab.selectedPaths.clear();
-            for (auto selected = first; selected <= last; ++selected)
-              tab.selectedPaths.insert(entries[selected].absPath.string());
-          } else {
-            tab.selectedPaths = {path};
-            tab.selectionAnchor = entries[*index].absPath;
-          }
-        } else {
-          tab.selectedPaths.clear();
-          tab.selectedPaths.insert(path);
-          tab.selectionAnchor = entries[*index].absPath;
-        }
-        m_grid->notifyDataChanged();
-      } else {
-        tab.selectedPaths.clear();
-        tab.selectionAnchor.reset();
-        tab.selectedPath.reset();
-      }
-      updateSelectionSummary();
+      m_selection.handleGridSelectionChanged(index);
     });
     fileView->addChild(std::move(grid));
     fileView->addChild(m_listHeader.buildHorizontalScrollbar());
@@ -4166,20 +3289,15 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     layoutPreviewPane(available, kSidebarDividerWidth + 2.0F * kPaneGap);
     const int headerWidth = static_cast<int>(available);
     m_menus.syncResponsiveMenuBar(headerWidth);
-    updateSearchFilterWidth(static_cast<float>(headerWidth), renderer);
     updateAdminHeaderUi(headerWidth);
-    auto* clearFilters = m_searchFilterUi.clear;
-    const float scopeWidthBudget = clearFilters->visible()
-        ? static_cast<float>(headerWidth) - clearFilters->measure(renderer, {}).width - m_searchBar->gap()
-        : static_cast<float>(m_surface->width()) - (showSidebar ? effectiveSidebar : 0.0F);
-    updateSearchScopeWidth(scopeWidthBudget);
     const float statusWidth =
         std::max(1.0F, static_cast<float>(headerWidth) - m_statusStrip->paddingLeft() - m_statusStrip->paddingRight());
     float summaryWidth = statusWidth;
-    if (m_searchStatusArea->visible()) {
-      m_searchStatus->setMaxWidth(std::floor(statusWidth * 0.45F));
-      summaryWidth -= m_searchStatusArea->measure(renderer, {}).width + Style::spaceSm;
-    }
+    m_searchBarController.layoutForFrame(
+        static_cast<float>(headerWidth),
+        static_cast<float>(m_surface->width()) - (showSidebar ? effectiveSidebar : 0.0F), statusWidth, renderer,
+        summaryWidth
+    );
     m_statusLabel->setMaxWidth(
         std::max(1.0F, m_statusDetailLabel->text().empty() ? summaryWidth : summaryWidth * 0.6F)
     );
@@ -4222,7 +3340,7 @@ void FileManager::requestQuit(ToplevelSurface* parent) {
     m_quitting = true;
     if (m_surface && m_windowOpen)
       ToplevelSurface::handleToplevelClose(m_surface.get(), nullptr);
-    if (m_transfers.pendingClipboardReads() == 0)
+    if (m_clipboard.pendingClipboardReads() == 0)
       m_running = false;
     return;
   }
@@ -4234,7 +3352,7 @@ void FileManager::requestQuit(ToplevelSurface* parent) {
           + std::to_string(activeCount)
           + (activeCount == 1 ? " active file operation. Incomplete staged copies will be removed."
                               : " active file operations. Incomplete staged copies will be removed."),
-      {{"Cancel", 0}, {"Quit", 1}},
+      {{"Cancel", 0, filemanager::DialogChoiceStyle::Cancel}, {"Quit", 1, filemanager::DialogChoiceStyle::Destructive}},
       [this](int choice) {
         if (choice != 1)
           return;
@@ -4244,7 +3362,7 @@ void FileManager::requestQuit(ToplevelSurface* parent) {
         m_quitting = true;
         if (m_surface && m_windowOpen)
           ToplevelSurface::handleToplevelClose(m_surface.get(), nullptr);
-        if (!m_operations.active() && m_transfers.pendingClipboardReads() == 0)
+        if (!m_operations.active() && m_clipboard.pendingClipboardReads() == 0)
           m_running = false;
       },
       parent
@@ -4254,22 +3372,22 @@ void FileManager::requestQuit(ToplevelSurface* parent) {
 std::optional<std::filesystem::path> FileManager::checksumTarget() const {
   const auto& tab = activeTab();
   if (!tab.capabilities().canChecksum
-      || !tab.selectedPath
-      || !tab.selectedPaths.contains(tab.selectedPath->string())
-      || tab.selectedPaths.size() != 1
+      || !tab.selectedPath()
+      || !tab.isPathSelected(tab.selectedPath()->string())
+      || tab.selectionCount() != 1
       || tab.session.loading()
       || tab.session.browsingTrash())
     return std::nullopt;
-  if (tab.hasActiveAdminSession() && !filemanager::userCanReadPath(*tab.selectedPath)) {
-    const auto entry = std::ranges::find(tab.session.entries(), *tab.selectedPath, &FileEntry::absPath);
+  if (tab.hasActiveAdminSession() && !filemanager::userCanReadPath(*tab.selectedPath())) {
+    const auto entry = std::ranges::find(tab.session.entries(), *tab.selectedPath(), &FileEntry::absPath);
     if (entry != tab.session.entries().end()
         && !entry->isDir
         && !entry->isSymlink
         && !entry->type.starts_with("inode/"))
-      return tab.selectedPath;
+      return tab.selectedPath();
     return std::nullopt;
   }
-  return filemanager::checksum::eligibleSelection(*tab.selectedPath, 1, true) ? tab.selectedPath : std::nullopt;
+  return filemanager::checksum::eligibleSelection(*tab.selectedPath(), 1, true) ? tab.selectedPath() : std::nullopt;
 }
 
 std::array<ContextMenuControlEntry, 2> FileManager::checksumMenuEntries() const {
@@ -4301,12 +3419,11 @@ void FileManager::showChecksumDialog(bool verify) {
 }
 
 void FileManager::showDialog(
-    std::string title, std::string message, std::vector<std::pair<std::string, int>> choices,
-    std::function<void(int)> response, ToplevelSurface* parent, bool applyToAllCheckbox, bool alternativeName
+    std::string title, std::string message, std::vector<filemanager::DialogChoice> choices,
+    std::function<void(int)> response, ToplevelSurface* parent, filemanager::DialogStyle style
 ) {
   m_modalDialog.showDialog(
-      std::move(title), std::move(message), std::move(choices), std::move(response), parent, applyToAllCheckbox,
-      alternativeName
+      std::move(title), std::move(message), std::move(choices), std::move(response), parent, std::nullopt, style
   );
 }
 
@@ -4469,8 +3586,7 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
       m_statusStrip->setPadding(std::clamp((m_statusHeight - fontSize) * 0.5F, 2.0F, 7.0F), 10.0F);
       m_statusLabel->setFontSize(fontSize);
       m_statusDetailLabel->setFontSize(fontSize);
-      m_searchStatus->setFontSize(fontSize);
-      m_searchSpinner->setSpinnerSize(fontSize);
+      m_searchBarController.setStatusFontSize(fontSize);
       m_surface->requestLayout();
       return;
     }
@@ -4498,7 +3614,7 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
       && (m_keyboardModifiers & KeyMod::Ctrl)
       && !m_transfers.isDragPending()
       && !m_transfers.isDraggingFiles()
-      && !m_reordering
+      && !m_places.isReordering()
       && m_grid
       && !m_renamePath) {
     float gx = 0, gy = 0;
@@ -4515,73 +3631,8 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
       return;
     }
   }
-  auto rowAt = [&]() -> std::optional<std::size_t> { return m_places.rowIndexAt(x, y); };
-  if (m_reorderId) {
-    const auto& placeRows = m_places.placeRows();
-    const auto source =
-        std::ranges::find_if(placeRows, [this](const auto& pair) { return pair.second.identity == *m_reorderId; });
-    if (event.type == PointerEvent::Type::Axis && m_reordering) {
-      m_dispatcher.pointerAxis(
-          x, y, event.axis, event.axisSource, event.axisValue, event.axisDiscrete, event.axisValue120, event.axisLines,
-          event.axisGestureSerial
-      );
-      if (source != placeRows.end()) {
-        const auto& place = source->second;
-        m_reorderBefore = m_places.placeInsertionAt(
-            x, y,
-            place.personal      ? "Personal"
-                : place.network ? "Network"
-                                : "Devices",
-            false
-        );
-        m_places.showPlaceInsertion(m_reorderBefore);
-        m_surface->requestRedraw();
-      }
-      return;
-    }
-    if (event.type == PointerEvent::Type::Motion) {
-      if (std::hypot(x - m_dragStartX, y - m_dragStartY) > 5.0F)
-        m_reordering = true;
-      m_reorderBefore.reset();
-      if (m_reordering && source != placeRows.end()) {
-        const auto& place = source->second;
-        m_reorderBefore = m_places.placeInsertionAt(
-            x, y,
-            place.personal      ? "Personal"
-                : place.network ? "Network"
-                                : "Devices",
-            false
-        );
-      }
-      m_places.showPlaceInsertion(m_reorderBefore);
-      if (m_pointerSerial && m_reordering)
-        m_wayland.setCursorShape(
-            m_pointerSerial,
-            m_reorderBefore ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED
-        );
-      m_surface->requestRedraw();
-      return;
-    }
-    if (event.type == PointerEvent::Type::Button && event.button == BTN_LEFT && !event.pressed) {
-      if (m_reordering && m_reorderBefore)
-        m_places.reorderPlace(*m_reorderId, *m_reorderBefore);
-      else if (!m_reordering && source != placeRows.end()) {
-        const auto place = source->second;
-        if (place.mounted)
-          navigate(place.path);
-      }
-      m_reorderId.reset();
-      m_reorderBefore.reset();
-      m_reordering = false;
-      m_places.showPlaceInsertion(std::nullopt);
-      m_dispatcher.cancelPointerCapture();
-      if (m_pointerSerial)
-        m_wayland.setCursorShape(m_pointerSerial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
-      m_surface->requestRedraw();
-      return;
-    }
+  if (m_places.handleActiveReorderPointer(event, x, y, m_pointerSerial))
     return;
-  }
   if (m_transfers.handleFileDragPointer(event, x, y))
     return;
   if (!m_resizingSidebar && handlePreviewDivider(event, x, y))
@@ -4641,85 +3692,27 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
       return;
     }
   }
-  if (m_grid && m_grid->rubberBandActive()) {
-    if (event.type == PointerEvent::Type::Motion)
-      m_grid->updateRubberBand(x, y);
-    else if (event.type == PointerEvent::Type::Button && event.button == BTN_LEFT && !event.pressed)
-      m_grid->endRubberBand();
-    else if (event.type == PointerEvent::Type::Axis)
-      m_dispatcher.pointerAxis(
-          x, y, event.axis, event.axisSource, event.axisValue, event.axisDiscrete, event.axisValue120, event.axisLines,
-          event.axisGestureSerial
-      );
+  if (m_selection.handleActiveRubberBandPointer(event, x, y))
     return;
-  }
   if (event.type == PointerEvent::Type::Button && event.pressed) {
-    if (m_fileViewFocusVisible) {
-      m_fileViewFocusVisible = false;
+    if (m_selection.focusVisible()) {
+      m_selection.setFocusVisible(false);
       if (m_grid)
         m_grid->notifyDataChanged();
     }
   }
-  if (event.type == PointerEvent::Type::Button && event.button == BTN_LEFT && event.pressed) {
-    if (auto row = rowAt()) {
-      const auto& place = m_places.placeRows()[*row].second;
-      {
-        m_reorderId = place.identity;
-        m_dragStartX = x;
-        m_dragStartY = y;
-        m_reordering = false;
-        m_dispatcher.cancelPointerCapture();
-        return;
-      }
-    }
-    auto& tab = activeTab();
-    const auto& session = tab.session;
-    // Leave clicks on tabs without drag support to the normal grid dispatcher.
-    if (tab.capabilities().canDragSource && m_grid && !m_renamePath && !m_places.hasActiveDeviceOperations()) {
-      if (auto index = m_grid->indexAtSurface(x, y)) {
-        m_transfers.beginFileDragPress(*index, x, y, event.serial);
-        const bool preserve = tab.selectedPaths.contains(session.entries()[*index].absPath.string())
-            && !(m_keyboardModifiers & (KeyMod::Ctrl | KeyMod::Shift));
-        m_restoringSelection = true;
-        if (!preserve)
-          m_grid->setSelectedIndex(std::nullopt, false);
-        m_restoringSelection = preserve;
-        m_grid->setSelectedIndex(index, false);
-        m_restoringSelection = false;
-        m_dispatcher.setFocus(m_grid->focusArea());
-        return;
-      }
-    }
-  }
+  if (m_places.tryBeginReorderPress(event, x, y))
+    return;
   if (event.type == PointerEvent::Type::Button
       && event.button == BTN_LEFT
       && event.pressed
-      && m_grid
-      && !m_renamePath) {
-    const auto& tab = activeTab();
-    m_rubberBaseline = tab.selectedPaths;
-    m_rubberSelectedPath = tab.selectedPath;
-    m_rubberAnchor = tab.selectionAnchor;
-    m_rubberModifiers = m_keyboardModifiers;
-    if (m_grid->beginRubberBand(x, y)) {
-      m_dispatcher.pointerLeave();
-      TooltipManager::instance().forceDestroy();
-      m_selectionTick = std::chrono::steady_clock::now();
-      m_selectionTimer.startRepeating(std::chrono::milliseconds(16), [this] {
-        const auto now = std::chrono::steady_clock::now();
-        const float seconds = std::chrono::duration<float>(now - m_selectionTick).count();
-        m_selectionTick = now;
-        if (m_grid)
-          m_grid->advanceRubberBandScroll(std::min(seconds, 0.05F));
-        if (m_surface)
-          m_surface->requestLayout();
-      });
-      m_lastPointerIndex.reset();
-      m_dispatcher.cancelPointerCapture();
-      m_dispatcher.setFocus(m_grid->focusArea());
-      return;
-    }
-  }
+      && m_selection.handleDragPressSelection(x, y, event.serial))
+    return;
+  if (event.type == PointerEvent::Type::Button
+      && event.button == BTN_LEFT
+      && event.pressed
+      && m_selection.tryBeginRubberBand(x, y))
+    return;
   switch (event.type) {
   case PointerEvent::Type::Enter:
     m_dispatcher.pointerEnter(x, y, event.serial);
@@ -4733,7 +3726,7 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
   case PointerEvent::Type::Button:
     if (event.button == BTN_LEFT || event.button == BTN_RIGHT || event.button == BTN_MIDDLE) {
       if (event.pressed && event.button == BTN_LEFT)
-        m_pointerClickTime = event.time;
+        m_selection.recordPointerClickTime(event.time);
       m_dispatcher.pointerButton(x, y, event.button, event.pressed, event.serial, event.time, false);
       // The virtual canvas only covers populated rows. The remainder of the
       // grid viewport still belongs to the directory background.
@@ -4756,19 +3749,20 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
 }
 
 void FileManager::openLocationContextMenu(float x, float y, bool highlightOnOpen) {
+  using namespace filemanager::menu_id;
   if (m_locationInput == nullptr)
     return;
   const bool selected = m_locationInput->hasTextSelection();
   const bool hasClipboardText = m_transfer.selectionOffersText();
   std::vector<ContextMenuControlEntry> entries{
-      {.id = 90, .label = "Cut", .enabled = selected && !m_locationInput->readOnly()},
-      {.id = 91, .label = "Copy", .enabled = selected},
-      {.id = 92,
+      {.id = kLocationCut, .label = "Cut", .enabled = selected && !m_locationInput->readOnly()},
+      {.id = kLocationCopy, .label = "Copy", .enabled = selected},
+      {.id = kLocationPaste,
        .label = "Paste",
        .enabled = hasClipboardText && !m_locationInput->readOnly(),
        .actionIconNames = {"edit-paste-symbolic", "edit-paste"},
        .actionGlyph = "U+EA6F"},
-      {.id = 93, .label = "Select All", .enabled = !m_locationInput->value().empty()},
+      {.id = kLocationSelectAll, .label = "Select All", .enabled = !m_locationInput->value().empty()},
   };
   m_menus.openColumnHeaderMenu(std::move(entries), x, y, highlightOnOpen);
 }
@@ -4791,7 +3785,7 @@ void FileManager::openFocusedContextMenu() {
   }
   if (m_grid == nullptr)
     return;
-  m_fileViewFocusVisible = true;
+  m_selection.setFocusVisible(true);
   m_dispatcher.setFocus(m_grid->focusArea());
   float gx = 0.0F;
   float gy = 0.0F;
@@ -4832,204 +3826,6 @@ bool FileManager::handleSidebarKeyboardNavigation(std::uint32_t sym, std::uint32
   return true;
 }
 
-bool FileManager::navigateFileViewByKeyboard(std::uint32_t sym, std::uint32_t mods) {
-  const auto& entries = activeSession().entries();
-  if (m_grid == nullptr || entries.empty())
-    return false;
-  const std::size_t cols = std::max<std::size_t>(1, m_grid->layoutColumnCount());
-  if (cols == 1 && (KeySymbol::isLeft(sym) || KeySymbol::isRight(sym)))
-    return false;
-
-  const std::size_t pageStride = std::max<std::size_t>(cols, m_grid->pageItemStride());
-  const auto current = m_grid->selectedIndex();
-  std::size_t target = 0;
-
-  if (!current.has_value()) {
-    if (KeySymbol::isDown(sym) || KeySymbol::isRight(sym) || KeySymbol::isHome(sym) || KeySymbol::isPageDown(sym))
-      target = 0;
-    else
-      target = entries.size() - 1;
-  } else {
-    const std::size_t idx = std::min(*current, entries.size() - 1);
-    if (KeySymbol::isHome(sym)) {
-      target = 0;
-    } else if (KeySymbol::isEnd(sym)) {
-      target = entries.size() - 1;
-    } else if (KeySymbol::isLeft(sym) || KeySymbol::isRight(sym)) {
-      const bool backward = Style::rtl() ? KeySymbol::isRight(sym) : KeySymbol::isLeft(sym);
-      if (backward)
-        target = idx > 0 ? idx - 1 : 0;
-      else
-        target = idx + 1 < entries.size() ? idx + 1 : idx;
-    } else if (KeySymbol::isUp(sym)) {
-      target = idx >= cols ? idx - cols : idx;
-    } else if (KeySymbol::isDown(sym)) {
-      if (idx + cols < entries.size()) {
-        target = idx + cols;
-      } else {
-        const std::size_t rowStart = (idx / cols) * cols;
-        target = (rowStart + cols < entries.size()) ? (entries.size() - 1) : idx;
-      }
-    } else if (KeySymbol::isPageUp(sym)) {
-      target = idx > pageStride ? idx - pageStride : 0;
-    } else if (KeySymbol::isPageDown(sym)) {
-      target = std::min(entries.size() - 1, idx + pageStride);
-    }
-  }
-
-  m_typeaheadQuery.clear();
-  m_fileViewFocusVisible = true;
-  m_dispatcher.setFocus(m_grid->focusArea());
-  auto& tab = activeTab();
-  recordAdminTabUserActivity(tab);
-  const bool ctrl = (mods & KeyMod::Ctrl) != 0U;
-  const bool shift = (mods & KeyMod::Shift) != 0U;
-  if (shift) {
-    if (!tab.selectionAnchor.has_value())
-      tab.selectionAnchor =
-          (current.has_value() && *current < entries.size()) ? entries[*current].absPath : entries[target].absPath;
-    const auto anchor = std::ranges::find(entries, *tab.selectionAnchor, &FileEntry::absPath);
-    const std::size_t anchorIdx = anchor != entries.end() ? static_cast<std::size_t>(anchor - entries.begin()) : target;
-    const std::size_t first = std::min(anchorIdx, target);
-    const std::size_t last = std::max(anchorIdx, target);
-    if (!ctrl)
-      tab.selectedPaths.clear();
-    for (std::size_t i = first; i <= last; ++i)
-      tab.selectedPaths.insert(entries[i].absPath.string());
-    tab.selectedPath = entries[target].absPath;
-  } else if (ctrl) {
-    // Ctrl+Arrow moves focus cursor independently while keeping existing selection intact.
-    tab.selectedPath = entries[target].absPath;
-  } else {
-    tab.selectedPaths.clear();
-    tab.selectedPaths.insert(entries[target].absPath.string());
-    tab.selectedPath = entries[target].absPath;
-    tab.selectionAnchor = entries[target].absPath;
-  }
-
-  m_restoringSelection = true;
-  m_grid->setSelectedIndex(target, true);
-  m_restoringSelection = false;
-  m_grid->notifyDataChanged();
-  updateSelectionSummary();
-  if (m_surface)
-    m_surface->requestRedraw();
-  return true;
-}
-
-bool FileManager::handleFileViewSpaceSelection(std::uint32_t mods) {
-  const auto& entries = activeSession().entries();
-  if (m_grid == nullptr || entries.empty())
-    return false;
-  const std::size_t idx = std::min(m_grid->selectedIndex().value_or(0), entries.size() - 1);
-  m_fileViewFocusVisible = true;
-  m_dispatcher.setFocus(m_grid->focusArea());
-  auto& tab = activeTab();
-  recordAdminTabUserActivity(tab);
-  const std::string path = entries[idx].absPath.string();
-  const bool ctrl = (mods & KeyMod::Ctrl) != 0U;
-  const bool shift = (mods & KeyMod::Shift) != 0U;
-
-  if (ctrl && !shift) {
-    if (!tab.selectedPaths.erase(path))
-      tab.selectedPaths.insert(path);
-    tab.selectedPath = entries[idx].absPath;
-    tab.selectionAnchor = entries[idx].absPath;
-  } else if (shift) {
-    if (!tab.selectionAnchor.has_value())
-      tab.selectionAnchor = entries[idx].absPath;
-    const auto anchor = std::ranges::find(entries, *tab.selectionAnchor, &FileEntry::absPath);
-    const std::size_t anchorIdx = anchor != entries.end() ? static_cast<std::size_t>(anchor - entries.begin()) : idx;
-    const std::size_t first = std::min(anchorIdx, idx);
-    const std::size_t last = std::max(anchorIdx, idx);
-    if (!ctrl)
-      tab.selectedPaths.clear();
-    for (std::size_t i = first; i <= last; ++i)
-      tab.selectedPaths.insert(entries[i].absPath.string());
-    tab.selectedPath = entries[idx].absPath;
-  } else {
-    tab.selectedPaths.clear();
-    tab.selectedPaths.insert(path);
-    tab.selectedPath = entries[idx].absPath;
-    tab.selectionAnchor = entries[idx].absPath;
-  }
-
-  m_restoringSelection = true;
-  m_grid->setSelectedIndex(idx, true);
-  m_restoringSelection = false;
-  m_grid->notifyDataChanged();
-  updateSelectionSummary();
-  if (m_surface)
-    m_surface->requestRedraw();
-  return true;
-}
-
-bool FileManager::handleFileViewTypeahead(std::uint32_t utf32) {
-  const auto& entries = activeSession().entries();
-  if (m_grid == nullptr || entries.empty())
-    return false;
-  const std::string chRaw = StringUtils::utf32ToUtf8(utf32);
-  if (chRaw.empty())
-    return false;
-  g_autofree gchar* chFoldedRaw = g_utf8_casefold(chRaw.c_str(), static_cast<gssize>(chRaw.size()));
-  const std::string ch = chFoldedRaw ? chFoldedRaw : StringUtils::toLower(chRaw);
-  if (ch.empty())
-    return false;
-
-  const auto now = std::chrono::steady_clock::now();
-  constexpr auto kTypeaheadTimeout = std::chrono::milliseconds(800);
-  bool cycleSameLetter = false;
-  if (now - m_typeaheadLastTime > kTypeaheadTimeout) {
-    m_typeaheadQuery = ch;
-  } else if (m_typeaheadQuery == ch) {
-    cycleSameLetter = true;
-  } else {
-    m_typeaheadQuery += ch;
-  }
-  m_typeaheadLastTime = now;
-
-  const auto findMatch = [&entries](std::string_view prefix, std::size_t startIndex) -> std::optional<std::size_t> {
-    const std::size_t count = entries.size();
-    for (std::size_t offset = 0; offset < count; ++offset) {
-      const std::size_t idx = (startIndex + offset) % count;
-      g_autofree gchar* foldedNameRaw =
-          g_utf8_casefold(entries[idx].name.c_str(), static_cast<gssize>(entries[idx].name.size()));
-      const std::string_view foldedName =
-          foldedNameRaw ? std::string_view(foldedNameRaw) : std::string_view(entries[idx].name);
-      if (foldedName.starts_with(prefix))
-        return idx;
-    }
-    return std::nullopt;
-  };
-
-  const auto current = m_grid->selectedIndex();
-  const std::size_t startIdx = current.has_value() ? (cycleSameLetter ? (*current + 1) % entries.size() : *current) : 0;
-  std::optional<std::size_t> match = findMatch(m_typeaheadQuery, startIdx);
-  if (!match.has_value() && m_typeaheadQuery.size() > ch.size()) {
-    m_typeaheadQuery = ch;
-    match = findMatch(m_typeaheadQuery, current.has_value() ? (*current + 1) % entries.size() : 0);
-  }
-  if (!match.has_value())
-    return false;
-
-  m_fileViewFocusVisible = true;
-  m_dispatcher.setFocus(m_grid->focusArea());
-  auto& tab = activeTab();
-  recordAdminTabUserActivity(tab);
-  tab.selectedPaths.clear();
-  tab.selectedPaths.insert(entries[*match].absPath.string());
-  tab.selectedPath = entries[*match].absPath;
-  tab.selectionAnchor = entries[*match].absPath;
-  m_restoringSelection = true;
-  m_grid->setSelectedIndex(*match, true);
-  m_restoringSelection = false;
-  m_grid->notifyDataChanged();
-  updateSelectionSummary();
-  if (m_surface)
-    m_surface->requestRedraw();
-  return true;
-}
-
 void FileManager::handleKeyboard(const KeyboardEvent& event) {
   if (!m_surface || m_wayland.lastKeyboardSurface() != m_surface->wlSurface())
     return;
@@ -5059,7 +3855,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
     if (event.repeat)
       return;
     m_quitConfirmation = false;
-    m_typeaheadQuery.clear();
+    m_selection.clearTypeahead();
     if (m_menus.isContextMenuOpen()) {
       m_menus.closeContextMenu();
       return;
@@ -5084,17 +3880,8 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       m_transfer.cancelDrag();
       return;
     }
-    if (m_transfers.isDragPending()
-        || m_transfers.isDraggingFiles()
-        || m_reorderId
-        || m_listHeader.gestureActive()
-        || m_tabBar.gestureActive()
-        || m_resizingSidebar
-        || m_previewResize
-        || m_resizingStatus
-        || (m_grid && m_grid->rubberBandActive())) {
-      if (m_grid)
-        m_grid->endRubberBand(true);
+    if (hasActiveGesture()) {
+      m_selection.cancelRubberBand();
       if (m_listHeader.gestureActive()) {
         m_dispatcher.cancelPointerCapture();
         m_listHeader.cancelGesture();
@@ -5103,10 +3890,9 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
         m_dispatcher.cancelPointerCapture();
         m_tabBar.cancelGesture();
       }
-      m_reordering = m_resizingSidebar = m_resizingStatus = false;
+      m_resizingSidebar = m_resizingStatus = false;
       m_previewResize.reset();
-      m_reorderId.reset();
-      m_reorderBefore.reset();
+      m_places.cancelGesture();
       m_transfers.cancelLocalDragState();
       return;
     }
@@ -5117,20 +3903,13 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
         closeSearch();
       return;
     }
-    if (!activeTab().selectedPaths.empty())
+    if (activeTab().hasSelection())
       changeSelection(SelectionChange::None);
-    m_transfers.cancelCutSelection();
+    m_clipboard.cancelCutSelection();
     return;
   }
 
-  if (m_transfers.isDragPending()
-      || m_transfers.isDraggingFiles()
-      || m_reorderId
-      || m_listHeader.gestureActive()
-      || m_tabBar.gestureActive()
-      || m_resizingSidebar
-      || m_previewResize
-      || (m_grid && m_grid->rubberBandActive()))
+  if (hasActiveGesture(false))
     return;
 
   if (mods == KeyMod::Ctrl
@@ -5155,14 +3934,11 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
     return;
   }
 
-  const bool inFilterInput = focused && std::ranges::any_of(m_searchFilterUi.values, [focused](const Input* input) {
-                               return input && focused == input->inputArea();
-                             });
-  if ((m_searchInput && focused == m_searchInput->inputArea()) || inFilterInput) {
+  if (m_searchBarController.ownsFocusedInput(focused)) {
     if ((mods == 0U && event.sym == XKB_KEY_F5)
         || (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_r || event.sym == XKB_KEY_R))) {
       if (!event.repeat)
-        activateContextMenuEntry({.id = 13});
+        activateContextMenuEntry({.id = filemanager::menu_id::kRefresh});
       return;
     }
     m_dispatcher.keyEvent(event.sym, event.utf32, event.modifiers, true, event.preedit, event.repeat);
@@ -5264,12 +4040,12 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
 
   if (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_q || event.sym == XKB_KEY_Q)) {
     if (!event.repeat)
-      activateContextMenuEntry(ContextMenuControlEntry{.id = 30007});
+      activateContextMenuEntry(ContextMenuControlEntry{.id = filemanager::menu_id::kQuit});
     return;
   }
   if (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_n || event.sym == XKB_KEY_N)) {
     if (!event.repeat)
-      activateContextMenuEntry(ContextMenuControlEntry{.id = 30001});
+      activateContextMenuEntry(ContextMenuControlEntry{.id = filemanager::menu_id::kFileNewWindow});
     return;
   }
   if ((mods == KeyMod::Ctrl && (event.sym == XKB_KEY_l || event.sym == XKB_KEY_L))
@@ -5376,24 +4152,30 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
     return;
   }
   if (mods == KeyMod::Alt && KeySymbol::isEnter(event.sym)) {
-    if (!event.repeat && activeTab().selectedPath) {
-      openProperties(*activeTab().selectedPath);
+    if (!event.repeat && activeTab().selectedPath()) {
+      openProperties(*activeTab().selectedPath());
     }
     return;
   }
   if (mods == 0U && event.sym == XKB_KEY_F2) {
     if (!event.repeat)
-      activateContextMenuEntry(ContextMenuControlEntry{.id = 4});
+      activateContextMenuEntry(ContextMenuControlEntry{.id = filemanager::menu_id::kRename});
     return;
   }
   if (mods == (KeyMod::Ctrl | KeyMod::Shift) && (event.sym == XKB_KEY_n || event.sym == XKB_KEY_N)) {
     if (!event.repeat && !activeSession().browsingTrash())
-      activateContextMenuEntry(ContextMenuControlEntry{.id = 111});
+      activateContextMenuEntry(ContextMenuControlEntry{.id = filemanager::menu_id::kCreateFolder});
     return;
   }
   if ((mods == 0U || mods == KeyMod::Shift) && (event.sym == XKB_KEY_Delete || event.sym == XKB_KEY_KP_Delete)) {
-    if (!event.repeat)
-      activateContextMenuEntry(ContextMenuControlEntry{.id = (mods == KeyMod::Shift) ? 6 : 5});
+    if (!event.repeat) {
+      const bool permanent = mods == KeyMod::Shift || activeTab().administratorBrowsing;
+      activateContextMenuEntry(
+          ContextMenuControlEntry{
+              .id = permanent ? filemanager::menu_id::kDeletePermanently : filemanager::menu_id::kTrash
+          }
+      );
+    }
     return;
   }
   if (mods == 0U && event.sym == XKB_KEY_BackSpace) {
@@ -5402,27 +4184,13 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
     return;
   }
   if (mods == KeyMod::Alt && event.sym == XKB_KEY_Left) {
-    if (!event.repeat) {
-      auto& session = activeSession();
-      if (!session.backHistory().empty()) {
-        auto path = session.backHistory().back();
-        session.backHistory().pop_back();
-        session.forwardHistory().push_back(session.location());
-        navigateLocation(std::move(path), false);
-      }
-    }
+    if (!event.repeat)
+      navigateBack();
     return;
   }
   if (mods == KeyMod::Alt && event.sym == XKB_KEY_Right) {
-    if (!event.repeat) {
-      auto& session = activeSession();
-      if (!session.forwardHistory().empty()) {
-        auto path = session.forwardHistory().back();
-        session.forwardHistory().pop_back();
-        session.backHistory().push_back(session.location());
-        navigateLocation(std::move(path), false);
-      }
-    }
+    if (!event.repeat)
+      navigateForward();
     return;
   }
   if (mods == KeyMod::Alt && event.sym == XKB_KEY_Up) {
@@ -5437,7 +4205,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
   }
   if (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_h || event.sym == XKB_KEY_H)) {
     if (!event.repeat)
-      activateContextMenuEntry(ContextMenuControlEntry{.id = 50});
+      activateContextMenuEntry(ContextMenuControlEntry{.id = filemanager::menu_id::kShowHidden});
     return;
   }
   if ((mods == KeyMod::Ctrl && (event.sym == XKB_KEY_plus || event.sym == XKB_KEY_equal || event.sym == XKB_KEY_KP_Add))
@@ -5457,7 +4225,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
   if ((mods == 0U && event.sym == XKB_KEY_F5)
       || (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_r || event.sym == XKB_KEY_R))) {
     if (!event.repeat)
-      activateContextMenuEntry({.id = 13});
+      activateContextMenuEntry({.id = filemanager::menu_id::kRefresh});
     return;
   }
 
@@ -5465,7 +4233,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       || KeybindMatcher::matches(KeybindAction::TabPrevious, event.sym, event.modifiers)) {
     m_dispatcher.keyEvent(event.sym, event.utf32, event.modifiers, event.pressed, event.preedit, event.repeat);
     if (m_grid != nullptr && m_dispatcher.focusedArea() == m_grid->focusArea()) {
-      m_fileViewFocusVisible = true;
+      m_selection.setFocusVisible(true);
       m_grid->notifyDataChanged();
       if (m_surface)
         m_surface->requestRedraw();
@@ -5499,19 +4267,17 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
           || KeySymbol::isEnd(event.sym)
           || KeySymbol::isPageUp(event.sym)
           || KeySymbol::isPageDown(event.sym))) {
-    (void)navigateFileViewByKeyboard(event.sym, mods);
+    (void)m_selection.navigateByKeyboard(event.sym, mods);
     return;
   }
 
   if ((mods & (KeyMod::Alt | KeyMod::Super)) == 0U && KeySymbol::isSpace(event.sym)) {
     if (!event.repeat) {
       constexpr auto kTypeaheadTimeout = std::chrono::milliseconds(800);
-      if (mods == 0U
-          && !m_typeaheadQuery.empty()
-          && (std::chrono::steady_clock::now() - m_typeaheadLastTime <= kTypeaheadTimeout)) {
-        (void)handleFileViewTypeahead(' ');
+      if (mods == 0U && m_selection.isTypeaheadActive(kTypeaheadTimeout)) {
+        (void)m_selection.handleTypeahead(' ');
       } else if (mods != 0U || !openQuickLook()) {
-        (void)handleFileViewSpaceSelection(mods);
+        (void)m_selection.handleSpaceSelection(mods);
       }
     }
     return;
@@ -5519,7 +4285,7 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
 
   if ((mods & (KeyMod::Ctrl | KeyMod::Alt | KeyMod::Super)) == 0U && event.utf32 > 0x20U && event.utf32 != 0x7FU) {
     if (!event.repeat)
-      (void)handleFileViewTypeahead(event.utf32);
+      (void)m_selection.handleTypeahead(event.utf32);
     return;
   }
 

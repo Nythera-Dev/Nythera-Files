@@ -175,7 +175,7 @@ namespace filemanager {
           if (const auto locked = alive.lock(); locked && *locked)
             clearState();
         },
-        nullptr, false, false, makeShortcutsCustomContent()
+        nullptr, makeShortcutsCustomContent()
     );
     if (!m_dialogHost.isOpen())
       clearState();
@@ -193,7 +193,7 @@ namespace filemanager {
           if (const auto locked = alive.lock(); locked && *locked)
             clearState();
         },
-        nullptr, false, false, makeAboutCustomContent()
+        nullptr, makeAboutCustomContent()
     );
     if (!m_dialogHost.isOpen())
       clearState();
