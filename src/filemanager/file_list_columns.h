@@ -1,10 +1,13 @@
 #pragma once
 
 #include "core/files/display_text.h"
+#include "filemanager/directory_session.h"
 #include "filemanager/file_columns.h"
 #include "render/core/renderer.h"
+#include "ui/dialogs/file_entry_row.h"
 #include "ui/style.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <optional>
 
@@ -61,6 +64,23 @@ namespace filemanager {
       left = right + gap;
     }
     return {left, left};
+  }
+
+  inline std::string fileColumnText(const DirectorySession& session, const FileEntry& entry, FileColumn column) {
+    const auto location =
+        session.search().active() && column == kSearchLocationSlot ? searchLocationText(entry.absPath) : std::string{};
+    const auto count = column == FileColumn::Size && entry.isDir ? session.cachedFolderItemCount(entry) : std::nullopt;
+    return FileEntryRow::columnText(entry, column, count, location);
+  }
+
+  inline float measureFileColumn(Renderer& renderer, const DirectorySession& session, FileColumn column) {
+    const bool searchView = session.search().active();
+    float width = 0;
+    for (const auto& entry : session.entries()) {
+      const auto text = fileColumnText(session, entry, column);
+      width = std::max(width, measureListColumnText(renderer, column, searchView, text));
+    }
+    return width;
   }
 
 } // namespace filemanager

@@ -2,6 +2,7 @@
 
 #include "core/files/directory_scanner.h"
 #include "filemanager/file_archive_actions.h"
+#include "filemanager/menu_ids.h"
 #include "ui/controls/context_menu.h"
 
 #include <algorithm>
@@ -9,8 +10,8 @@
 #include <utility>
 
 namespace filemanager {
-  inline constexpr int kQuickLookMenuId = 30400;
-  inline constexpr int kGoToLinkTargetMenuId = 30411;
+  inline constexpr int kQuickLookMenuId = menu_id::kQuickLook;
+  inline constexpr int kGoToLinkTargetMenuId = menu_id::kGoToLinkTarget;
   enum class FileMenuContext {
     Toolbar,
     File,
@@ -26,22 +27,34 @@ namespace filemanager {
     using Group = std::vector<int>;
     std::vector<Group> groups;
     const bool fileOrFolder = context == FileMenuContext::File || context == FileMenuContext::Folder;
-    constexpr int propertiesId = 22;
+    constexpr int propertiesId = menu_id::kProperties;
     if (fileOrFolder) {
       groups = {
-          {10, 80, kQuickLookMenuId, kGoToLinkTargetMenuId, 30013, 60, 30151},
-          {2, 1, 3, 59},
-          {110},
-          {119, 4, 5, 6},
+          {menu_id::kOpen, menu_id::kOpenWithSubmenu, menu_id::kQuickLook, menu_id::kGoToLinkTarget,
+           menu_id::kOpenFolderInNewTab, menu_id::kOpenFolderNewWindow, menu_id::kOpenFolderAsAdministrator},
+          {menu_id::kCut, menu_id::kCopy, menu_id::kPaste, menu_id::kCopyLocation},
+          {menu_id::kCreateNewSubmenu},
+          {menu_id::kDuplicate, menu_id::kRename, menu_id::kTrash, menu_id::kDeletePermanently},
           {menu_id::kArchiveCompress, menu_id::kArchiveExtract},
-          {20, 31, 100},
-          {30152},
-          {30104, 30105},
+          {menu_id::kPinTargetToPlaces, menu_id::kPlaceRemove, menu_id::kSortBySubmenu},
+          {menu_id::kSaveProtectedChanges},
+          {menu_id::kCalculateChecksum, menu_id::kVerifyChecksum},
       };
     } else if (context == FileMenuContext::Empty) {
-      groups = {{3}, {110}, {14, 50, 100}, {21}};
+      groups = {
+          {menu_id::kPaste},
+          {menu_id::kCreateNewSubmenu},
+          {menu_id::kToggleViewMode, menu_id::kShowHidden, menu_id::kSortBySubmenu},
+          {menu_id::kPinCurrentToPlaces},
+      };
     } else if (context == FileMenuContext::Places) {
-      groups = {{30, 41, 40}, {33, 34, 35}, {31, 32, 36, 37, 38}, {39}};
+      groups = {
+          {menu_id::kPlaceOpen, menu_id::kPlaceOpenInNewTab, menu_id::kPlaceOpenNewWindow},
+          {menu_id::kPlaceMount, menu_id::kPlaceUnmount, menu_id::kPlaceEject},
+          {menu_id::kPlaceRemove, menu_id::kPlacePin, menu_id::kPlaceHide, menu_id::kPlaceUnhide,
+           menu_id::kPlaceToggleShowHidden},
+          {menu_id::kPlaceProperties},
+      };
     } else {
       return; // Toolbar and Trash retain their existing action order and management scope.
     }
@@ -98,31 +111,35 @@ namespace filemanager {
       };
     };
     std::vector<ContextMenuControlEntry> children{
-        field(53, "Name", FileDialogSortField::Name),
-        field(54, "Size", FileDialogSortField::Size),
-        field(61, "Type", FileDialogSortField::Type),
-        field(55, "Modified", FileDialogSortField::Modified),
-        {.id = 58,
+        field(menu_id::kSortName, "Name", FileDialogSortField::Name),
+        field(menu_id::kSortSize, "Size", FileDialogSortField::Size),
+        field(menu_id::kSortType, "Type", FileDialogSortField::Type),
+        field(menu_id::kSortModified, "Modified", FileDialogSortField::Modified),
+        {.id = menu_id::kSortAscending,
          .label = "Ascending",
          .radio = true,
          .toggleState = sortOrder == FileDialogSortOrder::Ascending ? 1 : 0},
-        {.id = 62,
+        {.id = menu_id::kSortDescending,
          .label = "Descending",
          .radio = true,
          .toggleState = sortOrder == FileDialogSortOrder::Descending ? 1 : 0},
-        {.id = 51, .label = "Folders First", .checkmark = true, .toggleState = foldersFirst ? 1 : 0},
-        {.id = 52, .label = "Hidden Files Last", .checkmark = true, .toggleState = hiddenLast ? 1 : 0}
+        {.id = menu_id::kFoldersFirst,
+         .label = "Folders First",
+         .checkmark = true,
+         .toggleState = foldersFirst ? 1 : 0},
+        {.id = menu_id::kHiddenLast, .label = "Hidden Files Last", .checkmark = true, .toggleState = hiddenLast ? 1 : 0}
     };
     if (search) {
-      children.insert(children.begin() + 1, field(63, "Location", FileDialogSortField::Location));
+      children.insert(children.begin() + 1, field(menu_id::kSortLocation, "Location", FileDialogSortField::Location));
     } else {
       children.insert(
           children.begin() + 4,
-          {field(56, "Created", FileDialogSortField::Created), field(57, "Accessed", FileDialogSortField::Accessed)}
+          {field(menu_id::kSortCreated, "Created", FileDialogSortField::Created),
+           field(menu_id::kSortAccessed, "Accessed", FileDialogSortField::Accessed)}
       );
     }
     return {
-        .id = 100,
+        .id = menu_id::kSortBySubmenu,
         .label = "Sort By",
         .hasSubmenu = true,
         .submenuEntries = std::move(children),
@@ -137,8 +154,13 @@ namespace filemanager {
       bool search = false
   ) {
     if (context == FileMenuContext::Toolbar || context == FileMenuContext::Empty) {
-      entries.push_back({.id = 14, .label = gridMode ? "Switch to List" : "Switch to Grid"});
-      entries.push_back({.id = 50, .label = "Show Hidden Files", .checkmark = true, .toggleState = showHidden ? 1 : 0});
+      entries.push_back({.id = menu_id::kToggleViewMode, .label = gridMode ? "Switch to List" : "Switch to Grid"});
+      entries.push_back(
+          {.id = menu_id::kShowHidden,
+           .label = "Show Hidden Files",
+           .checkmark = true,
+           .toggleState = showHidden ? 1 : 0}
+      );
     }
     entries.push_back(fileSortByMenuEntry(sortField, sortOrder, foldersFirst, hiddenLast, search));
   }

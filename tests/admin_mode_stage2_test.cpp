@@ -981,8 +981,8 @@ private:
     TEST_CHECK(caps.canCopyItems);
 
     // Select regFile and check menu entries.
-    tab.selectedPath = regFile;
-    tab.selectedPaths = {regFile.string()};
+    tab.m_selectedPath = regFile;
+    tab.m_selectedPaths = {regFile.string()};
 
     const auto fileMenu = manager.fileMenuEntries();
     for (int id : {110, 111, 112, 113, static_cast<int>(kManualSymlink), static_cast<int>(kSelectionSymlink)}) {
@@ -1039,7 +1039,7 @@ private:
          })
       manager.handleWindowKeyEvent(shortcut);
     TEST_CHECK(manager.m_operations.operations().size() == opsBefore);
-    TEST_CHECK(manager.m_transfers.pendingClipboardReads() == 0);
+    TEST_CHECK(manager.m_clipboard.pendingClipboardReads() == 0);
     TEST_CHECK(!manager.m_renamePath);
 
     // Files can start a drag. The disconnected test scene still has no drop surface.
@@ -1307,7 +1307,7 @@ private:
     //    - fall back to the default opening location (accessible through the normal backend).
     manager.finishAdministratorMode(tabId, "Exited Administrator Mode.");
     TEST_CHECK(manager.activeSession().entries().empty());
-    TEST_CHECK(manager.activeTab().selectedPaths.empty() && !manager.activeTab().freeSpaceBytes());
+    TEST_CHECK(manager.activeTab().m_selectedPaths.empty() && !manager.activeTab().freeSpaceBytes());
     TEST_CHECK(manager.activeTab().adminSession.status().helperPid == 0);
     pumpUntil([&] { return !manager.activeSession().loading(); });
     TEST_CHECK(!manager.activeTab().hasActiveAdminSession());

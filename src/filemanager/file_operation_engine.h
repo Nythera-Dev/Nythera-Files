@@ -24,19 +24,6 @@ namespace filemanager::file_operation_engine {
   inline constexpr bool isProtectedRead(Kind kind) {
     return kind == Kind::ExportProtectedFile || kind == Kind::ProtectedChecksum || kind == Kind::ProtectedFolderSize;
   }
-  inline constexpr std::size_t kOperationSlots = 5;
-  inline constexpr std::size_t operationSlot(Kind kind, std::string_view operationData) {
-    switch (kind) {
-    case Kind::ExportProtectedFile:
-      return operationData == "thumbnail" ? 2 : 1;
-    case Kind::ProtectedChecksum:
-      return 3;
-    case Kind::ProtectedFolderSize:
-      return 4;
-    default:
-      return 0;
-    }
-  }
   enum class ConflictAction { Replace, Skip, Rename, Cancel, Merge };
 
   struct ConflictDecision {
@@ -156,6 +143,7 @@ namespace filemanager::file_operation_engine {
     std::vector<std::string> movedSources;
     TransferMeasure totalMeasure;
     TransferMeasure completedMeasure;
+    std::size_t skippedTransferEntries = 0;
     std::optional<PropertyResult> properties;
   };
 

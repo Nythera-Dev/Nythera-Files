@@ -252,7 +252,7 @@ public:
       const auto& tab = manager.activeTab();
       if (index >= tab.session.entries().size())
         return false;
-      return tab.selectedPaths.contains(tab.session.entries()[index].absPath.string());
+      return tab.m_selectedPaths.contains(tab.session.entries()[index].absPath.string());
     }
     [[nodiscard]] std::unique_ptr<Node> createTile() override { return std::make_unique<Box>(); }
     void bindTile(Node&, std::size_t, bool, bool) override {}
@@ -325,8 +325,8 @@ public:
 
     TEST_CHECK(manager.activeSession().entries().size() >= 20);
     const auto chosenA = manager.activeSession().entries()[10].absPath;
-    manager.activeTab().selectedPath = chosenA;
-    manager.activeTab().selectedPaths = {chosenA.string()};
+    manager.activeTab().m_selectedPath = chosenA;
+    manager.activeTab().m_selectedPaths = {chosenA.string()};
     manager.restoreSelection(false);
     harness.grid.scrollView().setScrollOffset(120.0F);
     harness.layout();
@@ -349,7 +349,7 @@ public:
     TEST_CHECK(manager.activeSession().path() == dirB);
     TEST_CHECK(manager.activeSession().backHistory().empty());
     TEST_CHECK(manager.activeSession().forwardHistory().empty());
-    TEST_CHECK(!manager.activeTab().selectedPath.has_value());
+    TEST_CHECK(!manager.activeTab().m_selectedPath.has_value());
     TEST_CHECK(manager.activeTab().scrollState.offset == 0.0F);
     TEST_CHECK(!manager.m_listHeader.gridMode());
     TEST_CHECK(manager.m_listHeader.sortField() == FileDialogSortField::Name);
@@ -375,7 +375,7 @@ public:
     TEST_CHECK(!manager.activeSession().hiddenLast());
     TEST_CHECK(manager.activeSession().showHidden());
     TEST_CHECK(manager.m_listHeader.viewScale() == 1.25F);
-    TEST_CHECK(manager.activeTab().selectedPath == chosenA);
+    TEST_CHECK(manager.activeTab().m_selectedPath == chosenA);
     TEST_CHECK(manager.activeTab().scrollState.offset == savedScrollA);
 
     manager.m_tabs.shutdownAll();
@@ -562,7 +562,7 @@ public:
       return true;
     };
 
-    tabA.selectedPaths = {(dirA / "a.txt").string()};
+    tabA.m_selectedPaths = {(dirA / "a.txt").string()};
     tabA.session.queryDirectoryWritableAsync(dirA);
     tabA.queryStatusFreeSpaceAsync(dirA);
     tabA.querySelectionInfoAsync(dirA / "a.txt");
@@ -641,8 +641,8 @@ public:
     const auto navGen = manager.m_tabs.findTab(opOriginId)->session.navigationGeneration();
     const auto opId = manager.m_operations.move({moveFile.string()}, dstDir.string());
     TEST_CHECK(opId != 0);
-    manager.m_transfers.m_cutOperations[opId] = cutSelectionGen;
-    manager.m_transfers.registerPasteRequest(opId, filemanager::PasteRequest{opOriginId, dstDir, navGen});
+    manager.m_clipboard.m_cutOperations[opId] = cutSelectionGen;
+    manager.m_clipboard.registerPasteRequest(opId, filemanager::PasteRequest{opOriginId, dstDir, navGen});
 
     TEST_CHECK(manager.closeTab(opOriginId));
     TEST_CHECK(manager.m_tabs.findTab(opOriginId) == nullptr);
@@ -650,9 +650,9 @@ public:
 
     TEST_CHECK(!std::filesystem::exists(moveFile));
     TEST_CHECK(std::filesystem::exists(dstDir / "cut_item.txt"));
-    TEST_CHECK(manager.m_transfers.m_consumedCutSelection == std::optional<std::uint64_t>{cutSelectionGen});
-    TEST_CHECK(manager.m_transfers.m_cutOperations.empty());
-    TEST_CHECK(manager.m_transfers.m_pasteRequests.empty());
+    TEST_CHECK(manager.m_clipboard.m_consumedCutSelection == std::optional<std::uint64_t>{cutSelectionGen});
+    TEST_CHECK(manager.m_clipboard.m_cutOperations.empty());
+    TEST_CHECK(manager.m_clipboard.m_pasteRequests.empty());
 
     manager.m_tabs.shutdownAll();
   }
@@ -748,20 +748,20 @@ public:
     // Case (a): Start copy into Tab B, switch back to Tab A before completion.
     const auto opId1 = manager.m_operations.copy({src1.string()}, dirB.string());
     TEST_CHECK(opId1 != 0);
-    manager.m_transfers.registerPasteRequest(opId1, filemanager::PasteRequest{tabBId, dirB, navB});
+    manager.m_clipboard.registerPasteRequest(opId1, filemanager::PasteRequest{tabBId, dirB, navB});
     TEST_CHECK(manager.activateTab(tabAId));
 
     pumpUntil([&] { return !manager.m_operations.active(); });
     // Tab A stays untouched while Tab B has pending paste selection + reveal ready for activation.
-    TEST_CHECK(!manager.activeTab().selectedPath.has_value());
+    TEST_CHECK(!manager.activeTab().m_selectedPath.has_value());
     const auto& tabB = *manager.m_tabs.findTab(tabBId);
-    TEST_CHECK(tabB.pendingPasteSelection.has_value() || tabB.selectedPath == dirB / "copy1.txt");
+    TEST_CHECK(tabB.pendingPasteSelection.has_value() || tabB.m_selectedPath == dirB / "copy1.txt");
 
     TEST_CHECK(manager.activateTab(tabBId));
     pumpUntil([&] { return !manager.activeSession().m_loading; });
     harness.layout();
-    TEST_CHECK(manager.activeTab().selectedPath == dirB / "copy1.txt");
-    TEST_CHECK(manager.activeTab().selectedPaths.contains((dirB / "copy1.txt").string()));
+    TEST_CHECK(manager.activeTab().m_selectedPath == dirB / "copy1.txt");
+    TEST_CHECK(manager.activeTab().m_selectedPaths.contains((dirB / "copy1.txt").string()));
     TEST_CHECK(manager.activeTab().scrollState.offset > 0.0F);
 
     // Case (b): With dropScrollGeneration set, user scroll in Tab B keeps selection but suppresses reveal.
@@ -771,7 +771,7 @@ public:
     const auto dropScrollGen = manager.activeTab().scrollState.userScrollGeneration;
     const auto opId2 = manager.m_operations.copy({src2.string()}, dirB.string());
     TEST_CHECK(opId2 != 0);
-    manager.m_transfers.registerPasteRequest(
+    manager.m_clipboard.registerPasteRequest(
         opId2,
         filemanager::PasteRequest{tabBId, dirB, manager.activeTab().session.navigationGeneration(), dropScrollGen}
     );
@@ -779,7 +779,7 @@ public:
 
     pumpUntil([&] { return !manager.m_operations.active() && !manager.activeSession().m_loading; });
     harness.layout();
-    TEST_CHECK(manager.activeTab().selectedPath == dirB / "copy2.txt");
+    TEST_CHECK(manager.activeTab().m_selectedPath == dirB / "copy2.txt");
     TEST_CHECK(manager.activeTab().scrollState.offset == 0.0F);
 
     manager.m_tabs.shutdownAll();
@@ -847,7 +847,7 @@ public:
     const auto dropTab = manager.openFolderInNewTab(drop, false);
     pumpUntil([&] { return !manager.m_tabs.findTab(dropTab)->session.loading(); });
     manager.m_transfers.m_callbacks.fileDropTabAt = [dropTab](float, float) { return dropTab; };
-    manager.activeTab().selectedPaths = {"project/sample.txt"};
+    manager.activeTab().m_selectedPaths = {"project/sample.txt"};
     manager.m_keyboardModifiers = KeyMod::Shift;
     manager.m_transfers.beginFileDragPress(0, 0.0F, 0.0F, 1);
     TEST_CHECK(
@@ -893,8 +893,8 @@ public:
     harness.layout();
 
     const auto selB = sharedDir / "f_5.txt";
-    manager.activeTab().selectedPath = selB;
-    manager.activeTab().selectedPaths = {selB.string()};
+    manager.activeTab().m_selectedPath = selB;
+    manager.activeTab().m_selectedPaths = {selB.string()};
     harness.grid.scrollView().setScrollOffset(90.0F);
     harness.layout();
     const float scrollB = manager.activeTab().scrollState.offset;
@@ -910,11 +910,11 @@ public:
     pumpUntil([&] { return !manager.m_operations.active() && !manager.activeSession().m_loading; });
 
     TEST_CHECK(std::filesystem::is_directory(newFolderPath));
-    TEST_CHECK(manager.activeTab().selectedPath == newFolderPath);
+    TEST_CHECK(manager.activeTab().m_selectedPath == newFolderPath);
     TEST_CHECK(manager.m_pendingInlineRenamePath == newFolderPath);
     auto& tabB = *manager.m_tabs.findTab(tabBId);
     TEST_CHECK(tabB.needsRefresh);
-    TEST_CHECK(tabB.selectedPath == selB);
+    TEST_CHECK(tabB.m_selectedPath == selB);
 
     // Reactivate Tab B: clears needsRefresh, refreshes preserving selection and scroll offset, no rename in B.
     manager.m_pendingInlineRenamePath.reset();
@@ -922,14 +922,14 @@ public:
     pumpUntil([&] { return !manager.activeSession().m_loading; });
     harness.layout();
     TEST_CHECK(!tabB.needsRefresh);
-    TEST_CHECK(tabB.selectedPath == selB);
+    TEST_CHECK(tabB.m_selectedPath == selB);
     TEST_CHECK(tabB.scrollState.offset == scrollB);
     TEST_CHECK(!manager.m_pendingInlineRenamePath.has_value());
 
     // Simulate background monitor event on inactive Tab A.
     const auto selA = sharedDir / "f_2.txt";
-    manager.m_tabs.findTab(tabAId)->selectedPath = selA;
-    manager.m_tabs.findTab(tabAId)->selectedPaths = {selA.string()};
+    manager.m_tabs.findTab(tabAId)->m_selectedPath = selA;
+    manager.m_tabs.findTab(tabAId)->m_selectedPaths = {selA.string()};
     writeFile(sharedDir / "external_touch.txt", "ext");
     if (manager.m_tabs.findTab(tabAId)->session.m_callbacks.onBackgroundMonitorDirty)
       manager.m_tabs.findTab(tabAId)->session.m_callbacks.onBackgroundMonitorDirty();
@@ -1415,8 +1415,8 @@ public:
     };
 
     // File menu entries reflect selection and closed-tab availability.
-    manager.activeTab().selectedPath = regularFile;
-    manager.activeTab().selectedPaths = {regularFile.string()};
+    manager.activeTab().m_selectedPath = regularFile;
+    manager.activeTab().m_selectedPaths = {regularFile.string()};
     const auto fileMenuRegular = manager.fileMenuEntries();
     TEST_CHECK(findMenuEntry(fileMenuRegular, filemanager::menu_id::kNewTab) != fileMenuRegular.end());
     TEST_CHECK(findMenuEntry(fileMenuRegular, filemanager::menu_id::kCloseTab) != fileMenuRegular.end());
@@ -1425,8 +1425,8 @@ public:
     TEST_CHECK(fileOpenTabReg != fileMenuRegular.end() && !fileOpenTabReg->enabled);
     TEST_CHECK(reopenDisabled != fileMenuRegular.end() && !reopenDisabled->enabled);
 
-    manager.activeTab().selectedPath = subFolder;
-    manager.activeTab().selectedPaths = {subFolder.string()};
+    manager.activeTab().m_selectedPath = subFolder;
+    manager.activeTab().m_selectedPaths = {subFolder.string()};
     const auto fileMenuFolder = manager.fileMenuEntries();
     const auto fileOpenTabFolder = findMenuEntry(fileMenuFolder, filemanager::menu_id::kFileOpenInNewTab);
     TEST_CHECK(fileOpenTabFolder != fileMenuFolder.end() && fileOpenTabFolder->enabled);

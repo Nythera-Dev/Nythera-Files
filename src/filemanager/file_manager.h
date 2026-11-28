@@ -5,25 +5,33 @@
 #include "config/config_service.h"
 #include "core/files/directory_scanner.h"
 #include "core/timer_manager.h"
+#include "cursor-shape-v1-client-protocol.h"
 #include "filemanager/checksum.h"
 #include "filemanager/dialogs/checksum_dialog.h"
+#include "filemanager/dialogs/custom_search_dialog_controller.h"
 #include "filemanager/dialogs/help_dialog.h"
 #include "filemanager/dialogs/modal_dialog_host.h"
 #include "filemanager/dialogs/progress_window.h"
 #include "filemanager/dialogs/trash_fallback_dialog.h"
 #include "filemanager/external_tools.h"
+#include "filemanager/file_clipboard_controller.h"
 #include "filemanager/file_columns.h"
+#include "filemanager/file_list_columns.h"
 #include "filemanager/file_list_header.h"
 #include "filemanager/file_manager_settings.h"
 #include "filemanager/file_menu_controller.h"
 #include "filemanager/file_operation_manager.h"
+#include "filemanager/file_selection_controller.h"
 #include "filemanager/file_transfer_controller.h"
 #include "filemanager/gio_poll_source.h"
+#include "filemanager/path_resolution_cache.h"
 #include "filemanager/places_model.h"
 #include "filemanager/places_sidebar.h"
 #include "filemanager/preview/file_preview.h"
 #include "filemanager/preview/thumbnail_provider.h"
 #include "filemanager/properties_window.h"
+#include "filemanager/protected_file_manager.h"
+#include "filemanager/search_bar_controller.h"
 #include "filemanager/search_thumbnails.h"
 #include "filemanager/tab_bar_controller.h"
 #include "filemanager/tab_manager.h"
@@ -84,7 +92,7 @@ private:
   class NativeTextClipboard;
   void installInputHooks();
   void uninstallInputHooks();
-  void activateContextMenuEntry(const ContextMenuControlEntry& entry);
+  void activateContextMenuEntry(const ContextMenuControlEntry& entry) { m_menus.activateEntry(entry); }
   class Adapter;
   [[nodiscard]] filemanager::BrowserTab& activeTab() noexcept { return m_tabs.activeTab(); }
   [[nodiscard]] const filemanager::BrowserTab& activeTab() const noexcept { return m_tabs.activeTab(); }
@@ -100,6 +108,8 @@ private:
     tab.session.navigate(path, recordHistory, revealName);
   }
   void navigateLocation(filemanager::BrowserLocation location, bool recordHistory = true);
+  void navigateBack();
+  void navigateForward();
   void navigateUp();
   void openArchiveMember(const std::filesystem::path& member, bool withApplication);
   void copyArchiveMembers();
@@ -157,22 +167,24 @@ private:
   [[nodiscard]] std::vector<ContextMenuControlEntry> toolsMenuEntries() { return m_menus.toolsMenuEntries(); }
   [[nodiscard]] std::vector<ContextMenuControlEntry> helpMenuEntries() const { return m_menus.helpMenuEntries(); }
   void launchNewWindow(const std::filesystem::path& path);
-  void restoreSelection(bool chooseFirst = false);
-  enum class SelectionChange { All, None, Invert };
+  void restoreSelection(bool chooseFirst = false) { m_selection.restoreSelection(chooseFirst); }
+  using SelectionChange = filemanager::SelectionChange;
+  [[nodiscard]] bool
+  hasActiveGesture(bool includeStatusResize = true, bool includeListHeader = true, bool includeTabBar = true) const;
   [[nodiscard]] bool canChangeSelection() const;
-  void changeSelection(SelectionChange change);
+  void changeSelection(SelectionChange change) { m_selection.changeSelection(change); }
   void activateSelected();
   void openProperties(const std::filesystem::path& path);
   void goToLinkTarget(const std::filesystem::path& link);
   void activatePath(const std::filesystem::path& path);
-  void activatePointerItem(std::size_t index);
+  void activatePointerItem(std::size_t index) { m_selection.activatePointerItem(index); }
   void activatePointerMiddleItem(std::size_t index);
   void setStatus(std::string text);
   void updateNavigationControls();
   void updateSelectionSummary();
   static std::string formatCount(std::size_t count);
   void updateStatusBar();
-  void updateSearchStatus();
+  void updateSearchStatus() { m_searchBarController.updateStatus(); }
   std::unique_ptr<Flex> buildStatusRow(float fontSize);
   void cancelFileGesture() {
     if (!m_transfers.switchingDragTab())
@@ -203,81 +215,26 @@ private:
     filemanager::TabId tabId = filemanager::kInvalidTabId;
     std::filesystem::path source;
   };
-  bool m_reordering = false;
-  std::optional<std::string> m_reorderId;
-  std::optional<std::string> m_reorderBefore;
-  float m_dragStartX = 0, m_dragStartY = 0;
-  std::unordered_set<std::string> m_rubberBaseline;
-  std::optional<std::filesystem::path> m_rubberSelectedPath;
-  std::optional<std::filesystem::path> m_rubberAnchor;
-  std::uint32_t m_rubberModifiers = 0;
   std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
-  struct ProtectedCopy {
-    filemanager::TabId tabId;
-    std::filesystem::path original;
-    std::filesystem::path temporary;
-    std::string revision;
-    ~ProtectedCopy();
-  };
-  using ProtectedCopyReady = std::function<void(std::shared_ptr<ProtectedCopy>, const std::string&)>;
-  std::vector<std::shared_ptr<ProtectedCopy>> m_protectedEdits;
-  [[nodiscard]] std::shared_ptr<ProtectedCopy>
-  protectedEdit(filemanager::TabId tab, const std::filesystem::path& path) const;
-  std::function<bool()> requestProtectedCopy(
-      filemanager::BrowserTab& tab, const std::filesystem::path& path, ProtectedCopyReady ready, bool thumbnail = false
-  );
-  void openProtectedFile(
-      filemanager::TabId tabId, const std::filesystem::path& path,
-      std::function<void(const std::filesystem::path&)> launch
-  );
-  void saveProtectedChanges(const std::filesystem::path& path);
-  void launchFileUri(filemanager::TabId tab, GFile* file, std::string success = {});
-  struct ProtectedThumbnail {
-    std::filesystem::path path;
-    std::shared_ptr<ProtectedCopy> copy;
-  };
-  std::unordered_map<std::size_t, ProtectedThumbnail> m_protectedThumbnails;
-  filemanager::TabId m_protectedThumbnailTab = filemanager::kInvalidTabId;
-  std::uint64_t m_protectedThumbnailListing = 0;
-  std::uint64_t m_protectedThumbnailRevision = 0;
-  std::function<bool()> m_cancelProtectedThumbnail;
-  bool m_protectedThumbnailPending = false;
-  Timer m_protectedThumbnailRetry;
-  void clearProtectedThumbnails();
-  std::optional<std::string>
-  protectedThumbnailPath(filemanager::BrowserTab& tab, const FileEntry& entry, std::size_t index);
+  void confirmPermanentDelete();
+  void createNewItem(int id);
+  void handleLocationInputAction(int id);
   void rebuildBreadcrumbs();
-  void buildSearchBar(Flex& pane, float extraTopSpacing);
-  void buildSearchFilters(Flex& pane);
-  void syncSearchFilters();
-  void updateSearchFilterWidth(float paneWidth, Renderer& renderer);
-  void changeSearchMetadata(const std::function<void(filemanager::SearchFilterDraft&)>& change);
   void refreshSearchQuery(std::string query);
-  void submitSearchFilters();
-  void openSearchFilterMenu(std::size_t field);
-  bool activateSearchFilterEntry(const ContextMenuControlEntry& entry);
-  void openSearchDatePicker(bool second);
   void focusSearch();
   void toggleSearch();
   void closeSearch();
   void resetSearchSelection();
-  void syncSearchUi();
+  void syncSearchUi() { m_searchBarController.syncUi(); }
   void applyActiveView();
   void loadSearchView();
   void configureSearchBackend(filemanager::DirectorySession& session);
-  void openSearchModeMenu();
-  void openSearchScopeMenu();
   void toggleSearchOption(bool filemanager::SearchOptions::* option);
-  void updateSearchScopeWidth(float paneWidth);
-  void syncSearchScopeButton();
-  bool activateSearchScopeEntry(const ContextMenuControlEntry& entry);
   void selectSearchScope(filemanager::SearchSelection selection);
   void refreshSearchSettings(const filemanager::SearchSettings& previous);
-  void editCustomSearch(std::optional<filemanager::CustomSearch> profile, std::function<void()> refreshParent = {});
   [[nodiscard]] filemanager::ModalDialogHost& activeModalDialog() {
-    return m_customSearchChild.isOpen() ? m_customSearchChild : m_modalDialog;
+    return m_customSearches.isChildOpen() ? m_customSearches.childHost() : m_modalDialog;
   }
-  void manageCustomSearches();
   bool activateArchiveAction(int id);
   void showCompressDialog(std::vector<std::string> sources, const std::string& baseName, bool canGzip);
   void selectSearchMode(filemanager::SearchMode mode);
@@ -309,13 +266,7 @@ private:
   void layoutPreviewPane(float available, float dividerSpace);
   void renderPreviewPane(Renderer& renderer);
   [[nodiscard]] bool handlePreviewDivider(const PointerEvent& event, float x, float y);
-  [[nodiscard]] bool navigateFileViewByKeyboard(std::uint32_t sym, std::uint32_t mods);
-  [[nodiscard]] bool handleFileViewSpaceSelection(std::uint32_t mods);
-  [[nodiscard]] bool handleFileViewTypeahead(std::uint32_t utf32);
   [[nodiscard]] bool handleSidebarKeyboardNavigation(std::uint32_t sym, std::uint32_t mods);
-  void openFileColumnMenu(std::optional<filemanager::FileColumn> column, float x, float y);
-  [[nodiscard]] float measureFileColumn(Renderer& renderer, filemanager::FileColumn column) const;
-  [[nodiscard]] std::string fileColumnText(const FileEntry& entry, filemanager::FileColumn column) const;
 
   void openLocationContextMenu(float x, float y, bool highlightOnOpen);
   void openFocusedContextMenu();
@@ -326,9 +277,9 @@ private:
 
   void requestQuit(ToplevelSurface* parent = nullptr);
   void showDialog(
-      std::string title, std::string message, std::vector<std::pair<std::string, int>> choices,
-      std::function<void(int)> response, ToplevelSurface* parent = nullptr, bool applyToAllCheckbox = false,
-      bool alternativeName = false
+      std::string title, std::string message, std::vector<filemanager::DialogChoice> choices,
+      std::function<void(int)> response, ToplevelSurface* parent = nullptr,
+      filemanager::DialogStyle style = filemanager::DialogStyle::Standard
   );
   void closeDialog(int response);
   void cancelStatusFreeSpaceQuery() { activeTab().cancelStatusFreeSpaceQuery(); }
@@ -351,22 +302,22 @@ private:
   void duplicateSelection();
   void createSelectionSymlink();
   void showSymlinkDialog();
-  void pasteClipboard() { m_transfers.pasteClipboard(); }
+  void pasteClipboard() { m_clipboard.pasteClipboard(); }
   bool recordPasteCompletion(const FileOperationManager::Operation& operation) {
-    return m_transfers.recordPasteCompletion(operation);
+    return m_clipboard.recordPasteCompletion(operation);
   }
-  void applyPendingPasteSelection() { m_transfers.applyPendingPasteSelection(); }
-  void finishPendingTransferReveal(Renderer& renderer) { m_transfers.finishPendingTransferReveal(renderer); }
+  void applyPendingPasteSelection() { m_clipboard.applyPendingPasteSelection(); }
+  void finishPendingTransferReveal(Renderer& renderer) { m_clipboard.finishPendingTransferReveal(renderer); }
   void copyToDesktopClipboard(bool cut) {
     if (activeSession().browsingArchive()) {
       if (!cut)
         copyArchiveMembers();
       return;
     }
-    m_transfers.copyToDesktopClipboard(cut);
+    m_clipboard.copyToDesktopClipboard(cut);
   }
   void writeDesktopClipboard(std::string payload, const char* mime) {
-    m_transfers.writeDesktopClipboard(std::move(payload), mime);
+    m_clipboard.writeDesktopClipboard(std::move(payload), mime);
   }
   void beginRename();
   void beginRenamePath(const std::filesystem::path& path);
@@ -408,7 +359,6 @@ private:
   filemanager::ProgressWindow m_progressWindow{
       m_wayland, m_renderContext, m_operations, [this](ToplevelSurface* parent) { requestQuit(parent); }
   };
-  std::function<void()> m_refreshSearchProfileList;
   filemanager::ModalDialogHost m_modalDialog{
       m_wayland,
       m_renderContext,
@@ -422,7 +372,35 @@ private:
           .setStatus = [this](std::string text) { setStatus(std::move(text)); },
       },
   };
-  filemanager::ModalDialogHost m_customSearchChild{m_wayland, m_renderContext, m_settings, {}};
+  filemanager::CustomSearchDialogController m_customSearches{
+      m_wayland,
+      m_renderContext,
+      m_configService,
+      m_settings,
+      m_modalDialog,
+      {
+          .activeTabId = [this] { return activeTab().id; },
+          .currentPath = [this] { return activeSession().path(); },
+          .activeCustomProfile = [this]() -> std::optional<std::string> {
+            const auto& selection = activeSession().searchSelection();
+            if (selection.scope == filemanager::SearchScope::Custom)
+              return selection.profile;
+            return std::nullopt;
+          },
+          .isWindowOpen = [this] { return m_windowOpen; },
+          .selectCustomSearch =
+              [this](std::string name) {
+                selectSearchScope({.scope = filemanager::SearchScope::Custom, .profile = std::move(name)});
+              },
+          .closeDestinationPicker =
+              [this] {
+                if (m_destinationPicker && m_destinationPicker->isOpen())
+                  m_destinationPicker->closeFileDialogWithoutResult();
+                FileDialog::cancelIfPending();
+              },
+          .onStatus = [this](std::string text) { setStatus(std::move(text)); },
+      },
+  };
   filemanager::ChecksumDialogController m_checksumDialog{
       m_modalDialog,
       m_transfer,
@@ -487,30 +465,33 @@ private:
                   m_surface->requestRedraw();
               },
           .onStatus = [this](std::string text) { setStatus(std::move(text)); },
-          .canHandlePointer =
-              [this] {
-                return !m_transfers.isDragPending()
-                    && !m_transfers.isDraggingFiles()
-                    && !m_transfer.dragging()
-                    && !m_reorderId
-                    && !m_tabBar.gestureActive()
-                    && !m_resizingSidebar
-                    && !m_resizingStatus
-                    && !(m_grid && m_grid->rubberBandActive());
-              },
+          .canHandlePointer = [this] { return !hasActiveGesture(true, false, true); },
           .canAdjustScale = [this] { return !m_renamePath; },
           .pointerSerial = [this] { return m_pointerSerial; },
           .measureColumn = [this](
                                Renderer& renderer, filemanager::FileColumn column
-                           ) { return measureFileColumn(renderer, column); },
-          .openHeaderMenu = [this](
-                                std::optional<filemanager::FileColumn> column, float x, float y
-                            ) { openFileColumnMenu(column, x, y); },
+                           ) { return filemanager::measureFileColumn(renderer, activeSession(), column); },
+          .openHeaderMenu =
+              [this](std::optional<filemanager::FileColumn> column, float x, float y) {
+                using namespace filemanager::menu_id;
+                auto entries = m_menus.columnVisibilityEntries();
+                entries.push_back({.separator = true});
+                if (column) {
+                  entries.push_back({
+                      .id = kFirstFitColumn + static_cast<int>(*column),
+                      .label = "Fit " + std::string(m_listHeader.columnLabel(*column)) + " to Contents",
+                  });
+                }
+                entries.push_back({.id = kFitAllColumns, .label = "Fit All Columns to Contents"});
+                m_menus.openColumnHeaderMenu(std::move(entries), x, y);
+              },
       },
   };
+  filemanager::PathResolutionCache m_pathCache;
   filemanager::PlacesSidebarController m_places{
       m_settings,
       m_operations,
+      m_pathCache,
       {
           .currentPath = [this] { return activeSession().path(); },
           .isBrowsingTrash = [this] { return activeSession().browsingTrash(); },
@@ -518,7 +499,7 @@ private:
           .sidebarWidth = [this] { return m_sidebarWidth; },
           .hasPendingClipboardOrRename =
               [this] {
-                return m_transfers.pendingClipboardReads() > 0
+                return m_clipboard.pendingClipboardReads() > 0
                     || m_renamePath.has_value()
                     || m_pendingInlineRenamePath.has_value();
               },
@@ -536,13 +517,47 @@ private:
               [this](
                   std::string title, std::string message, std::vector<std::pair<std::string, int>> choices,
                   std::function<void(int)> response
-              ) { showDialog(std::move(title), std::move(message), std::move(choices), std::move(response)); },
+              ) {
+                std::vector<filemanager::DialogChoice> actions;
+                actions.reserve(choices.size());
+                // GMountOperation supplies labels and indices without action roles.
+                // Translate those provider choices at the boundary for compatibility.
+                for (auto& [label, result] : choices) {
+                  const bool destructive = result != 0
+                      && (label.contains("Delete")
+                          || label == "Quit"
+                          || label == "Empty Wastebin"
+                          || label.starts_with("Replace"));
+                  const auto style = destructive ? filemanager::DialogChoiceStyle::Destructive
+                      : label == "Cancel"        ? filemanager::DialogChoiceStyle::Cancel
+                                                 : filemanager::DialogChoiceStyle::Normal;
+                  actions.push_back({std::move(label), result, style});
+                }
+                showDialog(std::move(title), std::move(message), std::move(actions), std::move(response));
+              },
           .onStatus = [this](std::string text) { setStatus(std::move(text)); },
           .onUpdateNavigationControls = [this] { updateNavigationControls(); },
           .onRequestLayout =
               [this] {
                 if (m_surface)
                   m_surface->requestLayout();
+              },
+          .onRequestRedraw =
+              [this] {
+                if (m_surface)
+                  m_surface->requestRedraw();
+              },
+          .onSetCursorShape =
+              [this](std::uint32_t serial, std::uint32_t shape) {
+                m_wayland.setCursorShape(serial, static_cast<wp_cursor_shape_device_v1_shape>(shape));
+              },
+          .onCancelPointerCapture = [this] { m_dispatcher.cancelPointerCapture(); },
+          .onPointerAxis =
+              [this](const PointerEvent& event, float x, float y) {
+                m_dispatcher.pointerAxis(
+                    x, y, event.axis, event.axisSource, event.axisValue, event.axisDiscrete, event.axisValue120,
+                    event.axisLines, event.axisGestureSerial
+                );
               },
           .onClearDropPlace = [this] { m_transfers.clearDropPlace(); },
           .onMountRemoved = [this](
@@ -557,9 +572,7 @@ private:
               },
       },
   };
-  Timer m_selectionTimer;
   Timer m_statusMessageTimer;
-  std::chrono::steady_clock::time_point m_selectionTick;
   std::unique_ptr<Flex> m_root;
   Flex* m_appBar = nullptr;
   InputArea* m_windowMoveArea = nullptr;
@@ -598,46 +611,118 @@ private:
   std::uint32_t m_pointerSerial = 0;
   VirtualGridView* m_grid = nullptr;
   Input* m_locationInput = nullptr;
-  Input* m_searchInput = nullptr;
-  Flex* m_searchBar = nullptr;
-  Flex* m_searchTools = nullptr;
-  struct SearchFilterUi {
-    Button* toggle = nullptr;
-    Flex* panel = nullptr;
-    Flex* metadata = nullptr;
-    Flex* size = nullptr;
-    Label* sizeCaption = nullptr;
-    Flex* date = nullptr;
-    Flex* separator = nullptr;
-    Flex* content = nullptr;
-    Flex* options = nullptr;
-    std::array<Button*, 6> choices{};
-    std::array<Input*, 4> values{};
-    std::array<Button*, 2> dates{};
-    std::array<Checkbox*, 2> checks{};
-    Button* clear = nullptr;
-    Button* submit = nullptr;
-    filemanager::ContentBackends backends;
-  } m_searchFilterUi;
-  Button* m_searchButton = nullptr;
-  Button* m_searchModeButton = nullptr;
-  Button* m_searchScopeButton = nullptr;
-  bool m_compactSearchScope = false;
-  filemanager::TabId m_searchUiTab = filemanager::kInvalidTabId;
   Label* m_statusLabel = nullptr;
   Label* m_statusDetailLabel = nullptr;
-  Label* m_searchStatus = nullptr;
-  Spinner* m_searchSpinner = nullptr;
-  Flex* m_searchStatusArea = nullptr;
   Button* m_backButton = nullptr;
   Button* m_forwardButton = nullptr;
   Button* m_upButton = nullptr;
   Button* m_refreshButton = nullptr;
   std::unique_ptr<Adapter> m_adapter;
   filemanager::TabManager m_tabs;
+  filemanager::ProtectedFileManager m_protectedFiles{
+      m_tabs,
+      {
+          .grid = [this] { return m_grid; },
+          .onStatus = [this](std::string text) { setStatus(std::move(text)); },
+          .onThumbnailReady =
+              [this] {
+                if (m_grid) {
+                  m_grid->notifyDataChanged();
+                  restoreSelection();
+                }
+              },
+      },
+  };
+  filemanager::FileSelectionController m_selection{
+      m_tabs,
+      m_dispatcher,
+      {
+          .grid = [this] { return m_grid; },
+          .mainSurface = [this] { return m_surface.get(); },
+          .canChangeSelection = [this] { return canChangeSelection(); },
+          .keyboardModifiers = [this] { return m_keyboardModifiers; },
+          .isRenaming = [this] { return m_renamePath.has_value(); },
+          .hasActiveDeviceOperations = [this] { return m_places.hasActiveDeviceOperations(); },
+          .onUpdateSelectionSummary = [this] { updateSelectionSummary(); },
+          .onAdminActivity = [this](filemanager::BrowserTab& tab) { recordAdminTabUserActivity(tab); },
+          .onActivatePath = [this](const std::filesystem::path& path) { activatePath(path); },
+          .onBeginFileDragPress = [this](
+                                      std::size_t index, float x, float y, std::uint32_t serial
+                                  ) { m_transfers.beginFileDragPress(index, x, y, serial); },
+      },
+  };
   std::vector<std::shared_ptr<const std::filesystem::path>> m_archiveTemporary;
   std::uint64_t m_archiveCopyGeneration = 0;
+  filemanager::FileLaunchController m_launcher{
+      m_wayland,
+      m_renderContext,
+      m_tabs,
+      m_protectedFiles,
+      {
+          .mainSurface = [this] { return m_surface.get(); },
+          .selectedPaths = [this]() -> const std::unordered_set<std::string>& { return activeTab().selectedPaths(); },
+          .selectedPathsOrdered = [this] { return selectedPaths(); },
+          .onStatus = [this](std::string text) { setStatus(std::move(text)); },
+      },
+  };
+  filemanager::FileClipboardController m_clipboard{
+      m_wayland,
+      m_transfer,
+      m_operations,
+      m_tabs,
+      m_places,
+      m_pathCache,
+      {
+          .mainSurface = [this] { return m_surface.get(); },
+          .grid = [this] { return m_grid; },
+          .isWindowOpen = [this] { return m_windowOpen; },
+          .isQuitting = [this] { return m_quitting; },
+          .selectedPathsOrdered = [this] { return selectedOperationPaths(); },
+          .onApplyPasteSelection =
+              [this](filemanager::TabId tabId, std::unordered_set<std::string> paths, std::filesystem::path primary) {
+                m_selection.applyPasteSelection(tabId, std::move(paths), primary);
+              },
+          .onUpdateSelectionSummary = [this] { updateSelectionSummary(); },
+          .onCutStateChanged =
+              [this] {
+                if (m_grid)
+                  m_grid->notifyDataChanged();
+                if (m_surface)
+                  m_surface->requestRedraw();
+              },
+          .onStatus = [this](std::string text) { setStatus(std::move(text)); },
+          .onMaybeStopMainLoop =
+              [this] {
+                if ((!m_windowOpen || m_quitting) && !m_operations.active() && m_clipboard.pendingClipboardReads() == 0)
+                  m_running = false;
+              },
+      },
+  };
   filemanager::FileMenuController m_menus;
+  filemanager::SearchBarController m_searchBarController{
+      m_wayland,
+      m_menuAnimations,
+      m_dispatcher,
+      m_settings,
+      m_tabs,
+      m_listHeader,
+      m_menus,
+      m_modalDialog,
+      m_customSearches,
+      {
+          .mainSurface = [this] { return m_surface.get(); },
+          .gridFocusArea = [this]() -> InputArea* { return m_grid ? m_grid->focusArea() : nullptr; },
+          .isWindowOpen = [this] { return m_windowOpen; },
+          .applyActiveView = [this] { applyActiveView(); },
+          .refreshSearchQuery = [this](std::string query) { refreshSearchQuery(std::move(query)); },
+          .resetSearchSelection = [this] { resetSearchSelection(); },
+          .closeSearch = [this] { closeSearch(); },
+          .selectSearchScope =
+              [this](filemanager::SearchSelection selection) { selectSearchScope(std::move(selection)); },
+          .toggleSearchOption = [this](bool filemanager::SearchOptions::* option) { toggleSearchOption(option); },
+          .formatCount = [](std::size_t count) { return formatCount(count); },
+      },
+  };
   filemanager::TabBarController m_tabBar;
   filemanager::FileTransferController m_transfers;
   filemanager::TrashFallbackDialogController m_trashFallbackDialog{m_modalDialog};
@@ -666,14 +751,7 @@ private:
   std::uint64_t m_locationEditGeneration = 0;
   std::function<void(std::function<void(std::optional<std::string>)>)> m_readLocationClipboardForTesting;
   bool m_refreshAfterRename = false;
-  bool m_restoringSelection = false;
-  bool m_fileViewFocusVisible = false;
-  std::string m_typeaheadQuery;
-  std::chrono::steady_clock::time_point m_typeaheadLastTime{};
-  std::optional<std::size_t> m_lastPointerIndex;
   std::optional<filemanager::FileColumn> m_hoveredFileColumn;
   std::optional<float> m_filePointerX;
-  std::uint32_t m_lastPointerClickTime = 0;
-  std::uint32_t m_pointerClickTime = 0;
   bool m_running = true;
 };

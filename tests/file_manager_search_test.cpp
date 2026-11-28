@@ -225,7 +225,7 @@ class FileManagerTestAccess {
   }
 
   static void query(FileManager& manager, const std::string& text) {
-    auto& input = *manager.m_searchInput;
+    auto& input = *manager.m_searchBarController.m_searchInput;
     input.selectAll();
     if (text.empty())
       key(manager, XKB_KEY_BackSpace);
@@ -250,7 +250,10 @@ class FileManagerTestAccess {
     TEST_CHECK(session.entries().size() == 5);
 
     query(manager, "nEeDlE");
-    TEST_CHECK(manager.m_searchStatus->visible() && manager.m_searchStatus->text() == "Searching… 0 found");
+    TEST_CHECK(
+        manager.m_searchBarController.m_searchStatus->visible()
+        && manager.m_searchBarController.m_searchStatus->text() == "Searching… 0 found"
+    );
     finish(manager);
     TEST_CHECK(session.search().status() == Status::Finished);
     TEST_CHECK(session.entries().size() == 5);
@@ -261,28 +264,29 @@ class FileManagerTestAccess {
         find(session, root / "Needle Folder" / "needle.txt").absPath != find(session, root / "needle.txt").absPath
     );
     TEST_CHECK(session.search().skippedFolders() == (getuid() == 0 ? 0U : 1U));
-    TEST_CHECK(!manager.m_searchSpinner->spinning());
+    TEST_CHECK(!manager.m_searchBarController.m_searchSpinner->spinning());
     TEST_CHECK(manager.m_statusLabel->text() == "2 folders");
     TEST_CHECK(manager.m_statusDetailLabel->text().starts_with("  |  3 files"));
     if (getuid() != 0) {
-      TEST_CHECK(manager.m_searchStatus->text() == "Partial results · 5 found");
-      const auto rows = std::get<std::vector<TooltipRow>>(manager.m_searchStatus->tooltipContent());
+      TEST_CHECK(manager.m_searchBarController.m_searchStatus->text() == "Partial results · 5 found");
+      const auto rows =
+          std::get<std::vector<TooltipRow>>(manager.m_searchBarController.m_searchStatus->tooltipContent());
       TEST_CHECK(std::ranges::any_of(rows, [](const TooltipRow& row) {
         return row.key == "Folders skipped" && row.value == "1";
       }));
     } else {
-      TEST_CHECK(manager.m_searchStatus->text() == "5 found");
+      TEST_CHECK(manager.m_searchBarController.m_searchStatus->text() == "5 found");
     }
 
     const auto folder = root / "Needle Folder";
-    manager.activeTab().selectedPaths = {folder.string(), (folder / "needle.txt").string()};
+    manager.activeTab().m_selectedPaths = {folder.string(), (folder / "needle.txt").string()};
     manager.updateSelectionSummary();
     TEST_CHECK(manager.m_statusLabel->text() == "2 selected");
-    TEST_CHECK(manager.m_searchStatus->text().ends_with("5 found"));
-    manager.activeTab().selectedPaths.clear();
+    TEST_CHECK(manager.m_searchBarController.m_searchStatus->text().ends_with("5 found"));
+    manager.activeTab().m_selectedPaths.clear();
     manager.updateSelectionSummary();
     TEST_CHECK(manager.m_statusLabel->text() == "2 folders");
-    manager.activeTab().selectedPaths = {folder.string(), (folder / "needle.txt").string()};
+    manager.activeTab().m_selectedPaths = {folder.string(), (folder / "needle.txt").string()};
     TEST_CHECK(manager.selectedPaths().size() == 2);
     TEST_CHECK(manager.selectedOperationPaths() == std::vector<std::string>{folder.string()});
 
@@ -300,8 +304,8 @@ class FileManagerTestAccess {
     query(manager, "other needle");
     finish(manager);
     const auto target = find(session, root / "Needle Folder" / "Deep" / "another NEEDLE.txt").absPath;
-    manager.activeTab().selectedPaths.insert(target.string());
-    manager.activeTab().selectedPath = target;
+    manager.activeTab().m_selectedPaths.insert(target.string());
+    manager.activeTab().m_selectedPath = target;
     TEST_CHECK(manager.activeTab().selectedPathsOrdered() == std::vector<std::string>{target.string()});
     g_autoptr(GFile) file = g_file_new_for_path(target.c_str());
     g_autoptr(GAppInfo) handler = g_file_query_default_handler(file, nullptr, nullptr);
@@ -328,15 +332,15 @@ class FileManagerTestAccess {
     query(manager, "unused needle from linked folder");
     finish(manager);
     TEST_CHECK(session.entries().empty());
-    TEST_CHECK(manager.m_searchStatus->text().ends_with("No matches"));
+    TEST_CHECK(manager.m_searchBarController.m_searchStatus->text().ends_with("No matches"));
     query(manager, "cafe\u0301");
     finish(manager);
     TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "CAFÉ.txt");
     query(manager, "");
     TEST_CHECK(session.searchOpen() && !session.search().active() && session.entries().size() == 5);
-    TEST_CHECK(!manager.m_searchStatus->visible());
+    TEST_CHECK(!manager.m_searchBarController.m_searchStatus->visible());
     key(manager, XKB_KEY_Escape);
-    TEST_CHECK(!session.searchOpen() && !manager.m_searchBar->visible());
+    TEST_CHECK(!session.searchOpen() && !manager.m_searchBarController.m_searchBar->visible());
 
     manager.navigate(outside / "missing");
     waitFor([&] { return !session.loading(); });
@@ -344,7 +348,7 @@ class FileManagerTestAccess {
     query(manager, "needle");
     finish(manager);
     TEST_CHECK(session.search().status() == Status::Failed);
-    TEST_CHECK(manager.m_searchStatus->text() == "Search failed");
+    TEST_CHECK(manager.m_searchBarController.m_searchStatus->text() == "Search failed");
     key(manager, XKB_KEY_Escape);
     TEST_CHECK(!session.searchOpen() && session.entries().empty());
   }
@@ -420,7 +424,9 @@ class FileManagerTestAccess {
     TEST_CHECK(!header.searchView() && header.gridMode());
     key(manager, XKB_KEY_f, KeyMod::Ctrl);
     TEST_CHECK(!header.searchView() && header.gridMode());
-    TEST_CHECK(manager.m_searchBar->visible() && !manager.m_searchStatus->visible());
+    TEST_CHECK(
+        manager.m_searchBarController.m_searchBar->visible() && !manager.m_searchBarController.m_searchStatus->visible()
+    );
     query(manager, "needle");
     TEST_CHECK(header.searchView() && !header.gridMode());
     const std::vector defaults{
@@ -429,7 +435,9 @@ class FileManagerTestAccess {
     TEST_CHECK(header.columnLayout().displayed() == defaults);
     TEST_CHECK(header.columnLabel(kSearchLocationSlot) == "Location");
     TEST_CHECK(header.columnSortField(kSearchLocationSlot) == FileDialogSortField::Location);
-    TEST_CHECK(manager.m_searchStatus->parent() == manager.m_searchStatusArea);
+    TEST_CHECK(
+        manager.m_searchBarController.m_searchStatus->parent() == manager.m_searchBarController.m_searchStatusArea
+    );
 
     finish(manager);
     manager.activateContextMenuEntry({.id = 63});
@@ -502,12 +510,12 @@ class FileManagerTestAccess {
     waitFor([&] { return !manager.activeSession().loading(); });
     auto& session = manager.activeSession();
     key(manager, XKB_KEY_f, KeyMod::Ctrl);
-    TEST_CHECK(manager.m_searchScopeButton->visible());
+    TEST_CHECK(manager.m_searchBarController.m_searchScopeButton->visible());
     TEST_CHECK(session.searchSelection() == SearchSelection{});
-    manager.updateSearchScopeWidth(340);
-    TEST_CHECK(manager.m_searchScopeButton->label()->text() == "Scope");
-    manager.updateSearchScopeWidth(580);
-    TEST_CHECK(manager.m_searchScopeButton->label()->text() == "Current folder & subfolders");
+    manager.m_searchBarController.updateScopeWidth(340);
+    TEST_CHECK(manager.m_searchBarController.m_searchScopeButton->label()->text() == "Scope");
+    manager.m_searchBarController.updateScopeWidth(580);
+    TEST_CHECK(manager.m_searchBarController.m_searchScopeButton->label()->text() == "Current folder & subfolders");
     manager.activateContextMenuEntry({.id = kFirstSearchScope + static_cast<int>(SearchScope::Local)});
     TEST_CHECK(!session.searchSelection().includeSystem);
     manager.activateContextMenuEntry({.id = kSearchIncludeSystem});
@@ -525,13 +533,15 @@ class FileManagerTestAccess {
     finish(manager);
     TEST_CHECK(session.entries().size() == 1);
     TEST_CHECK(
-        manager.fileColumnText(session.entries().front(), kSearchLocationSlot)
+        filemanager::fileColumnText(session, session.entries().front(), kSearchLocationSlot)
         == (root / "Needle Folder" / "Deep").native()
     );
-    TEST_CHECK(manager.fileColumnText(session.entries().front(), FileColumn::Name) == "scoped fixture.txt");
+    TEST_CHECK(
+        filemanager::fileColumnText(session, session.entries().front(), FileColumn::Name) == "scoped fixture.txt"
+    );
     TEST_CHECK(searchLocationText("/etc/test.conf") == "/etc");
     TEST_CHECK(searchLocationText("/mnt/Goku/SteamLibrary/steamapps/test") == "/mnt/Goku/SteamLibrary/steamapps");
-    TEST_CHECK(manager.m_searchInput->value() == "scoped fixture");
+    TEST_CHECK(manager.m_searchBarController.m_searchInput->value() == "scoped fixture");
 
     const CustomSearch profile{"Needles", {root / "Needle Folder"}};
     TEST_CHECK(manager.m_settings.editCustomSearch(std::nullopt, profile));
@@ -564,16 +574,16 @@ class FileManagerTestAccess {
     manager.navigate(root);
     waitFor([&] { return !manager.activeSession().loading(); });
     auto& tab = manager.activeTab();
-    tab.selectedPath = root / "needle.txt";
-    tab.selectedPaths.insert(tab.selectedPath->native());
-    tab.selectionAnchor = tab.selectedPath;
+    tab.m_selectedPath = root / "needle.txt";
+    tab.m_selectedPaths.insert(tab.m_selectedPath->native());
+    tab.m_selectionAnchor = tab.m_selectedPath;
     tab.scrollState.offset = 54.0F;
 
     manager.toggleSearch();
-    TEST_CHECK(tab.session.searchOpen() && !manager.m_listHeader.searchView() && tab.selectedPath);
+    TEST_CHECK(tab.session.searchOpen() && !manager.m_listHeader.searchView() && tab.m_selectedPath);
     manager.activateContextMenuEntry({.id = kSearchShowHidden});
     TEST_CHECK(tab.session.searchOptions() == SearchOptions{true, false});
-    TEST_CHECK(!manager.m_listHeader.searchView() && !tab.session.showHidden() && tab.selectedPath);
+    TEST_CHECK(!manager.m_listHeader.searchView() && !tab.session.showHidden() && tab.m_selectedPath);
     const CustomSearch profile{"Link policy", {root}, {}, false, {false, true}};
     TEST_CHECK(manager.m_settings.editCustomSearch(std::nullopt, profile));
     manager.activateContextMenuEntry({.id = kUseCustomSearch, .label = profile.name});
@@ -586,7 +596,7 @@ class FileManagerTestAccess {
 
     query(manager, "needle");
     finish(manager);
-    TEST_CHECK(manager.m_listHeader.searchView() && !tab.selectedPath);
+    TEST_CHECK(manager.m_listHeader.searchView() && !tab.m_selectedPath);
     manager.activateContextMenuEntry({.id = kSearchFollowLinks});
     TEST_CHECK(tab.session.search().status() == Status::Searching && tab.session.entries().empty());
     TEST_CHECK(tab.session.search().query() == "needle" && tab.session.searchOptions() == SearchOptions{true, true});
@@ -599,19 +609,19 @@ class FileManagerTestAccess {
     TEST_CHECK(tab.session.search().status() == Status::Finished);
     query(manager, "");
     TEST_CHECK(!manager.m_listHeader.searchView() && tab.session.searchOpen());
-    TEST_CHECK(tab.selectedPath == root / "needle.txt" && tab.scrollState.offset == 54.0F);
+    TEST_CHECK(tab.m_selectedPath == root / "needle.txt" && tab.scrollState.offset == 54.0F);
 
     query(manager, "needle");
     manager.toggleSearch();
     TEST_CHECK(!tab.session.searchOpen() && !tab.session.search().active());
-    TEST_CHECK(tab.selectedPath == root / "needle.txt");
+    TEST_CHECK(tab.m_selectedPath == root / "needle.txt");
     manager.toggleSearch();
     query(manager, "needle");
-    auto* close = static_cast<Button*>(manager.m_searchBar->children().back().get());
+    auto* close = static_cast<Button*>(manager.m_searchBarController.m_searchBar->children().back().get());
     manager.m_dispatcher.setFocus(close->inputArea());
     key(manager, XKB_KEY_Return);
     TEST_CHECK(!tab.session.searchOpen() && !tab.session.search().active());
-    TEST_CHECK(tab.selectedPath == root / "needle.txt");
+    TEST_CHECK(tab.m_selectedPath == root / "needle.txt");
     FileManagerSettings reopened(manager.m_configService);
     TEST_CHECK(reopened.searchSettings().standardOptions == SearchOptions{false, true});
     TEST_CHECK(manager.m_settings.saveStandardSearchOptions({}));
@@ -668,8 +678,8 @@ class FileManagerTestAccess {
     manager.m_surface = std::make_unique<ToplevelSurface>(manager.m_wayland);
     auto& tab = manager.activeTab();
     // Ctrl+Space can leave the keyboard cursor on an unselected item.
-    tab.selectedPath = selected.parent_path() / "Needle Folder";
-    tab.selectedPaths = {selected.string()};
+    tab.m_selectedPath = selected.parent_path() / "Needle Folder";
+    tab.m_selectedPaths = {selected.string()};
     auto& dialog = manager.m_modalDialog;
     TestRenderer renderer;
     dialog.m_initialLayoutRendererForTest = &renderer;
@@ -681,8 +691,8 @@ class FileManagerTestAccess {
       dialog.m_initialLayoutRendererForTest = nullptr;
       manager.m_surface.reset();
       manager.m_grid = nullptr;
-      tab.selectedPath.reset();
-      tab.selectedPaths.clear();
+      tab.m_selectedPath.reset();
+      tab.m_selectedPaths.clear();
     });
 
     manager.activateContextMenuEntry({.id = kQuickLookMenuId});
@@ -715,7 +725,7 @@ class FileManagerTestAccess {
 
     dialog.forceCloseImmediate();
     const auto folder = selected.parent_path() / "Needle Folder";
-    tab.selectedPaths = {folder.string()};
+    tab.m_selectedPaths = {folder.string()};
     key(manager, XKB_KEY_space);
     TEST_CHECK(dialog.isOpen() && !dialog.surface());
     waitFor([&] { return dialog.surface() != nullptr; });
@@ -731,7 +741,7 @@ class FileManagerTestAccess {
   static void testProfileDialogs(FileManager& manager, const fs::path& folder) {
     using namespace filemanager;
     auto& parent = manager.m_modalDialog;
-    auto& editor = manager.m_customSearchChild;
+    auto& editor = manager.m_customSearches.m_customSearchChild;
     ToplevelSurface* presentedParent = nullptr;
     ModalDialogHost::DialogSize presentedDimensions;
     parent.m_presentToplevelForTest = [&](auto&, auto*, auto size) { presentedDimensions = size; };
@@ -749,7 +759,7 @@ class FileManagerTestAccess {
     const CustomSearch profile{"Editable root", {longLocation, "/"}, {folder / "exclude"}, true, {true, true}};
     TEST_CHECK(manager.m_settings.editCustomSearch(std::nullopt, profile));
 
-    manager.manageCustomSearches();
+    manager.m_customSearches.manageCustomSearches();
     auto* original = parent.surface();
     TEST_CHECK(original && presentedDimensions == ModalDialogHost::DialogSize{620, 470});
     parent.recordConfiguredSize(620, 470);
@@ -929,7 +939,7 @@ class FileManagerTestAccess {
     parent.closeDialog(0);
     waitFor([&] { return !parent.isOpen(); });
 
-    manager.editCustomSearch(std::nullopt);
+    manager.m_customSearches.editCustomSearch(std::nullopt);
     TEST_CHECK(parent.isOpen() && !editor.isOpen());
     TEST_CHECK(presentedDimensions == ModalDialogHost::DialogSize{930, 760});
     fields.clear();
@@ -1077,16 +1087,16 @@ class FileManagerTestAccess {
     using enum filemanager::SearchMode;
     auto& session = manager.activeSession();
     key(manager, XKB_KEY_f, KeyMod::Ctrl);
-    TEST_CHECK(!manager.m_searchModeButton->visible());
+    TEST_CHECK(!manager.m_searchBarController.m_searchModeButton->visible());
     session.configureSearchBackend(executable, StartsWith);
     manager.syncSearchUi();
-    TEST_CHECK(manager.m_searchModeButton->visible() && session.searchMode() == StartsWith);
+    TEST_CHECK(manager.m_searchBarController.m_searchModeButton->visible() && session.searchMode() == StartsWith);
     manager.activateContextMenuEntry({.id = filemanager::menu_id::kFirstSearchMode + static_cast<int>(Fuzzy)});
     query(manager, "^metadata$");
     TEST_CHECK(session.searchMode() == Exact);
-    TEST_CHECK(manager.m_searchInput->value() == "^metadata$");
+    TEST_CHECK(manager.m_searchBarController.m_searchInput->value() == "^metadata$");
     query(manager, "metadata");
-    TEST_CHECK(session.searchMode() == Fuzzy && manager.m_searchInput->value() == "metadata");
+    TEST_CHECK(session.searchMode() == Fuzzy && manager.m_searchBarController.m_searchInput->value() == "metadata");
     query(manager, "");
     TEST_CHECK(session.searchMode() == StartsWith);
     key(manager, XKB_KEY_Escape);
@@ -1102,18 +1112,18 @@ class FileManagerTestAccess {
     waitFor([&] { return !session.loading(); });
     key(manager, XKB_KEY_f, KeyMod::Ctrl);
 
-    auto& ui = manager.m_searchFilterUi;
+    auto& ui = manager.m_searchBarController.m_searchFilterUi;
     const auto click = [&](Button* button) {
       manager.m_dispatcher.setFocus(button->inputArea());
       key(manager, XKB_KEY_Return);
     };
     click(ui.toggle);
     TEST_CHECK(ui.panel->visible());
-    auto* scene = static_cast<Flex*>(manager.m_searchTools->parent());
+    auto* scene = static_cast<Flex*>(manager.m_searchBarController.m_searchTools->parent());
     TestRenderer renderer;
     const auto layout = [&](float width) {
       scene->setSize(width, 500.0F);
-      manager.updateSearchFilterWidth(width, renderer);
+      manager.m_searchBarController.updateFilterWidth(width, renderer);
       scene->layout(renderer);
     };
     auto& draft = session.searchFilters();
@@ -1121,7 +1131,7 @@ class FileManagerTestAccess {
     TEST_CHECK(ui.toggle->label()->text() == "0" && !session.search().active());
     TEST_CHECK(!ui.values[0]->invalid() && !ui.values[2]->invalid());
     using namespace filemanager;
-    manager.changeSearchMetadata([](auto& filters) {
+    manager.m_searchBarController.changeMetadata([](auto& filters) {
       filters.sizeComparison = SizeComparison::Between;
       filters.dateComparison = DateComparison::Between;
     });
@@ -1146,7 +1156,7 @@ class FileManagerTestAccess {
     TEST_CHECK(labelsAligned());
     TEST_CHECK(ui.metadata->direction() == FlexDirection::Vertical && !ui.separator->visible());
     TEST_CHECK(ui.date->y() > ui.size->y() && ui.content->direction() == FlexDirection::Vertical);
-    TEST_CHECK(ui.clear->parent() == manager.m_searchBar);
+    TEST_CHECK(ui.clear->parent() == manager.m_searchBarController.m_searchBar);
     const auto* sizeHeading = ui.choices[0]->parent();
     const auto* firstBound = ui.values[0]->parent();
     const auto* secondBound = ui.values[1]->parent();
@@ -1156,7 +1166,7 @@ class FileManagerTestAccess {
     const auto* addressBar = scene->children().front().get();
     float addressX = 0, addressY = 0, searchX = 0, searchY = 0;
     Node::absolutePosition(addressBar, addressX, addressY);
-    Node::absolutePosition(manager.m_searchBar, searchX, searchY);
+    Node::absolutePosition(manager.m_searchBarController.m_searchBar, searchX, searchY);
     TEST_CHECK(searchX == addressX && searchY - (addressY + addressBar->height()) == Style::spaceSm);
     const auto edit = [&](Input* input, std::string_view text) {
       manager.m_dispatcher.setFocus(input->inputArea());
@@ -1166,7 +1176,7 @@ class FileManagerTestAccess {
       else
         input->textInputApplyEdit({.commitText = std::string(text), .hasCommitText = true});
     };
-    manager.changeSearchMetadata([](auto& filters) {
+    manager.m_searchBarController.changeMetadata([](auto& filters) {
       filters.sizeFirstUnit = SizeUnit::Bytes;
       filters.sizeSecondUnit = SizeUnit::Bytes;
     });
@@ -1175,9 +1185,12 @@ class FileManagerTestAccess {
     edit(ui.values[1], "invalid");
     TEST_CHECK(ui.values[1]->invalid() && ui.toggle->label()->text() == "0");
     edit(ui.values[1], "6");
-    TEST_CHECK(manager.m_searchSpinner->spinning());
+    TEST_CHECK(manager.m_searchBarController.m_searchSpinner->spinning());
     finish(manager);
-    TEST_CHECK(manager.m_searchStatus->text() == "1 found" && !manager.m_searchSpinner->spinning());
+    TEST_CHECK(
+        manager.m_searchBarController.m_searchStatus->text() == "1 found"
+        && !manager.m_searchBarController.m_searchSpinner->spinning()
+    );
     TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "one.txt");
     TEST_CHECK(ui.toggle->label()->text() == "1");
     click(ui.toggle);
@@ -1187,12 +1200,12 @@ class FileManagerTestAccess {
     click(ui.toggle);
     click(ui.clear);
     TEST_CHECK(!session.search().active() && session.entries().size() == 2);
-    TEST_CHECK(!manager.m_searchStatusArea->visible());
+    TEST_CHECK(!manager.m_searchBarController.m_searchStatusArea->visible());
     TEST_CHECK(ui.toggle->label()->text() == "0");
 
     if (ui.backends.supports(ContentMode::Plain)) {
       draft.content.mode = ContentMode::Plain;
-      manager.changeSearchMetadata([](auto& filters) {
+      manager.m_searchBarController.changeMetadata([](auto& filters) {
         filters.sizeComparison = SizeComparison::Larger;
         filters.sizeFirstUnit = SizeUnit::Bytes;
         filters.sizeFirst = "5";
@@ -1200,9 +1213,9 @@ class FileManagerTestAccess {
         filters.dateFirst = {2000, 1, 1};
       });
       TEST_CHECK(ui.toggle->label()->text() == "1");
-      manager.changeSearchMetadata([](auto& filters) { filters.dateSecond = {1999, 1, 1}; });
+      manager.m_searchBarController.changeMetadata([](auto& filters) { filters.dateSecond = {1999, 1, 1}; });
       TEST_CHECK(ui.toggle->label()->text() == "1");
-      manager.changeSearchMetadata([](auto& filters) { filters.dateSecond = {2099, 12, 31}; });
+      manager.m_searchBarController.changeMetadata([](auto& filters) { filters.dateSecond = {2099, 12, 31}; });
       TEST_CHECK(ui.toggle->label()->text() == "2");
       query(manager, "txt");
       finish(manager);
@@ -1214,9 +1227,12 @@ class FileManagerTestAccess {
       TEST_CHECK(session.path() == folder && content->value() == "needle");
       TEST_CHECK(session.search().status() == Status::Finished && !draft.submitted && session.entries().size() == 2);
       key(manager, XKB_KEY_Return);
-      TEST_CHECK(manager.m_searchSpinner->spinning());
+      TEST_CHECK(manager.m_searchBarController.m_searchSpinner->spinning());
       finish(manager);
-      TEST_CHECK(manager.m_searchStatus->text() == "1 found" && !manager.m_searchSpinner->spinning());
+      TEST_CHECK(
+          manager.m_searchBarController.m_searchStatus->text() == "1 found"
+          && !manager.m_searchBarController.m_searchSpinner->spinning()
+      );
       TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "one.txt");
       TEST_CHECK(draft.submitted && ui.toggle->label()->text() == "3");
       edit(content, "other");
@@ -1232,7 +1248,7 @@ class FileManagerTestAccess {
       finish(manager);
       TEST_CHECK(!draft.submitted && ui.toggle->label()->text() == "2");
       TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "one.txt");
-      manager.changeSearchMetadata([](auto& filters) { filters.dateSecond = {}; });
+      manager.m_searchBarController.changeMetadata([](auto& filters) { filters.dateSecond = {}; });
       TEST_CHECK(ui.toggle->label()->text() == "1");
       edit(ui.values[0], "");
       TEST_CHECK(ui.toggle->label()->text() == "0");
@@ -1273,7 +1289,7 @@ class FileManagerTestAccess {
     key(manager, XKB_KEY_f, KeyMod::Ctrl);
     auto& draft = session.searchFilters();
     draft.content = {"Tagged search fixture", filemanager::ContentMode::Extracted};
-    manager.submitSearchFilters();
+    manager.m_searchBarController.submitFilters();
     finish(manager);
     TEST_CHECK(session.entries().size() == 1);
     const auto& entry = session.entries().front();
@@ -1283,8 +1299,8 @@ class FileManagerTestAccess {
     const auto* names = g_themed_icon_get_names(G_THEMED_ICON(icon));
     TEST_CHECK(names && names[0] && std::string_view(names[0]) == "video-mp4");
 
-    std::vector<ContextMenuControlEntry> entries{{.id = 10, .label = "Open"}};
-    manager.m_menus.appendOpenWithEntries(entry, entries);
+    std::vector<ContextMenuControlEntry> entries{{.id = filemanager::menu_id::kOpen, .label = "Open"}};
+    manager.m_launcher.appendOpenWithEntries(entry, entries);
     TEST_CHECK(entries.front().label == "Open with Isolated video player");
     TEST_CHECK(entries.size() == 2 && entries.back().label == "Open With");
     TEST_CHECK(std::ranges::any_of(entries.back().submenuEntries, [](const auto& item) {
@@ -1333,8 +1349,8 @@ class FileManagerTestAccess {
     manager.m_listHeader.applyColumnWidths();
     TEST_CHECK(manager.m_listHeader.listColumns().widths == manuallySized.widths);
     TEST_CHECK(session.search().status() == Status::Searching);
-    TEST_CHECK(manager.m_searchSpinner->spinning());
-    TEST_CHECK(manager.m_searchStatus->text() != "Searching… 0 found");
+    TEST_CHECK(manager.m_searchBarController.m_searchSpinner->spinning());
+    TEST_CHECK(manager.m_searchBarController.m_searchStatus->text() != "Searching… 0 found");
     query(manager, "fixture-11");
     TEST_CHECK(session.entries().empty());
     query(manager, "replacement");
@@ -1349,10 +1365,10 @@ class FileManagerTestAccess {
     const char* locale = std::getenv("LC_ALL");
     const bool grouped = locale && std::string_view(locale) == "en_GB.utf8";
     if (grouped) {
-      TEST_CHECK(manager.m_searchStatus->text() == "12,000 found");
+      TEST_CHECK(manager.m_searchBarController.m_searchStatus->text() == "12,000 found");
       TEST_CHECK(manager.m_statusDetailLabel->text().starts_with("  |  12,000 files"));
       for (const auto& entry : session.entries() | std::views::take(1000))
-        manager.activeTab().selectedPaths.insert(entry.absPath.string());
+        manager.activeTab().m_selectedPaths.insert(entry.absPath.string());
       manager.updateSelectionSummary();
       TEST_CHECK(manager.m_statusLabel->text() == "1,000 selected");
       TEST_CHECK(manager.m_statusDetailLabel->text().starts_with("  |  0 folders, 1,000 files"));
@@ -1367,11 +1383,14 @@ class FileManagerTestAccess {
     const auto found = session.entries().size();
     key(manager, XKB_KEY_Escape);
     TEST_CHECK(session.searchOpen() && session.search().status() == Status::Cancelled);
-    TEST_CHECK(session.entries().size() == found && !manager.m_searchSpinner->spinning());
-    TEST_CHECK(manager.m_searchStatus->text().starts_with("Search cancelled"));
+    TEST_CHECK(session.entries().size() == found && !manager.m_searchBarController.m_searchSpinner->spinning());
+    TEST_CHECK(manager.m_searchBarController.m_searchStatus->text().starts_with("Search cancelled"));
     key(manager, XKB_KEY_Escape);
     TEST_CHECK(!session.searchOpen() && !session.search().active());
-    TEST_CHECK(!manager.m_searchStatusArea->visible() && !manager.m_searchSpinner->spinning());
+    TEST_CHECK(
+        !manager.m_searchBarController.m_searchStatusArea->visible()
+        && !manager.m_searchBarController.m_searchSpinner->spinning()
+    );
     TEST_CHECK(manager.m_statusLabel->text() == "12 folders");
     TEST_CHECK(session.entries().size() == 12);
     // A replacement search following Escape must publish only its own results.
@@ -1438,7 +1457,7 @@ for path; do printf '%s\000' "$path"; done
       manager.focusSearch();
       auto& draft = tab.session.searchFilters();
       draft.content = {std::string(name), ContentMode::Plain};
-      manager.submitSearchFilters();
+      manager.m_searchBarController.submitFilters();
       std::array<pid_t, 2> pids{};
       waitFor([&] {
         std::ifstream processes(work / (std::string(name) + ".pids"));
@@ -1490,7 +1509,7 @@ for path; do printf '%s\000' "$path"; done
 
     TEST_CHECK(manager.activateTab(otherId));
     manager.m_tabBar.rebuildIfDirty();
-    TEST_CHECK(searchingSpinner()->spinning() && !manager.m_searchSpinner->spinning());
+    TEST_CHECK(searchingSpinner()->spinning() && !manager.m_searchBarController.m_searchSpinner->spinning());
     manager.focusSearch();
     query(manager, "other-result");
     finish(manager);
@@ -1501,7 +1520,10 @@ for path; do printf '%s\000' "$path"; done
     searching.needsRefresh = true;
     TEST_CHECK(manager.activateTab(searchingId));
     TEST_CHECK(searching.session.entries().size() == 64);
-    TEST_CHECK(searching.session.search().status() == Status::Searching && manager.m_searchSpinner->spinning());
+    TEST_CHECK(
+        searching.session.search().status() == Status::Searching
+        && manager.m_searchBarController.m_searchSpinner->spinning()
+    );
     TEST_CHECK(manager.activateTab(otherId));
     manager.m_tabBar.rebuildIfDirty();
     TEST_CHECK(searchingSpinner()->spinning());
@@ -1513,7 +1535,7 @@ for path; do printf '%s\000' "$path"; done
     TEST_CHECK(orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Descending));
     TEST_CHECK(otherTab.session.search().query() == "other-result" && otherTab.session.entries().size() == 1);
     TEST_CHECK(manager.activateTab(searchingId));
-    TEST_CHECK(manager.m_searchStatus->text() == "128 found");
+    TEST_CHECK(manager.m_searchBarController.m_searchStatus->text() == "128 found");
     clickHeader(FileColumn::Name);
     waitFor([&] { return orderMatches(FileDialogSortField::Name, FileDialogSortOrder::Ascending); });
     TEST_CHECK(searching.session.search().status() == Status::Finished && searching.session.entries().size() == 128);
@@ -1522,7 +1544,7 @@ for path; do printf '%s\000' "$path"; done
     const auto stop = begin(searching, "stop");
     key(manager, XKB_KEY_Escape);
     TEST_CHECK(searching.session.search().status() == Status::Cancelled && searching.session.entries().size() == 64);
-    TEST_CHECK(!searchingSpinner()->spinning() && !manager.m_searchSpinner->spinning());
+    TEST_CHECK(!searchingSpinner()->spinning() && !manager.m_searchBarController.m_searchSpinner->spinning());
     cleanedUp(stop);
 
     const auto navigation = begin(searching, "navigation");
@@ -1598,8 +1620,8 @@ public:
     auto addressBar = std::make_unique<Flex>();
     addressBar->setMinHeight(32.0F);
     scene.addChild(std::move(addressBar));
-    manager.m_searchButton = &searchButton;
-    manager.buildSearchBar(scene, Style::spaceSm - scene.gap());
+    manager.m_searchBarController.m_searchButton = &searchButton;
+    manager.m_searchBarController.buildSearchBar(scene, Style::spaceSm - scene.gap());
     scene.addChild(manager.buildStatusRow(12.0F));
     scene.addChild(manager.m_listHeader.buildHeader());
     scene.addChild(manager.m_tabBar.buildUi());

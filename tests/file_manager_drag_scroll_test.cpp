@@ -537,8 +537,8 @@ public:
     scene.grid->scrollView().setScrollOffset(0.0F);
     scene.root.layout(scene.renderer);
     auto& tab = manager.activeTab();
-    tab.selectedPaths = {(rootDir / "file-0.txt").string()};
-    tab.selectedPath = rootDir / "file-0.txt";
+    tab.m_selectedPaths = {(rootDir / "file-0.txt").string()};
+    tab.m_selectedPath = rootDir / "file-0.txt";
     manager.m_transfers.m_dropValidationHook = [](const std::vector<std::string>& sources,
                                                   const std::filesystem::path& dest, auto done) {
       done(

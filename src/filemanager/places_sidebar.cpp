@@ -1,8 +1,12 @@
 #include "filemanager/places_sidebar.h"
 
+#include "cursor-shape-v1-client-protocol.h"
+#include "filemanager/byte_size_format.h"
 #include "filemanager/file_operation_manager.h"
 #include "filemanager/file_view_menu.h"
+#include "filemanager/menu_ids.h"
 #include "filemanager/place_metadata.h"
+#include "render/scene/input_dispatcher.h"
 #include "ui/controls/button.h"
 #include "ui/controls/flex.h"
 #include "ui/controls/label.h"
@@ -11,11 +15,13 @@
 #include "ui/dialogs/file_icon.h"
 #include "ui/palette.h"
 #include "ui/style.h"
+#include "wayland/wayland_connection.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <iomanip>
+#include <linux/input-event-codes.h>
 #include <sstream>
 
 namespace filemanager {
@@ -27,35 +33,7 @@ namespace filemanager {
 
     constexpr float kToolbarHeight = 32.0F;
 
-    std::filesystem::path normalizeDirectoryPath(const std::filesystem::path& path) {
-      auto normalized = path.lexically_normal();
-      if (normalized.filename().empty() && normalized.has_parent_path() && normalized != normalized.root_path())
-        normalized = normalized.parent_path();
-      return normalized;
-    }
-
-    std::string compactFreeSpace(std::uint64_t bytes) {
-      constexpr std::array<std::string_view, 7> units{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
-      double value = static_cast<double>(bytes);
-      std::size_t index = 0;
-      while (value >= 1024.0 && index + 1 < units.size()) {
-        value /= 1024.0;
-        ++index;
-      }
-      if (value >= 10.0)
-        value = std::round(value);
-      else
-        value = std::round(value * 10.0) / 10.0;
-      std::ostringstream out;
-      out
-          << std::fixed
-          << std::setprecision(value == std::round(value) ? 0 : 1)
-          << value
-          << ' '
-          << units[index]
-          << " free";
-      return out.str();
-    }
+    std::string compactFreeSpace(std::uint64_t bytes) { return formatCompactBinaryByteSize(bytes) + " free"; }
 
     void useSubtleSelection(Button& button, bool muted = false) {
       auto palette = Button::defaultPalette(button.variant());
@@ -93,9 +71,10 @@ namespace filemanager {
   } // namespace
 
   PlacesSidebarController::PlacesSidebarController(
-      FileManagerSettings& settings, FileOperationManager& operations, Callbacks callbacks
+      FileManagerSettings& settings, FileOperationManager& operations, PathResolutionCache& pathCache,
+      Callbacks callbacks
   )
-      : m_settings(settings), m_operations(operations), m_callbacks(std::move(callbacks)) {}
+      : m_settings(settings), m_operations(operations), m_pathCache(pathCache), m_callbacks(std::move(callbacks)) {}
 
   PlacesSidebarController::~PlacesSidebarController() { shutdown(); }
 
@@ -127,7 +106,7 @@ namespace filemanager {
     m_mountPrompts.clear();
     m_placesAlive.reset();
     cancelCapacityQueries();
-    cancelPathResolutions();
+    m_pathCache.cancel();
     m_model.reset();
     detachUi();
   }
@@ -158,176 +137,8 @@ namespace filemanager {
 
   bool PlacesSidebarController::isPersonalPlaceSaved(const std::filesystem::path& path) const {
     return std::ranges::any_of(m_placeRows, [&](const auto& row) {
-      return row.second.personal && samePersonalPlace(row.second.path, path);
+      return row.second.personal && m_pathCache.samePersonalPlace(row.second.path, path);
     });
-  }
-
-  void PlacesSidebarController::cancelPathResolutions() {
-    ++m_placePathGeneration;
-    if (m_placePathCancellable != nullptr) {
-      g_cancellable_cancel(m_placePathCancellable);
-      g_clear_object(&m_placePathCancellable);
-    }
-    m_placePathPending.clear();
-  }
-
-  bool PlacesSidebarController::samePersonalPlace(
-      const std::filesystem::path& first, const std::filesystem::path& second
-  ) const {
-    const auto normFirst = first.lexically_normal();
-    const auto normSecond = second.lexically_normal();
-    if (normFirst == normSecond)
-      return true;
-    const auto firstIt = m_placePathCache.find(normFirst.string());
-    const auto secondIt = m_placePathCache.find(normSecond.string());
-    const auto& firstTarget = firstIt != m_placePathCache.end() && !firstIt->second.canonicalPath.empty()
-        ? firstIt->second.canonicalPath
-        : normFirst;
-    const auto& secondTarget = secondIt != m_placePathCache.end() && !secondIt->second.canonicalPath.empty()
-        ? secondIt->second.canonicalPath
-        : normSecond;
-    return firstTarget == secondTarget;
-  }
-
-  std::optional<bool> PlacesSidebarController::sameDirectoryPathCached(
-      const std::filesystem::path& first, const std::filesystem::path& second
-  ) const {
-    const auto normFirst = normalizeDirectoryPath(first);
-    const auto normSecond = normalizeDirectoryPath(second);
-    if (normFirst == normSecond)
-      return true;
-    const auto firstIt = m_placePathCache.find(normFirst.string());
-    const auto secondIt = m_placePathCache.find(normSecond.string());
-    if (firstIt == m_placePathCache.end() || secondIt == m_placePathCache.end())
-      return std::nullopt;
-    if (!firstIt->second.exists
-        || !secondIt->second.exists
-        || firstIt->second.canonicalPath.empty()
-        || secondIt->second.canonicalPath.empty())
-      return false;
-    return firstIt->second.canonicalPath == secondIt->second.canonicalPath;
-  }
-
-  void PlacesSidebarController::compareDirectoriesAsync(
-      const std::filesystem::path& first, const std::filesystem::path& second, std::function<void(bool)> onResolved
-  ) {
-    if (const auto cached = sameDirectoryPathCached(first, second)) {
-      if (onResolved)
-        onResolved(*cached);
-      return;
-    }
-    const auto normFirst = normalizeDirectoryPath(first);
-    const auto normSecond = normalizeDirectoryPath(second);
-    struct CompareState {
-      std::size_t remaining = 2;
-      std::function<void(bool)> done;
-    };
-    auto state = std::make_shared<CompareState>(CompareState{.remaining = 2, .done = std::move(onResolved)});
-    auto step = [this, alive = std::weak_ptr<bool>(m_alive), normFirst, normSecond, state](const PlacePathResolution&) {
-      const auto locked = alive.lock();
-      if (!locked || !*locked || (m_callbacks.isQuitting && m_callbacks.isQuitting()))
-        return;
-      if (--state->remaining > 0)
-        return;
-      if (state->done)
-        state->done(sameDirectoryPathCached(normFirst, normSecond).value_or(false));
-    };
-    resolvePathAsync(normFirst, step, false);
-    resolvePathAsync(normSecond, step, false);
-  }
-
-  void
-  PlacesSidebarController::cacheResolvedPath(const std::filesystem::path& path, const PlacePathResolution& resolved) {
-    m_placePathCache[normalizeDirectoryPath(path).string()] = resolved;
-  }
-
-  void PlacesSidebarController::resolvePathAsync(
-      const std::filesystem::path& path, std::function<void(const PlacePathResolution&)> onResolved, bool refreshSidebar
-  ) {
-    if (path.empty() || path.string().starts_with("trash:")) {
-      if (onResolved)
-        onResolved(PlacePathResolution{});
-      return;
-    }
-    const auto normalized = normalizeDirectoryPath(path);
-    const std::string key = normalized.string();
-    if (const auto cached = m_placePathCache.find(key); cached != m_placePathCache.end()) {
-      if (onResolved)
-        onResolved(cached->second);
-      return;
-    }
-    const bool sidebarRefresh = !onResolved && refreshSidebar;
-    if (!onResolved && m_placePathPending.contains(key))
-      return;
-    if (!onResolved)
-      m_placePathPending.insert(key);
-
-    const auto generation = m_placePathGeneration;
-    std::weak_ptr<bool> alive = m_alive;
-    auto finishOnMain = [this, alive, generation, key, sidebarRefresh,
-                         onResolved = std::move(onResolved)](PlacePathResolution resolved) {
-      const auto locked = alive.lock();
-      if (!locked || !*locked || m_placePathGeneration != generation)
-        return;
-      m_placePathPending.erase(key);
-      m_placePathCache[key] = resolved;
-      if (onResolved) {
-        onResolved(resolved);
-      } else if (sidebarRefresh) {
-        markDirty(false);
-      }
-    };
-
-    if (m_placePathResolveHook) {
-      if (m_placePathResolveHook(normalized, std::move(finishOnMain)))
-        return;
-    }
-
-    if (m_placePathCancellable == nullptr)
-      m_placePathCancellable = g_cancellable_new();
-    struct ResolveRequest {
-      std::filesystem::path path;
-      std::function<void(PlacePathResolution)> done;
-    };
-    GTask* task = g_task_new(
-        nullptr, m_placePathCancellable,
-        [](GObject*, GAsyncResult* result, gpointer userData) {
-          std::unique_ptr<ResolveRequest> req(static_cast<ResolveRequest*>(userData));
-          GError* error = nullptr;
-          auto* resolved = static_cast<PlacePathResolution*>(g_task_propagate_pointer(G_TASK(result), &error));
-          const bool cancelled = g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED) != FALSE;
-          g_clear_error(&error);
-          if (resolved != nullptr) {
-            PlacePathResolution value = std::move(*resolved);
-            delete resolved;
-            if (!cancelled && req->done)
-              req->done(std::move(value));
-          }
-        },
-        new ResolveRequest{normalized, std::move(finishOnMain)}
-    );
-    auto* workerPath = new std::filesystem::path(normalized);
-    g_task_set_task_data(task, workerPath, [](gpointer p) { delete static_cast<std::filesystem::path*>(p); });
-    g_task_run_in_thread(task, [](GTask* worker, gpointer, gpointer taskData, GCancellable* cancellable) {
-      if (g_cancellable_is_cancelled(cancellable)) {
-        g_task_return_new_error(worker, G_IO_ERROR, G_IO_ERROR_CANCELLED, "cancelled");
-        return;
-      }
-      const auto& targetPath = *static_cast<const std::filesystem::path*>(taskData);
-      PlacePathResolution res;
-      std::error_code ec;
-      const auto canonical = std::filesystem::canonical(targetPath, ec);
-      if (!ec) {
-        res.exists = true;
-        res.canonicalPath = canonical;
-        std::error_code dirEc;
-        res.isDirectory = std::filesystem::is_directory(canonical, dirEc) && !dirEc;
-      }
-      g_task_return_pointer(worker, new PlacePathResolution(std::move(res)), [](gpointer p) {
-        delete static_cast<PlacePathResolution*>(p);
-      });
-    });
-    g_object_unref(task);
   }
 
   void PlacesSidebarController::savePlace(const std::filesystem::path& requested, bool verifiedDirectory) {
@@ -335,8 +146,9 @@ namespace filemanager {
     if ((!verifiedDirectory && browsingTrash) || requested.empty() || !requested.is_absolute())
       return;
     const auto path = requested.lexically_normal();
-    if (isPersonalPlaceSaved(path)
-        || std::ranges::any_of(m_savedPlaces, [&](const auto& saved) { return samePersonalPlace(saved.path, path); })) {
+    if (isPersonalPlaceSaved(path) || std::ranges::any_of(m_savedPlaces, [&](const auto& saved) {
+          return m_pathCache.samePersonalPlace(saved.path, path);
+        })) {
       if (m_callbacks.onStatus)
         m_callbacks.onStatus("This folder is already saved in Places");
       return;
@@ -354,7 +166,7 @@ namespace filemanager {
         return;
       }
       if (isPersonalPlaceSaved(path) || std::ranges::any_of(m_savedPlaces, [&](const auto& saved) {
-            return samePersonalPlace(saved.path, path);
+            return m_pathCache.samePersonalPlace(saved.path, path);
           })) {
         if (m_callbacks.onStatus)
           m_callbacks.onStatus("This folder is already saved in Places");
@@ -369,7 +181,7 @@ namespace filemanager {
     if (verifiedDirectory)
       save({.isDirectory = true});
     else
-      resolvePathAsync(path, std::move(save));
+      m_pathCache.resolveAsync(path, std::move(save));
   }
 
   std::optional<std::string>
@@ -497,7 +309,7 @@ namespace filemanager {
             continue;
           const auto& path = batch->candidates[idx];
           if (std::ranges::any_of(currentPlaces, [&](const auto& place) {
-                return place.personal && samePersonalPlace(place.path, path);
+                return place.personal && m_pathCache.samePersonalPlace(place.path, path);
               }))
             continue;
           gchar* uuid = g_uuid_string_random();
@@ -521,7 +333,7 @@ namespace filemanager {
       if (verifiedDirectories)
         onResolved({.isDirectory = true});
       else
-        resolvePathAsync(candidates[i], std::move(onResolved));
+        m_pathCache.resolveAsync(candidates[i], std::move(onResolved));
     }
   }
 
@@ -530,30 +342,30 @@ namespace filemanager {
     std::vector<ContextMenuControlEntry> entries;
     if (place.mounted)
       entries.push_back(
-          {.id = 30,
+          {.id = menu_id::kPlaceOpen,
            .label = "Open",
            .actionIconNames = {"folder-open-symbolic", "folder-open"},
            .actionGlyph = "folder-open"}
       );
     if (place.mounted && !place.path.empty())
       entries.push_back(
-          {.id = 41,
+          {.id = menu_id::kPlaceOpenInNewTab,
            .label = "Open in New Tab",
            .actionIconNames = {"tab-new-symbolic", "tab-new"},
            .actionGlyph = "plus"}
       );
     if (place.identity == "personal:trash")
-      entries.push_back({.id = 72, .label = "Empty Wastebin…"});
+      entries.push_back({.id = menu_id::kEmptyWastebin, .label = "Empty Wastebin…"});
     if (place.identity != "personal:trash") {
       entries.push_back(
-          {.id = 39,
+          {.id = menu_id::kPlaceProperties,
            .label = "Properties",
            .actionIconNames = {"document-properties-symbolic", "document-properties"},
            .actionGlyph = "file-info"}
       );
       if (place.mounted && !place.path.empty())
         entries.push_back(
-            {.id = 40,
+            {.id = menu_id::kPlaceOpenNewWindow,
              .label = "Open in New Window",
              .actionIconNames = {"window-new-symbolic", "window-new"},
              .actionGlyph = "app-window"}
@@ -561,34 +373,40 @@ namespace filemanager {
     }
     if (place.identity.starts_with("saved:"))
       entries.push_back(
-          {.id = 31,
+          {.id = menu_id::kPlaceRemove,
            .label = "Remove from Places",
            .actionIconNames = {"bookmark-remove-symbolic", "bookmark-remove"},
            .actionGlyph = "bookmark-minus"}
       );
     else if (place.mounted && !place.personal && !place.path.empty())
       entries.push_back(
-          {.id = 32,
+          {.id = menu_id::kPlacePin,
            .label = "Add to Places",
            .actionIconNames = {"bookmark-new-symbolic", "bookmark-new"},
            .actionGlyph = "bookmark-plus"}
       );
     if (!m_deviceOperations.contains(place.identity)) {
       if (place.canMount)
-        entries.push_back({.id = 33, .label = "Mount"});
+        entries.push_back({.id = menu_id::kPlaceMount, .label = "Mount"});
       if (place.canUnmount)
-        entries.push_back({.id = 34, .label = "Unmount"});
+        entries.push_back({.id = menu_id::kPlaceUnmount, .label = "Unmount"});
       if (place.canEject)
-        entries.push_back({.id = 35, .label = "Eject"});
+        entries.push_back({.id = menu_id::kPlaceEject, .label = "Eject"});
     }
     const auto hidden = m_settings.loadHiddenMounts();
     if (!place.personal) {
       const bool isHidden = std::ranges::find(hidden, place.identity) != hidden.end();
-      entries.push_back({.id = isHidden ? 37 : 36, .label = isHidden ? "Show in Places" : "Hide from Places"});
+      entries.push_back(
+          {.id = isHidden ? menu_id::kPlaceUnhide : menu_id::kPlaceHide,
+           .label = isHidden ? "Show in Places" : "Hide from Places"}
+      );
     }
     if (!hidden.empty() || m_showHiddenMounts)
       entries.push_back(
-          {.id = 38, .label = "Show hidden mounts", .checkmark = true, .toggleState = m_showHiddenMounts ? 1 : 0}
+          {.id = menu_id::kPlaceToggleShowHidden,
+           .label = "Show hidden mounts",
+           .checkmark = true,
+           .toggleState = m_showHiddenMounts ? 1 : 0}
       );
     groupFileMenuEntries(entries, FileMenuContext::Places);
     if (m_callbacks.onShowMenu)
@@ -621,8 +439,11 @@ namespace filemanager {
     m_placeMenuTarget.reset();
     if (m_callbacks.onShowMenu)
       m_callbacks.onShowMenu(
-          {{.id = 38, .label = "Show hidden mounts", .checkmark = true, .toggleState = m_showHiddenMounts ? 1 : 0}}, x,
-          y
+          {{.id = menu_id::kPlaceToggleShowHidden,
+            .label = "Show hidden mounts",
+            .checkmark = true,
+            .toggleState = m_showHiddenMounts ? 1 : 0}},
+          x, y
       );
   }
 
@@ -775,19 +596,22 @@ namespace filemanager {
           const auto norm = place.path.lexically_normal();
           const std::string key = norm.string();
           const bool isHome = place.identity.starts_with("personal:home:");
-          const auto cached = m_placePathCache.find(key);
-          if (cached != m_placePathCache.end()) {
-            if (!isHome && !cached->second.isDirectory)
+          if (const auto cached = m_pathCache.findCached(norm)) {
+            if (!isHome && !cached->isDirectory)
               continue;
-            const std::string targetKey =
-                cached->second.canonicalPath.empty() ? key : cached->second.canonicalPath.string();
+            const std::string targetKey = cached->canonicalPath.empty() ? key : cached->canonicalPath.string();
             if (!isHome && !seenPersonalTargets.insert(targetKey).second)
               continue;
             if (isHome)
               seenPersonalTargets.insert(targetKey);
           } else {
             seenPersonalTargets.insert(key);
-            resolvePathAsync(norm);
+            m_pathCache.resolveAsync(norm, [this, alive = std::weak_ptr<bool>(m_alive)](const PlacePathResolution&) {
+              const auto locked = alive.lock();
+              if (!locked || !*locked)
+                return;
+              markDirty(false);
+            });
           }
         }
         filtered.push_back(std::move(place));
@@ -808,7 +632,12 @@ namespace filemanager {
     std::unordered_set<std::string> savedPaths;
     for (const auto& saved : m_savedPlaces) {
       const auto norm = saved.path.lexically_normal();
-      resolvePathAsync(norm);
+      m_pathCache.resolveAsync(norm, [this, alive = std::weak_ptr<bool>(m_alive)](const PlacePathResolution&) {
+        const auto locked = alive.lock();
+        if (!locked || !*locked)
+          return;
+        markDirty(false);
+      });
       if (!savedPaths.insert(norm.string()).second)
         continue;
       places.push_back(
@@ -1201,6 +1030,98 @@ namespace filemanager {
         return i;
     }
     return std::nullopt;
+  }
+
+  void PlacesSidebarController::cancelGesture() {
+    m_reorderId.reset();
+    m_reorderBefore.reset();
+    m_reordering = false;
+    showPlaceInsertion(std::nullopt);
+  }
+
+  bool PlacesSidebarController::handleActiveReorderPointer(
+      const PointerEvent& event, float x, float y, std::uint32_t pointerSerial
+  ) {
+    if (!m_reorderId)
+      return false;
+    const auto source =
+        std::ranges::find_if(m_placeRows, [this](const auto& pair) { return pair.second.identity == *m_reorderId; });
+    if (event.type == PointerEvent::Type::Axis && m_reordering) {
+      if (m_callbacks.onPointerAxis)
+        m_callbacks.onPointerAxis(event, x, y);
+      if (source != m_placeRows.end()) {
+        const auto& place = source->second;
+        m_reorderBefore = placeInsertionAt(
+            x, y,
+            place.personal      ? "Personal"
+                : place.network ? "Network"
+                                : "Devices",
+            false
+        );
+        showPlaceInsertion(m_reorderBefore);
+        if (m_callbacks.onRequestRedraw)
+          m_callbacks.onRequestRedraw();
+      }
+      return true;
+    }
+    if (event.type == PointerEvent::Type::Motion) {
+      if (std::hypot(x - m_dragStartX, y - m_dragStartY) > 5.0F)
+        m_reordering = true;
+      m_reorderBefore.reset();
+      if (m_reordering && source != m_placeRows.end()) {
+        const auto& place = source->second;
+        m_reorderBefore = placeInsertionAt(
+            x, y,
+            place.personal      ? "Personal"
+                : place.network ? "Network"
+                                : "Devices",
+            false
+        );
+      }
+      showPlaceInsertion(m_reorderBefore);
+      if (pointerSerial && m_reordering && m_callbacks.onSetCursorShape)
+        m_callbacks.onSetCursorShape(
+            pointerSerial,
+            m_reorderBefore ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED
+        );
+      if (m_callbacks.onRequestRedraw)
+        m_callbacks.onRequestRedraw();
+      return true;
+    }
+    if (event.type == PointerEvent::Type::Button && event.button == BTN_LEFT && !event.pressed) {
+      if (m_reordering && m_reorderBefore)
+        reorderPlace(*m_reorderId, *m_reorderBefore);
+      else if (!m_reordering && source != m_placeRows.end()) {
+        const auto place = source->second;
+        if (place.mounted && m_callbacks.onNavigate)
+          m_callbacks.onNavigate(place.path, true);
+      }
+      cancelGesture();
+      if (m_callbacks.onCancelPointerCapture)
+        m_callbacks.onCancelPointerCapture();
+      if (pointerSerial && m_callbacks.onSetCursorShape)
+        m_callbacks.onSetCursorShape(pointerSerial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+      if (m_callbacks.onRequestRedraw)
+        m_callbacks.onRequestRedraw();
+      return true;
+    }
+    return true;
+  }
+
+  bool PlacesSidebarController::tryBeginReorderPress(const PointerEvent& event, float x, float y) {
+    if (event.type != PointerEvent::Type::Button || event.button != BTN_LEFT || !event.pressed)
+      return false;
+    const auto row = rowIndexAt(x, y);
+    if (!row)
+      return false;
+    const auto& place = m_placeRows[*row].second;
+    m_reorderId = place.identity;
+    m_dragStartX = x;
+    m_dragStartY = y;
+    m_reordering = false;
+    if (m_callbacks.onCancelPointerCapture)
+      m_callbacks.onCancelPointerCapture();
+    return true;
   }
 
 } // namespace filemanager

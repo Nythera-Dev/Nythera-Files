@@ -241,9 +241,7 @@ namespace {
     TEST_CHECK(count >= 0);
     std::vector<gid_t> groups(static_cast<std::size_t>(count));
     TEST_CHECK(getgroups(count, groups.data()) == count);
-    const auto group = std::ranges::find_if(groups, [&](gid_t gid) {
-      return gid != getegid() && gid != excluded;
-    });
+    const auto group = std::ranges::find_if(groups, [&](gid_t gid) { return gid != getegid() && gid != excluded; });
     return group == groups.end() ? std::nullopt : std::optional<gid_t>{*group};
   }
 
@@ -284,7 +282,7 @@ namespace {
     TEST_CHECK(copied->totalBytes == std::filesystem::file_size(from / "nested" / "payload.txt"));
     TEST_CHECK(copied->processedBytes == copied->totalBytes && copied->totalFiles == 1 && copied->processedFiles == 1);
     TEST_CHECK(copied->resultTitle == "Copy completed");
-    TEST_CHECK(copied->resultDescription.starts_with("1 file copied to "));
+    TEST_CHECK(copied->resultDescription == "1 file copied to " + to.string());
     TEST_CHECK(copied->completedEntries.size() == 1);
     assertCompletedEntry(*copied, 0, to / "nested");
     TEST_CHECK(!waitFor(manager, manager.copy({(from / "nested").string()}, to.string())));
@@ -300,7 +298,10 @@ namespace {
     });
     TEST_CHECK(invalidCopy != manager.operations().end());
     TEST_CHECK(invalidCopy->resultTitle == "Copy failed");
-    TEST_CHECK(invalidCopy->resultDescription == "Cannot copy \"from\" into itself");
+    TEST_CHECK(
+        invalidCopy->resultDescription
+        == "Cannot copy \"from\" into itself · Destination: " + (from / "nested").string()
+    );
     const auto batchSourceA = root / "batch-a.txt";
     const auto batchSourceB = root / "batch-b.txt";
     {
@@ -624,6 +625,65 @@ namespace {
     const auto skippedBatch =
         std::ranges::find(manager.operations(), skippedBatchId, &FileOperationManager::Operation::id);
     TEST_CHECK(skippedBatch->completedEntries.empty());
+    TEST_CHECK(skippedBatch->resultTitle == "Copy skipped");
+    TEST_CHECK(skippedBatch->resultDescription == "No items copied to " + to.string() + " · 2 skipped");
+
+    auto write = [](const auto& path, const std::string& text) {
+      std::ofstream file(path);
+      file << text;
+    };
+    auto read = [](const auto& path) {
+      std::ifstream file(path);
+      return std::string(std::istreambuf_iterator<char>(file), {});
+    };
+    {
+      const auto source = root / "notification-source";
+      const auto games =
+          env.home() / "parent-with-a-long-enough-name-to-require-the-entire-original-path-to-be-preserved" / "Games";
+      std::filesystem::create_directories(source);
+      std::filesystem::create_directories(games);
+      const auto keep = source / "keep";
+      const auto skip = source / "skip";
+      const auto cancel = source / "cancel";
+      write(keep, "copied");
+      write(skip, "incoming skipped");
+      write(cancel, "incoming cancelled");
+      write(games / "skip", "keep old");
+      write(games / "cancel", "keep old");
+      FileOperationManager notifications;
+      TEST_CHECK(waitFor(notifications, notifications.copy({keep.string()}, env.home().string())));
+      TEST_CHECK(notifications.operations().back().resultDescription == "1 file copied to " + env.home().string());
+
+      notifications.setConflictResolver([](const auto& name, const auto&, bool, const auto&, GCancellable*) {
+        return FileOperationManager::ConflictDecision{
+            .action = std::filesystem::path(name).filename() == "skip" ? FileOperationManager::ConflictAction::Skip
+                                                                       : FileOperationManager::ConflictAction::Cancel
+        };
+      });
+      TEST_CHECK(waitFor(notifications, notifications.copy({skip.string()}, games.string())));
+      TEST_CHECK(notifications.operations().back().resultTitle == "Copy skipped");
+      TEST_CHECK(
+          notifications.operations().back().resultDescription == "No items copied to " + games.string() + " · 1 skipped"
+      );
+
+      TEST_CHECK(waitFor(notifications, notifications.copy({keep.string(), skip.string()}, games.string())));
+      TEST_CHECK(notifications.operations().back().resultTitle == "Copy completed with skips");
+      TEST_CHECK(
+          notifications.operations().back().resultDescription == "1 file copied to " + games.string() + " · 1 skipped"
+      );
+      std::filesystem::remove(games / "keep");
+
+      TEST_CHECK(
+          !waitFor(notifications, notifications.copy({keep.string(), skip.string(), cancel.string()}, games.string()))
+      );
+      const auto& cancelled = notifications.operations().back();
+      TEST_CHECK(cancelled.resultTitle == "Copy cancelled");
+      TEST_CHECK(
+          cancelled.resultDescription == "Transfer to " + games.string() + " was cancelled · 1 file copied · 1 skipped"
+      );
+      TEST_CHECK(read(games / "keep") == "copied");
+      TEST_CHECK(read(games / "skip") == "keep old" && read(games / "cancel") == "keep old");
+    }
     {
       std::ifstream file(to / "all-a.txt");
       std::string value;
@@ -666,14 +726,14 @@ namespace {
       file << "existing payload";
     }
     int mixedConflictCount = 0;
-    manager.setConflictResolver([&mixedConflictCount](
-                                    const std::string&, const std::string&, bool, const auto&, GCancellable*
-                                ) {
-      ++mixedConflictCount;
-      return FileOperationManager::ConflictDecision{
-          FileOperationManager::ConflictAction::Skip, mixedConflictCount == 1
-      };
-    });
+    manager.setConflictResolver(
+        [&mixedConflictCount](const std::string&, const std::string&, bool, const auto&, GCancellable*) {
+          ++mixedConflictCount;
+          return FileOperationManager::ConflictDecision{
+              FileOperationManager::ConflictAction::Skip, mixedConflictCount == 1
+          };
+        }
+    );
     TEST_CHECK(waitFor(
         manager, manager.copy({mixedFile.string(), mixedFolder.string(), mixedFileAfterFolder.string()}, to.string())
     ));
@@ -725,14 +785,6 @@ namespace {
     const auto mergeTarget = mergeParent / "tree";
     std::filesystem::create_directories(mergeSource / "nested");
     std::filesystem::create_directories(mergeTarget / "nested");
-    auto write = [](const auto& path, const std::string& text) {
-      std::ofstream file(path);
-      file << text;
-    };
-    auto read = [](const auto& path) {
-      std::ifstream file(path);
-      return std::string(std::istreambuf_iterator<char>(file), {});
-    };
     write(mergeSource / "only-source.txt", "source");
     write(mergeTarget / "only-destination.txt", "destination");
     write(mergeSource / "nested" / "replace.txt", "new");
@@ -1598,8 +1650,11 @@ namespace {
       TEST_CHECK(std::filesystem::read_symlink(nrSymRenamed) == "relative-target-value");
       struct stat afterLink{};
       TEST_CHECK(lstat(nrSymRenamed.c_str(), &afterLink) == 0);
-      TEST_CHECK(afterLink.st_uid == beforeLink.st_uid && afterLink.st_gid == beforeLink.st_gid
-                 && afterLink.st_mode == beforeLink.st_mode);
+      TEST_CHECK(
+          afterLink.st_uid == beforeLink.st_uid
+          && afterLink.st_gid == beforeLink.st_gid
+          && afterLink.st_mode == beforeLink.st_mode
+      );
       setFileOperationLinkAtHookForTesting({});
 
       // Split-state preservation: if linkat publishes the new destination during
@@ -2137,9 +2192,7 @@ namespace {
               return defaults.st_gid;
             }();
             const auto alternateGroup = supplementaryGroupOtherThan(destinationGroup);
-            const std::array metadataPaths{
-                shmSrcFile, shmSrcDir, shmSrcDir / "deep" / "data", shmSrcDir / "link"
-            };
+            const std::array metadataPaths{shmSrcFile, shmSrcDir, shmSrcDir / "deep" / "data", shmSrcDir / "link"};
             std::array<struct stat, metadataPaths.size()> originalMetadata{};
             for (std::size_t i = 0; i < metadataPaths.size(); ++i) {
               if (alternateGroup) {
@@ -2158,8 +2211,11 @@ namespace {
               struct stat moved{};
               const auto path = shmDst / metadataPaths[i].lexically_relative(crossSimSrc);
               TEST_CHECK(lstat(path.c_str(), &moved) == 0);
-              TEST_CHECK(moved.st_uid == originalMetadata[i].st_uid && moved.st_gid == originalMetadata[i].st_gid
-                         && moved.st_mode == originalMetadata[i].st_mode);
+              TEST_CHECK(
+                  moved.st_uid == originalMetadata[i].st_uid
+                  && moved.st_gid == originalMetadata[i].st_gid
+                  && moved.st_mode == originalMetadata[i].st_mode
+              );
             }
             TEST_CHECK(modeOf(shmDst / "shm-file.bin") == 04750);
             TEST_CHECK(modeOf(shmDst / "shm-dir") == 0750);

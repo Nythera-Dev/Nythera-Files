@@ -439,10 +439,8 @@ namespace filemanager {
               auto* tab = findTab(tabId);
               if (tab == nullptr)
                 return;
-              tab->selectedPath.reset();
-              tab->selectedPaths.clear();
-              tab->selectionAnchor.reset();
-              tab->browsingSelection.reset();
+              tab->clearSelection();
+              tab->clearBrowsingSelection();
               tab->pendingScrollOffsetAfterRefresh.reset();
               if (m_callbacks.onAnyBeforePathChange)
                 m_callbacks.onAnyBeforePathChange(*tab, newPath);
@@ -489,20 +487,7 @@ namespace filemanager {
               auto* tab = findTab(tabId);
               if (tab == nullptr)
                 return;
-              if (!tab->selectedPaths.empty()) {
-                const auto selected = tab->selectedPathsOrdered();
-                tab->selectedPaths = std::unordered_set<std::string>(selected.begin(), selected.end());
-              }
-              if (tab->selectedPath
-                  && std::ranges::find(tab->session.entries(), *tab->selectedPath, &FileEntry::absPath)
-                      == tab->session.entries().end()) {
-                tab->selectedPath.reset();
-              }
-              if (tab->selectionAnchor
-                  && std::ranges::find(tab->session.entries(), *tab->selectionAnchor, &FileEntry::absPath)
-                      == tab->session.entries().end()) {
-                tab->selectionAnchor.reset();
-              }
+              tab->reconcileSelectionWithEntries();
               if (m_callbacks.onSearchActivityChanged)
                 m_callbacks.onSearchActivityChanged(tabId);
               if (tabId == m_activeTabId && m_callbacks.onActiveEntriesLoaded)
@@ -523,35 +508,22 @@ namespace filemanager {
               auto* tab = findTab(tabId);
               if (tab == nullptr)
                 return;
-              if (tab->selectedPath == oldPath)
-                tab->selectedPath = newPath;
-              if (tab->selectionAnchor == oldPath)
-                tab->selectionAnchor = newPath;
-              if (tab->selectedPaths.erase(oldPath.string()))
-                tab->selectedPaths.insert(newPath.string());
+              tab->renameSelectedPath(oldPath, newPath);
             },
         .onEntryMonitoredRemoved =
             [this, tabId](const std::filesystem::path& path) {
               auto* tab = findTab(tabId);
               if (tab == nullptr)
                 return;
-              if (tab->selectedPath == path)
-                tab->selectedPath.reset();
-              tab->selectedPaths.erase(path.string());
-              if (tab->selectionAnchor == path)
-                tab->selectionAnchor.reset();
+              tab->eraseSelectedPath(path);
             },
         .onEntriesChanged =
             [this, tabId] {
               auto* tab = findTab(tabId);
               if (!tab)
                 return;
-              if (!tab->session.search().active() && tab->browsingSelection) {
-                tab->selectedPath = std::move(tab->browsingSelection->path);
-                tab->selectedPaths = std::move(tab->browsingSelection->paths);
-                tab->selectionAnchor = std::move(tab->browsingSelection->anchor);
-                tab->browsingSelection.reset();
-              }
+              if (!tab->session.search().active())
+                (void)tab->restoreBrowsingSelection();
               if (m_callbacks.onSearchActivityChanged)
                 m_callbacks.onSearchActivityChanged(tabId);
               if (tabId == m_activeTabId && m_callbacks.onActiveEntriesChanged)

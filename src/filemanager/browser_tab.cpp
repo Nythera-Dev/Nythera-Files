@@ -16,55 +16,57 @@ namespace filemanager {
     session.setShowHidden(viewState.showHidden);
     session.setFoldersFirst(viewState.foldersFirst);
     session.setHiddenLast(viewState.hiddenLast);
-    session.setPrivilegedBackend(DirectorySession::PrivilegedBackend{
-        .isActive = [this] { return adminSession.isActive(); },
-        .enumerateDirectory =
-            [this](
-                const std::filesystem::path& path,
-                bool userInitiated,
-                std::function<void(const std::vector<AdminDirEntryRecord>&)> onBatch,
-                std::function<void(bool ok, bool writable, const std::string& errorDetail)> onComplete
-            ) {
-              return adminSession.listDirectoryAsync(
-                  path, userInitiated, kAdminDefaultDirBatchEntries, std::move(onBatch),
-                  [onComplete = std::move(onComplete)](
-                      bool ok, bool writable, std::uint64_t, AdminStatusCode, const std::string& detail
-                  ) {
-                    if (onComplete)
-                      onComplete(ok, writable, detail);
-                  }
-              );
-            },
-        .queryWritable =
-            [this](const std::filesystem::path& path, std::function<void(bool writable)> onComplete) {
-              return adminSession.statInfoAsync(
-                  path, false,
-                  [onComplete = std::move(onComplete)](
-                      bool ok, const AdminStatRecord& rec, AdminStatusCode, const std::string&
-                  ) {
-                    if (onComplete)
-                      onComplete(ok && rec.exists && rec.writable);
-                  }
-              );
-            },
-        .countFolderItems =
-            [this](const std::filesystem::path& path, std::function<void(std::optional<std::uint64_t>)> onComplete) {
-              return adminSession.countDirectoryItemsAsync(
-                  path,
-                  [onComplete = std::move(onComplete)](
-                      bool ok, std::uint64_t count, AdminStatusCode, const std::string&
-                  ) {
-                    if (onComplete)
-                      onComplete(ok ? std::optional<std::uint64_t>(count) : std::nullopt);
-                  }
-              );
-            },
-        .cancelRequest =
-            [this](AdminRequestId reqId) {
-              if (adminSession.isActive() && reqId != kInvalidAdminRequestId)
-                (void)adminSession.cancelRequestAsync(reqId);
-            },
-    });
+    session.setPrivilegedBackend(
+        DirectorySession::PrivilegedBackend{
+            .isActive = [this] { return adminSession.isActive(); },
+            .enumerateDirectory =
+                [this](
+                    const std::filesystem::path& path, bool userInitiated,
+                    std::function<void(const std::vector<AdminDirEntryRecord>&)> onBatch,
+                    std::function<void(bool ok, bool writable, const std::string& errorDetail)> onComplete
+                ) {
+                  return adminSession.listDirectoryAsync(
+                      path, userInitiated, kAdminDefaultDirBatchEntries, std::move(onBatch),
+                      [onComplete = std::move(onComplete)](
+                          bool ok, bool writable, std::uint64_t, AdminStatusCode, const std::string& detail
+                      ) {
+                        if (onComplete)
+                          onComplete(ok, writable, detail);
+                      }
+                  );
+                },
+            .queryWritable =
+                [this](const std::filesystem::path& path, std::function<void(bool writable)> onComplete) {
+                  return adminSession.statInfoAsync(
+                      path, false,
+                      [onComplete = std::move(onComplete)](
+                          bool ok, const AdminStatRecord& rec, AdminStatusCode, const std::string&
+                      ) {
+                        if (onComplete)
+                          onComplete(ok && rec.exists && rec.writable);
+                      }
+                  );
+                },
+            .countFolderItems =
+                [this](
+                    const std::filesystem::path& path, std::function<void(std::optional<std::uint64_t>)> onComplete
+                ) {
+                  return adminSession.countDirectoryItemsAsync(
+                      path,
+                      [onComplete =
+                           std::move(onComplete)](bool ok, std::uint64_t count, AdminStatusCode, const std::string&) {
+                        if (onComplete)
+                          onComplete(ok ? std::optional<std::uint64_t>(count) : std::nullopt);
+                      }
+                  );
+                },
+            .cancelRequest =
+                [this](AdminRequestId reqId) {
+                  if (adminSession.isActive() && reqId != kInvalidAdminRequestId)
+                    (void)adminSession.cancelRequestAsync(reqId);
+                },
+        }
+    );
   }
 
   BrowserTab::~BrowserTab() { shutdown(); }
@@ -86,9 +88,7 @@ namespace filemanager {
     cancelSelectionInfoQuery();
     cancelStatusFreeSpaceQuery();
     adminSession.stopSession(true);
-    selectedPath.reset();
-    selectedPaths.clear();
-    selectionAnchor.reset();
+    clearSelection();
     pendingPasteSelection.reset();
     identityCheckedPaths.clear();
     pendingPasteRevealPath.reset();
@@ -118,19 +118,19 @@ namespace filemanager {
 
   std::vector<std::string> BrowserTab::selectedPathsOrdered() const {
     std::vector<std::string> paths;
-    paths.reserve(selectedPaths.size());
+    paths.reserve(m_selectedPaths.size());
     for (const auto& entry : session.entries()) {
-      if (selectedPaths.contains(entry.absPath.string()))
+      if (m_selectedPaths.contains(entry.absPath.string()))
         paths.push_back(entry.absPath.string());
     }
     return paths;
   }
 
   std::optional<std::pair<std::filesystem::path, bool>> BrowserTab::symlinkSelection() const {
-    if (session.browsingTrash() || session.browsingArchive() || session.loading() || selectedPaths.size() != 1)
+    if (session.browsingTrash() || session.browsingArchive() || session.loading() || m_selectedPaths.size() != 1)
       return std::nullopt;
     const auto selected = std::ranges::find_if(session.entries(), [this](const auto& entry) {
-      return selectedPaths.contains(entry.absPath.string());
+      return m_selectedPaths.contains(entry.absPath.string());
     });
     if (selected == session.entries().end() || (administratorBrowsing && selected->isSymlink))
       return std::nullopt;
@@ -138,6 +138,125 @@ namespace filemanager {
       return std::nullopt;
     return std::pair{selected->absPath, selected->isDir};
   }
+
+  void BrowserTab::clearSelection() {
+    m_selectedPath.reset();
+    m_selectedPaths.clear();
+    m_selectionAnchor.reset();
+  }
+
+  void BrowserTab::selectSingle(const std::filesystem::path& path, bool updateAnchor) {
+    m_selectedPaths.clear();
+    m_selectedPaths.insert(path.string());
+    m_selectedPath = path;
+    if (updateAnchor)
+      m_selectionAnchor = path;
+  }
+
+  void BrowserTab::setSelection(
+      std::unordered_set<std::string> paths, std::optional<std::filesystem::path> primary,
+      std::optional<std::filesystem::path> anchor
+  ) {
+    m_selectedPaths = std::move(paths);
+    m_selectedPath = std::move(primary);
+    m_selectionAnchor = std::move(anchor);
+  }
+
+  void BrowserTab::setSelectionWithAnchor(
+      std::unordered_set<std::string> paths, std::optional<std::filesystem::path> primary
+  ) {
+    m_selectedPaths = std::move(paths);
+    m_selectedPath = std::move(primary);
+    m_selectionAnchor = m_selectedPath;
+  }
+
+  void BrowserTab::toggleSelection(const std::filesystem::path& path) {
+    const std::string key = path.string();
+    if (!m_selectedPaths.erase(key))
+      m_selectedPaths.insert(key);
+    m_selectedPath = path;
+    m_selectionAnchor = path;
+  }
+
+  void BrowserTab::selectRange(
+      std::size_t targetIndex, bool keepExisting, const std::optional<std::filesystem::path>& fallbackAnchor
+  ) {
+    const auto& entries = session.entries();
+    if (targetIndex >= entries.size())
+      return;
+    if (!m_selectionAnchor)
+      m_selectionAnchor = fallbackAnchor ? *fallbackAnchor : entries[targetIndex].absPath;
+    const auto anchor = std::ranges::find(entries, *m_selectionAnchor, &FileEntry::absPath);
+    if (anchor != entries.end()) {
+      const auto anchorIndex = static_cast<std::size_t>(anchor - entries.begin());
+      const auto first = std::min(anchorIndex, targetIndex);
+      const auto last = std::max(anchorIndex, targetIndex);
+      if (!keepExisting)
+        m_selectedPaths.clear();
+      for (auto idx = first; idx <= last; ++idx)
+        m_selectedPaths.insert(entries[idx].absPath.string());
+    } else if (!keepExisting) {
+      m_selectedPaths = {entries[targetIndex].absPath.string()};
+      m_selectionAnchor = entries[targetIndex].absPath;
+    } else {
+      m_selectedPaths.insert(entries[targetIndex].absPath.string());
+    }
+    m_selectedPath = entries[targetIndex].absPath;
+  }
+
+  void BrowserTab::moveSelectionFocus(const std::filesystem::path& path) { m_selectedPath = path; }
+
+  void BrowserTab::renameSelectedPath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath) {
+    if (m_selectedPath == oldPath)
+      m_selectedPath = newPath;
+    if (m_selectionAnchor == oldPath)
+      m_selectionAnchor = newPath;
+    if (m_selectedPaths.erase(oldPath.string()))
+      m_selectedPaths.insert(newPath.string());
+  }
+
+  void BrowserTab::eraseSelectedPath(const std::filesystem::path& path) {
+    if (m_selectedPath == path)
+      m_selectedPath.reset();
+    m_selectedPaths.erase(path.string());
+    if (m_selectionAnchor == path)
+      m_selectionAnchor.reset();
+  }
+
+  void BrowserTab::reconcileSelectionWithEntries() {
+    if (!m_selectedPaths.empty()) {
+      const auto selected = selectedPathsOrdered();
+      m_selectedPaths = std::unordered_set<std::string>(selected.begin(), selected.end());
+    }
+    if (m_selectedPath
+        && std::ranges::find(session.entries(), *m_selectedPath, &FileEntry::absPath) == session.entries().end()) {
+      m_selectedPath.reset();
+    }
+    if (m_selectionAnchor
+        && std::ranges::find(session.entries(), *m_selectionAnchor, &FileEntry::absPath) == session.entries().end()) {
+      m_selectionAnchor.reset();
+    }
+  }
+
+  void BrowserTab::saveBrowsingSelection() {
+    m_browsingSelection = BrowsingSelection{
+        std::move(m_selectedPath),
+        std::move(m_selectedPaths),
+        std::move(m_selectionAnchor),
+    };
+  }
+
+  bool BrowserTab::restoreBrowsingSelection() {
+    if (!m_browsingSelection)
+      return false;
+    m_selectedPath = std::move(m_browsingSelection->path);
+    m_selectedPaths = std::move(m_browsingSelection->paths);
+    m_selectionAnchor = std::move(m_browsingSelection->anchor);
+    m_browsingSelection.reset();
+    return true;
+  }
+
+  void BrowserTab::clearBrowsingSelection() { m_browsingSelection.reset(); }
 
   void BrowserTab::cancelStatusFreeSpaceQuery() {
     ++m_statusFreeSpaceGeneration;
@@ -177,9 +296,8 @@ namespace filemanager {
     if (hasActiveAdminSession()) {
       m_statusFreeSpaceAdminReqId = adminSession.statVfsAsync(
           path,
-          [this, weakAlive, generation, path](
-              bool ok, const AdminStatVfsRecord& rec, AdminStatusCode, const std::string&
-          ) {
+          [this, weakAlive, generation,
+           path](bool ok, const AdminStatVfsRecord& rec, AdminStatusCode, const std::string&) {
             const auto locked = weakAlive.lock();
             if (!locked || !*locked || m_statusFreeSpaceGeneration != generation || session.path() != path)
               return;
@@ -261,8 +379,8 @@ namespace filemanager {
         if (!locked
             || !*locked
             || m_selectionInfoGeneration != generation
-            || selectedPaths.size() != 1
-            || *selectedPaths.begin() != path.string()) {
+            || m_selectedPaths.size() != 1
+            || *m_selectedPaths.begin() != path.string()) {
           return;
         }
         m_selectionInfo = std::move(info);
@@ -275,17 +393,15 @@ namespace filemanager {
 
     if (hasActiveAdminSession()) {
       m_selectionInfoAdminReqId = adminSession.statInfoAsync(
-          path,
-          false,
-          [this, weakAlive, generation, path](
-              bool ok, const AdminStatRecord& rec, AdminStatusCode, const std::string&
-          ) {
+          path, false,
+          [this, weakAlive, generation,
+           path](bool ok, const AdminStatRecord& rec, AdminStatusCode, const std::string&) {
             const auto locked = weakAlive.lock();
             if (!locked
                 || !*locked
                 || m_selectionInfoGeneration != generation
-                || selectedPaths.size() != 1
-                || *selectedPaths.begin() != path.string()) {
+                || m_selectedPaths.size() != 1
+                || *m_selectedPaths.begin() != path.string()) {
               return;
             }
             m_selectionInfoAdminReqId = kInvalidAdminRequestId;
@@ -360,8 +476,8 @@ namespace filemanager {
               || !locked
               || !*locked
               || req->tab->m_selectionInfoGeneration != req->generation
-              || req->tab->selectedPaths.size() != 1
-              || *req->tab->selectedPaths.begin() != req->path.string()) {
+              || req->tab->m_selectedPaths.size() != 1
+              || *req->tab->m_selectedPaths.begin() != req->path.string()) {
             g_clear_object(&info);
             return;
           }
@@ -426,8 +542,8 @@ namespace filemanager {
                     || !followLocked
                     || !*followLocked
                     || follow->tab->m_selectionInfoGeneration != follow->generation
-                    || follow->tab->selectedPaths.size() != 1
-                    || *follow->tab->selectedPaths.begin() != follow->path.string()) {
+                    || follow->tab->m_selectedPaths.size() != 1
+                    || *follow->tab->m_selectedPaths.begin() != follow->path.string()) {
                   g_clear_object(&targetInfo);
                   return;
                 }
@@ -465,6 +581,17 @@ namespace filemanager {
         initialReq
     );
     g_object_unref(file);
+  }
+
+  std::optional<FileOperationManager::AdminOperationContext> adminOperationContext(BrowserTab* tab) {
+    if (!tab)
+      return std::nullopt;
+    return FileOperationManager::AdminOperationContext{
+        {tab->id, tab->adminSession.sessionGeneration(), tab->session.navigationGeneration(), tab->session.path()},
+        tab->adminSession,
+        tab->hasActiveAdminSession(),
+        tab->capabilities().canMutate
+    };
   }
 
 } // namespace filemanager

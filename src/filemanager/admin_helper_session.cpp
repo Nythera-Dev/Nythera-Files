@@ -32,6 +32,21 @@
 #include <utility>
 #include <vector>
 
+namespace filemanager::admin_operation_concurrency {
+  std::size_t operationSlot(file_operation_engine::Kind kind, std::string_view operationData) {
+    switch (kind) {
+    case file_operation_engine::Kind::ExportProtectedFile:
+      return operationData == "thumbnail" ? 2 : 1;
+    case file_operation_engine::Kind::ProtectedChecksum:
+      return 3;
+    case file_operation_engine::Kind::ProtectedFolderSize:
+      return 4;
+    default:
+      return 0;
+    }
+  }
+} // namespace filemanager::admin_operation_concurrency
+
 namespace filemanager {
   namespace {
 
@@ -269,6 +284,12 @@ namespace filemanager {
             {
               ScopedCreationUmask umaskGuard(engine::isProtectedRead(request.kind) ? std::nullopt : config.creationUmask);
               execution = engine::executeLocalOperation(request, m_cancel.get(), &m_pause, callbacks);
+            }
+            // Some clients use the existing result description without parsing the progress frames.
+            if (execution.skippedTransferEntries > 0) {
+              if (!execution.customDescription.empty())
+                execution.customDescription += " · ";
+              execution.customDescription += std::to_string(execution.skippedTransferEntries) + " skipped";
             }
             for (auto& entry : execution.completedEntries)
               post({.kind = AdminServerFrameKind::OpCompletedEntry, .completedEntry = std::move(entry)});
@@ -554,7 +575,7 @@ namespace filemanager {
     AdminLineBuffer lineBuffer(config.maxFrameBytes);
     std::size_t consecutiveBadRequests = 0;
     std::optional<OperationUpload> upload;
-    std::array<std::unique_ptr<SharedOperation>, engine::kOperationSlots> operations;
+    std::array<std::unique_ptr<SharedOperation>, admin_operation_concurrency::kOperationSlots> operations;
     auto& sharedOperation = operations[0];
     const auto hasOperation = [&] { return std::ranges::any_of(operations, [](const auto& op) { return op != nullptr; }); };
     const auto findOperation = [&](AdminRequestId id) -> SharedOperation* {
@@ -1321,7 +1342,8 @@ namespace filemanager {
         return !shouldExit;
 
       case Command::OpBegin:
-        if (upload || operations[engine::operationSlot(request.operationKind, request.contentRevision)])
+        if (upload
+            || operations[admin_operation_concurrency::operationSlot(request.operationKind, request.contentRevision)])
           return respond(AdminStatusCode::BadRequest, "Another Administrator operation is active.");
         upload.emplace(
             OperationUpload{
@@ -1360,7 +1382,7 @@ namespace filemanager {
           auto worker = std::make_unique<SharedOperation>(request.requestId);
           if (worker->fd() < 0)
             return respond(AdminStatusCode::InternalError, "Could not create operation wakeup descriptor.");
-          auto& slot = operations[engine::operationSlot(operation->request.kind, operation->request.contentRevision)];
+          auto& slot = operations[admin_operation_concurrency::operationSlot(operation->request.kind, operation->request.contentRevision)];
           const bool renew = operation->request.contentRevision != "thumbnail";
           worker->start(std::move(operation->request), config);
           slot = std::move(worker);
@@ -1440,7 +1462,7 @@ namespace filemanager {
         return result;
       }
 
-      std::array<pollfd, 2 + engine::kOperationSlots> pfds{{{inFd, POLLIN, 0}, {outFd, 0, 0}}};
+      std::array<pollfd, 2 + admin_operation_concurrency::kOperationSlots> pfds{{{inFd, POLLIN, 0}, {outFd, 0, 0}}};
       for (std::size_t i = 0; i < operations.size(); ++i)
         pfds[i + 2] = {operations[i] ? operations[i]->fd() : -1, POLLIN, 0};
       const int remaining = remainingTimeMs();

@@ -2,10 +2,7 @@
 
 #include "core/files/display_text.h"
 #include "filemanager/archive/archive_backend.h"
-#include "filemanager/browser_tab.h"
-#include "filemanager/file_interaction.h"
-#include "filemanager/fs_compat.h"
-#include "filemanager/wastebin_fallback.h"
+#include "filemanager/job_view_reporter.h"
 
 #include <algorithm>
 #include <array>
@@ -25,10 +22,9 @@
 
 namespace {
   namespace engine = filemanager::file_operation_engine;
-  namespace fs_compat = filemanager::fs_compat;
 
   using Kind = FileOperationManager::Kind;
-  namespace wastebin_fallback = filemanager::wastebin_fallback;
+  using filemanager::operationName;
 
   bool isCopy(Kind kind) { return kind == Kind::Copy || kind == Kind::Duplicate; }
   bool isTransfer(Kind kind) { return isCopy(kind) || kind == Kind::Move; }
@@ -51,46 +47,8 @@ namespace {
         || kind == Kind::Properties;
   }
 
-  using engine::cleanupStagedTree;
-  using engine::copyTree;
-  using engine::entryExistsNoFollow;
-  using engine::FileIdentity;
   using engine::FileTransferPauseState;
-  using engine::measureTree;
-  using engine::parentIdentity;
-  using engine::PrivateStaging;
-  using engine::publishProgress;
-  using engine::reject;
-  using engine::removeTree;
-  using engine::revision;
-  using engine::setErrorFromPublishOutcome;
-  using engine::toCompatIdentity;
-  using engine::transferCheckpoint;
   using engine::TransferMeasure;
-  using engine::TransferProgress;
-
-  std::optional<engine::Kind> localKind(Kind kind) {
-    switch (kind) {
-    case Kind::Copy:
-      return engine::Kind::Copy;
-    case Kind::Duplicate:
-      return engine::Kind::Duplicate;
-    case Kind::Move:
-      return engine::Kind::Move;
-    case Kind::Rename:
-      return engine::Kind::Rename;
-    case Kind::CreateFolder:
-      return engine::Kind::CreateFolder;
-    case Kind::CreateFile:
-      return engine::Kind::CreateFile;
-    case Kind::CreateSymlink:
-      return engine::Kind::CreateSymlink;
-    case Kind::Delete:
-      return engine::Kind::Delete;
-    default:
-      return std::nullopt;
-    }
-  }
 
   void postProgressIdle(FileOperationManager* owner, std::weak_ptr<bool> alive, std::array<std::uint64_t, 6> values) {
     struct ProgressReport {
@@ -114,83 +72,41 @@ namespace {
 
   std::string basename(const std::string& path) { return std::filesystem::path(path).filename().string(); }
 
-  const char* operationName(FileOperationManager::Kind kind) {
-    switch (kind) {
-    case FileOperationManager::Kind::Copy:
-      return "Copy";
-    case FileOperationManager::Kind::Duplicate:
-      return "Duplicate";
-    case FileOperationManager::Kind::Move:
-      return "Move";
-    case FileOperationManager::Kind::Rename:
-      return "Rename";
-    case FileOperationManager::Kind::CreateFolder:
-    case FileOperationManager::Kind::CreateFile:
-      return "Create";
-    case FileOperationManager::Kind::CreateSymlink:
-      return "Create symlink";
-    case FileOperationManager::Kind::Trash:
-      return "Trash";
-    case FileOperationManager::Kind::TrashToHome:
-      return "Move to Home Wastebin";
-    case FileOperationManager::Kind::Delete:
-      return "Permanent delete";
-    case FileOperationManager::Kind::Restore:
-      return "Restore";
-    case FileOperationManager::Kind::EmptyWastebin:
-      return "Empty Wastebin";
-    case FileOperationManager::Kind::Properties:
-      return "Properties";
-    case Kind::Undo:
-      return "Undo";
-    case Kind::Redo:
-      return "Redo";
-    case Kind::Compress:
-      return "Compression";
-    case Kind::Extract:
-      return "Extraction";
-    }
-    return "File operation";
-  }
-
   std::string quotedBasename(const std::string& path) {
     const std::string name = basename(path);
     return name.empty() ? "item" : "\"" + name + "\"";
   }
 
-  std::string displayDestination(const std::string& path, bool executorOnly = false) {
-    std::filesystem::path destination(path);
-    if (const char* home = g_get_home_dir(); home != nullptr) {
-      const std::filesystem::path homePath(home);
-      std::error_code ec;
-      const auto relative = executorOnly ? destination.lexically_relative(homePath)
-                                         : std::filesystem::relative(destination, homePath, ec);
-      if (!ec && !relative.empty() && *relative.begin() != "..")
-        destination = relative;
-      else if (!ec && relative == ".")
-        return "Home";
-    }
-    std::string label = destination.string();
-    constexpr std::size_t kMaxDestinationLabel = 72;
-    if (label.size() > kMaxDestinationLabel)
-      label = "…" + label.substr(label.size() - (kMaxDestinationLabel - 1));
-    return label;
+  std::string displayDestination(const std::string& path) {
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(path, error);
+    return filemanager::sanitizeFilenameForDisplay(error ? path : absolute.native());
+  }
+
+  const char* transferVerb(Kind kind) {
+    return kind == Kind::Move ? "moved" : kind == Kind::Duplicate ? "duplicated" : "copied";
+  }
+
+  const char* transferPreposition(Kind kind) { return kind == Kind::Duplicate ? " in " : " to "; }
+
+  std::string publishedTransfer(const FileOperationManager::Operation& operation) {
+    const bool hasFiles = operation.processedFiles != 0;
+    const auto count = hasFiles ? operation.processedFiles : operation.completedEntries.size();
+    if (count == 0)
+      return {};
+    const auto unit = hasFiles ? (count == 1 ? " file " : " files ") : (count == 1 ? " item " : " items ");
+    return std::to_string(count) + unit + transferVerb(operation.kind);
   }
 
   std::string completedDescription(const FileOperationManager::Operation& operation) {
     const auto kind = operation.kind;
-    const auto count = !isTransfer(kind) ? operation.requestedItemCount
-        : operation.adminOrigin ? operation.completedEntries.size()
-        : operation.totalFiles > 0 ? operation.totalFiles : operation.requestedItemCount;
-    const char* unit = isTransfer(kind) && !operation.adminOrigin && operation.totalFiles > 0 ? "file" : "item";
-    const std::string quantity = std::to_string(count) + " " + unit + (count == 1 ? "" : "s");
+    const auto count = operation.requestedItemCount;
+    const std::string quantity = std::to_string(count) + (count == 1 ? " item" : " items");
     switch (kind) {
-    case FileOperationManager::Kind::Copy:
-      return quantity + " copied to " + displayDestination(operation.destination, operation.adminOrigin.has_value());
+    case Kind::Copy:
     case Kind::Duplicate:
-      return quantity + " duplicated in " + displayDestination(operation.destination, operation.adminOrigin.has_value());
-    case FileOperationManager::Kind::Move:
-      return quantity + " moved to " + displayDestination(operation.destination, operation.adminOrigin.has_value());
+    case Kind::Move:
+      break;
     case FileOperationManager::Kind::Rename:
       return "Renamed " + quotedBasename(operation.source) + " to " + quotedBasename(operation.destination);
     case FileOperationManager::Kind::CreateFolder:
@@ -243,286 +159,6 @@ namespace {
     return detail;
   }
 
-  bool queryTrashOriginalPath(GFile* file, GCancellable* cancellable, std::string& path, std::string& queryError) {
-    GError* error = nullptr;
-    GFileInfo* info =
-        g_file_query_info(file, "trash::orig-path", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error);
-    if (info == nullptr && error != nullptr)
-      queryError = error->message;
-    g_clear_error(&error);
-    if (info == nullptr)
-      return false;
-    const char* original = g_file_info_get_attribute_byte_string(info, "trash::orig-path");
-    if (original != nullptr && original[0] == '/')
-      path = original;
-    g_object_unref(info);
-    return !path.empty();
-  }
-
-  bool gioOriginalPath(const std::string& uri, GCancellable* cancellable, std::string& path, std::string& message) {
-    if (wastebin_fallback::productionWastebinForbidden()) {
-      path.clear();
-      message = "Production Wastebin metadata access is disabled in test isolation mode.";
-      return false;
-    }
-    GFile* current = g_file_new_for_uri(uri.c_str());
-    std::vector<std::string> suffix;
-    std::string lastQueryError;
-    GFile* trashRoot = g_file_new_for_uri("trash:///");
-    while (current != nullptr) {
-      path.clear();
-      if (queryTrashOriginalPath(current, cancellable, path, lastQueryError)) {
-        for (auto it = suffix.rbegin(); it != suffix.rend(); ++it)
-          path = (std::filesystem::path(path) / *it).string();
-        g_object_unref(current);
-        g_object_unref(trashRoot);
-        return true;
-      }
-      GFile* parent = g_file_get_parent(current);
-      if (parent == nullptr)
-        break;
-      char* name = g_file_get_basename(current);
-      if (name != nullptr)
-        suffix.emplace_back(name);
-      g_free(name);
-      g_object_unref(current);
-      current = parent;
-      if (g_file_equal(current, trashRoot)) {
-        g_object_unref(current);
-        current = nullptr;
-        break;
-      }
-    }
-    if (current != nullptr)
-      g_object_unref(current);
-    g_object_unref(trashRoot);
-    message =
-        lastQueryError.empty() ? "Original location metadata is unavailable for this Wastebin item." : lastQueryError;
-    return false;
-  }
-
-  bool gioEnumerateTrash(GCancellable* cancellable, std::vector<std::string>& uris, std::string& message) {
-    if (wastebin_fallback::productionWastebinForbidden()) {
-      uris.clear();
-      message = "Production Wastebin access is disabled in test isolation mode.";
-      return false;
-    }
-    GFile* root = g_file_new_for_uri("trash:///");
-    GError* error = nullptr;
-    GFileEnumerator* entries = g_file_enumerate_children(
-        root, G_FILE_ATTRIBUTE_STANDARD_NAME, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error
-    );
-    if (entries == nullptr) {
-      message = error == nullptr ? "Could not enumerate the Wastebin." : error->message;
-      g_clear_error(&error);
-      g_object_unref(root);
-      return false;
-    }
-    while (GFileInfo* child = g_file_enumerator_next_file(entries, cancellable, &error)) {
-      GFile* item = g_file_get_child(root, g_file_info_get_name(child));
-      char* uri = g_file_get_uri(item);
-      if (uri != nullptr)
-        uris.emplace_back(uri);
-      g_free(uri);
-      g_object_unref(item);
-      g_object_unref(child);
-    }
-    const bool ok = error == nullptr;
-    if (!ok)
-      message = error->message;
-    g_clear_error(&error);
-    g_object_unref(entries);
-    g_object_unref(root);
-    return ok;
-  }
-
-  bool isTrashUri(const std::string& uri) {
-    GFile* item = g_file_new_for_uri(uri.c_str());
-    char* resolvedUri = g_file_get_uri(item);
-    const bool valid = resolvedUri != nullptr && g_str_has_prefix(resolvedUri, "trash:");
-    g_free(resolvedUri);
-    g_object_unref(item);
-    return valid;
-  }
-
-  bool isDirectTrashChild(const std::string& uri) {
-    GFile* item = g_file_new_for_uri(uri.c_str());
-    GFile* parent = g_file_get_parent(item);
-    GFile* root = g_file_new_for_uri("trash:///");
-    const bool direct = parent != nullptr && g_file_equal(parent, root);
-    if (parent != nullptr)
-      g_object_unref(parent);
-    g_object_unref(root);
-    g_object_unref(item);
-    return direct;
-  }
-
-  bool gioMoveWithBackup(
-      GFile* source, GFile* target, GFileType incomingType, bool replace,
-      const std::optional<fs_compat::EntryIdentity>& expectedTarget, GCancellable* cancellable, std::string& message,
-      bool& mutated
-  ) {
-    GError* error = nullptr;
-    std::optional<fs_compat::ReplacementBackup> backup;
-    bool backupMoved = false;
-    bool preserveBackup = false;
-    bool ok = true;
-    g_autofree char* sourcePath = g_file_get_path(source);
-    g_autofree char* targetPath = g_file_get_path(target);
-    const bool isDirectory = incomingType == G_FILE_TYPE_DIRECTORY;
-    const bool isSymlink = incomingType == G_FILE_TYPE_SYMBOLIC_LINK;
-
-    if (sourcePath == nullptr && targetPath != nullptr) {
-      ok = fs_compat::preflightTransferDestination(
-          std::filesystem::path(targetPath).parent_path(), isDirectory, isSymlink, replace, &error
-      );
-    }
-    if (ok && replace) {
-      ok = fs_compat::allocateReplacementBackup(targetPath, expectedTarget, backup, message, &error);
-      backupMoved = ok;
-      mutated |= ok || !message.empty();
-    }
-    if (ok) {
-      int directErrno = 0;
-      if (sourcePath != nullptr && targetPath != nullptr) {
-        const auto outcome = fs_compat::moveOrPublishEntryNoReplace(sourcePath, targetPath, false, std::nullopt, true);
-        ok = outcome.ok;
-        directErrno = outcome.savedErrno;
-        mutated |= outcome.destinationCommitted;
-        if (outcome.splitState) {
-          preserveBackup = backupMoved;
-          message = outcome.message
-              + (backupMoved ? "; previous destination backup remains at " + backup->backupPath.string()
-                             : std::string{});
-        } else if (!ok) {
-          setErrorFromPublishOutcome(outcome, &error);
-        }
-      } else {
-        ok = false;
-      }
-      if (!ok && !preserveBackup && (sourcePath == nullptr || directErrno == EXDEV)) {
-        g_clear_error(&error);
-        GFile* parent = g_file_get_parent(target);
-        if (parent == nullptr) {
-          g_set_error_literal(
-              &error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not resolve the destination parent folder."
-          );
-        } else {
-          g_autofree char* parentPath = g_file_get_path(parent);
-          const bool preflightOk = parentPath != nullptr
-              && fs_compat::preflightTransferDestination(parentPath, isDirectory, isSymlink, replace, &error);
-          if (!preflightOk) {
-            g_object_unref(parent);
-          } else {
-            char* uuid = g_uuid_string_random();
-            char* leaf = g_strdup_printf(".nythera-restore-%s", uuid);
-            GFile* staged = g_file_get_child(parent, leaf);
-            g_free(leaf);
-            g_free(uuid);
-            g_object_unref(parent);
-            const bool absent = !g_file_query_exists(staged, cancellable);
-            g_autofree char* stagedPath = g_file_get_path(staged);
-            bool destinationCommitted = false;
-            if (!absent) {
-              g_set_error_literal(
-                  &error, G_IO_ERROR, G_IO_ERROR_EXISTS, "Could not allocate a temporary restore destination."
-              );
-            } else if (!copyTree(source, staged, cancellable, &error, nullptr, engine::CopyMetadata::DirectoryModeAndTimes)) {
-              // Preserve the source when staging fails.
-            } else {
-              const auto outcome =
-                  fs_compat::moveOrPublishEntryNoReplace(stagedPath, targetPath, true, std::nullopt, true);
-              destinationCommitted = outcome.destinationCommitted;
-              mutated |= destinationCommitted;
-              if (outcome.splitState) {
-                preserveBackup = backupMoved;
-                message = outcome.message
-                    + "; source remains in Wastebin"
-                    + (backupMoved ? "; previous destination backup remains at " + backup->backupPath.string()
-                                   : std::string{});
-              } else if (!outcome.ok) {
-                setErrorFromPublishOutcome(outcome, &error);
-              } else {
-                // Production sources are trash:// GFiles, so recursive semantics
-                // remain owned by that backend. Local recursion is limited to the
-                // explicit isolated provider seam used by tests.
-                ok = g_file_has_uri_scheme(source, "trash") ? g_file_delete(source, nullptr, &error)
-                                                            : removeTree(source, nullptr, &error);
-                if (!ok && error == nullptr)
-                  g_set_error_literal(
-                      &error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                      "Restored a copy but could not remove the original Wastebin item."
-                  );
-                if (!ok) {
-                  preserveBackup = backupMoved;
-                  message = std::string("A restored copy remains at ")
-                      + (targetPath == nullptr ? "the destination" : targetPath)
-                      + "; the original could not be removed from Wastebin"
-                      + (backupMoved ? "; previous destination backup remains at " + backup->backupPath.string()
-                                     : std::string{});
-                }
-              }
-            }
-            if (!destinationCommitted && absent && g_file_query_exists(staged, nullptr)) {
-              cleanupStagedTree(staged);
-            }
-            g_object_unref(staged);
-          }
-        }
-      }
-    }
-    if (!ok && backupMoved && !preserveBackup && backup) {
-      fs_compat::restoreOrReportBackup(*backup, "Restore failed", error, message);
-    }
-    if (!ok && message.empty())
-      message = error == nullptr ? "Could not restore Wastebin item." : error->message;
-    g_clear_error(&error);
-    if (ok && backup) {
-      ok = fs_compat::removeOrReportBackup(
-          *backup, "Restored item, but could not remove the replaced destination backup: ", message
-      );
-    }
-    return ok;
-  }
-
-  // Replay is keyed to the recorded directory as well as the entry. Pin it
-  // before validation so a concurrent rename or retargeted parent symlink
-  // cannot redirect a later filesystem call to a different directory.
-  struct ReplayParent {
-    int fd = -1;
-    std::filesystem::path path;
-    std::filesystem::path logicalDirectory;
-    explicit ReplayParent(const std::string& entry, FileIdentity expected) {
-      if (expected == FileIdentity{})
-        return;
-      const auto directory = std::filesystem::path(entry).parent_path();
-      fd = open(directory.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-      if (fd < 0)
-        return;
-      struct stat state{};
-      if (fstat(fd, &state) == 0 && FileIdentity{state.st_dev, state.st_ino} == expected) {
-        path = "/proc/self/fd/" + std::to_string(fd);
-        logicalDirectory = directory;
-      }
-    }
-    ReplayParent(const ReplayParent&) = delete;
-    ReplayParent& operator=(const ReplayParent&) = delete;
-    ~ReplayParent() {
-      if (fd >= 0)
-        close(fd);
-    }
-  };
-
-  bool changedEntry(GError** error, const char* message) {
-    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG, message);
-    return false;
-  }
-
-  bool emptyDirectory(const std::string& path) {
-    std::error_code error;
-    return std::filesystem::is_empty(path, error) && !error;
-  }
-
 } // namespace
 
 struct FileOperationManager::WorkerDrain {
@@ -533,6 +169,7 @@ struct FileOperationManager::WorkerDrain {
 
 struct FileOperationManager::Result : engine::Result {
   bool historyBlocked = false;
+  bool adminSkipSelected = false;
   std::string customTitle;
   bool outcomeUncertain = false;
   std::optional<std::size_t> requestedCount;
@@ -548,7 +185,6 @@ struct FileOperationManager::Task {
   Kind kind;
   std::vector<std::string> sources;
   std::string destination;
-  std::vector<TransferMeasure> measures;
   TransferMeasure totalMeasure;
   TransferMeasure completedMeasure;
   std::optional<filemanager::PropertyRequest> metadata;
@@ -571,206 +207,27 @@ struct FileOperationManager::Task {
   TransferMeasure archiveProgress;
 };
 
-
-bool FileOperationManager::replay(HistoryEntry& entry, bool undoing, GCancellable* cancellable, GError** error) {
-  const bool moving = entry.kind == Kind::Move || entry.kind == Kind::Rename;
-  const bool copying = isCopy(entry.kind);
-  const bool readsSource = moving || copying;
-  if (g_cancellable_set_error_if_cancelled(cancellable, error))
-    return false;
-  const ReplayParent destinationParent(entry.destination, entry.destinationParent);
-  const ReplayParent sourceParent(entry.source, readsSource ? entry.sourceParent : FileIdentity{});
-  if (destinationParent.path.empty() || (readsSource && sourceParent.path.empty()))
-    return reject(error, "An original folder is missing or was replaced.");
-  const auto destinationLeaf = basename(entry.destination);
-  const auto destinationPath = (destinationParent.path / destinationLeaf).string();
-  const auto destinationLogicalPath = (destinationParent.logicalDirectory / destinationLeaf).string();
-  const auto sourceLeaf = readsSource ? basename(entry.source) : std::string{};
-  const auto sourcePath = readsSource ? (sourceParent.path / sourceLeaf).string() : std::string{};
-  const auto sourceLogicalPath = readsSource ? (sourceParent.logicalDirectory / sourceLeaf).string() : std::string{};
-
-  // Moving updates ctime. Require the entire fingerprint before moving and
-  // recheck everything except that timestamp after the no-overwrite rename.
-  const auto afterMove = [](std::optional<Revision> actual, Revision expected) {
-    if (actual)
-      expected.changed = actual->changed;
-    return actual == expected;
-  };
-  const auto expectedAt = [](const std::string& path, const Revision& expected) {
-    return revision(path) == expected && (!S_ISDIR(expected.mode) || emptyDirectory(path));
-  };
-  const auto restoreMovedItem = [&](const std::string& from, const std::string& to, const std::string& location,
-                                    const std::string& fromHook, const std::string& toHook, int fromFd, int toFd) {
-    const auto outcome = fs_compat::moveOrPublishEntryNoReplace(
-        from.c_str(), to.c_str(), false, std::nullopt, true, fromHook.c_str(), toHook.c_str(), fromFd, toFd
-    );
-    if (outcome.ok)
-      return changedEntry(error, "The item changed during the operation and was put back.");
-    g_set_error(
-        error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG, "The item could not be restored and remains at %s.", location.c_str()
-    );
-    return false;
-  };
-  if (moving) {
-    const auto& from = undoing ? destinationPath : sourcePath;
-    const auto& to = undoing ? sourcePath : destinationPath;
-    const auto& fromHook = undoing ? destinationLogicalPath : sourceLogicalPath;
-    const auto& toHook = undoing ? sourceLogicalPath : destinationLogicalPath;
-    const int fromFd = undoing ? destinationParent.fd : sourceParent.fd;
-    const int toFd = undoing ? sourceParent.fd : destinationParent.fd;
-    const auto& expected = undoing ? entry.resultRevision : *entry.sourceRevision;
-    if (!expectedAt(from, expected))
-      return changedEntry(error, "The item is missing, replaced, or has been modified.");
-    if (g_cancellable_set_error_if_cancelled(cancellable, error))
-      return false;
-    const auto outcome = fs_compat::moveOrPublishEntryNoReplace(
-        from.c_str(), to.c_str(), false, toCompatIdentity(expected), S_ISLNK(expected.mode), fromHook.c_str(),
-        toHook.c_str(), fromFd, toFd
-    );
-    if (outcome.splitState)
-      return changedEntry(error, outcome.message.c_str());
-    if (!outcome.ok) {
-      setErrorFromPublishOutcome(outcome, error);
-      return false;
-    }
-    const auto actual = revision(to);
-    if (!afterMove(actual, expected) || (S_ISDIR(expected.mode) && !emptyDirectory(to)))
-      return restoreMovedItem(to, from, undoing ? entry.source : entry.destination, toHook, fromHook, toFd, fromFd);
-    if (undoing)
-      entry.sourceRevision = actual;
-    else
-      entry.resultRevision = *actual;
-    return true;
-  }
-
-  if (undoing && !expectedAt(destinationPath, entry.resultRevision))
-    return changedEntry(error, "The result is missing, replaced, or has been modified.");
-  if (copying && !expectedAt(sourcePath, *entry.sourceRevision))
-    return changedEntry(error, "The original source is missing, replaced, or has been modified.");
-
-  if (!undoing && entry.kind == Kind::CreateFolder) {
-    const auto caps = fs_compat::probeCapabilities(destinationParent.logicalDirectory);
-    if (caps.renameNoReplace == fs_compat::CapabilitySupport::Unsupported) {
-      int mkdirErr = 0;
-      if (!fs_compat::createDirectoryExclusiveAt(
-              destinationParent.fd, destinationLeaf.c_str(), entry.resultRevision.mode & 07777, mkdirErr, error
-          )) {
-        return false;
-      }
-      const auto created = revision(destinationPath);
-      if (!created || created->mode != entry.resultRevision.mode) {
-        unlinkat(destinationParent.fd, destinationLeaf.c_str(), AT_REMOVEDIR);
-        return reject(error, "The recreated item's permissions differ from the original result.");
-      }
-      entry.resultRevision = *created;
-      return true;
-    }
-  }
-
-  // Isolate an output before deleting it. If the directory entry changed
-  // between validation and rename, recover it without overwriting anything.
-  // The private directory also gives redo a no-overwrite publication point.
-  PrivateStaging staging(destinationPath);
-  if (staging.directory.empty())
-    return reject(error, "Could not create a private staging directory beside the destination.");
-  const std::string stagingFolder = basename(staging.directory);
-  const std::string staged = staging.directory + "/item";
-  const std::string stagedHook = (destinationParent.logicalDirectory / stagingFolder / "item").string();
-  if (undoing) {
-    const auto recovery = (std::filesystem::path(entry.destination).parent_path() / stagingFolder / "item").string();
-    if (g_cancellable_set_error_if_cancelled(cancellable, error))
-      return false;
-    bool isolated = false;
-    int renameErr = 0;
-    GError* noReplaceErr = nullptr;
-    if (fs_compat::renameNoReplaceRaw(destinationLogicalPath.c_str(), stagedHook.c_str(), renameErr, &noReplaceErr)) {
-      isolated = true;
-    } else if (fs_compat::isNoReplaceUnsupportedErrno(renameErr)) {
-      g_clear_error(&noReplaceErr);
-      // staging.directory was created exclusively with mkdtemp (0700), so "item" is absent.
-      const int stagingFd = open(staging.directory.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-      if (stagingFd >= 0) {
-        if (renameat(destinationParent.fd, destinationLeaf.c_str(), stagingFd, "item") == 0)
-          isolated = true;
-        else
-          g_set_error_literal(error, G_IO_ERROR, g_io_error_from_errno(errno), g_strerror(errno));
-        close(stagingFd);
-      } else {
-        g_set_error_literal(error, G_IO_ERROR, g_io_error_from_errno(errno), g_strerror(errno));
-      }
-    } else {
-      g_propagate_error(error, noReplaceErr);
-    }
-    if (!isolated)
-      return false;
-    const auto actual = revision(staged);
-    if (!afterMove(actual, entry.resultRevision) || (copying && !expectedAt(sourcePath, *entry.sourceRevision)))
-      return restoreMovedItem(
-          staged, destinationPath, recovery, stagedHook, destinationLogicalPath, -1, destinationParent.fd
-      );
-    const int removed = S_ISDIR(entry.resultRevision.mode) ? rmdir(staged.c_str()) : unlink(staged.c_str());
-    return removed == 0
-        || restoreMovedItem(
-               staged, destinationPath, recovery, stagedHook, destinationLogicalPath, -1, destinationParent.fd
-        );
-  }
-
-  GFile* target = g_file_new_for_path(staged.c_str());
-  bool ok = false;
-  bool destinationCommitted = false;
-  if (copying) {
-    GFile* source = g_file_new_for_path(sourcePath.c_str());
-    ok = copyTree(source, target, cancellable, error, nullptr);
-    g_object_unref(source);
-    if (ok && !expectedAt(sourcePath, *entry.sourceRevision))
-      ok = changedEntry(error, "The source changed during copying.");
-  } else {
-    bool created = false;
-    ok = engine::createItem(
-        *localKind(entry.kind), target, entry.linkTarget, entry.createdContent, {}, cancellable, error, created
-    );
-  }
-  if (ok) {
-    const auto created = revision(staged);
-    if (!created || created->mode != entry.resultRevision.mode)
-      ok = reject(error, "The recreated item's permissions differ from the original result.");
-    else if (!g_cancellable_set_error_if_cancelled(cancellable, error)) {
-      const auto outcome = fs_compat::moveOrPublishEntryNoReplace(
-          staged.c_str(), destinationPath.c_str(), true, toCompatIdentity(*created), true, stagedHook.c_str(),
-          destinationLogicalPath.c_str(), -1, destinationParent.fd
-      );
-      ok = outcome.ok;
-      destinationCommitted = outcome.destinationCommitted;
-      if (!ok) {
-        if (outcome.splitState)
-          reject(error, outcome.message.c_str());
-        else
-          setErrorFromPublishOutcome(outcome, error);
-      }
-    } else {
-      ok = false;
-    }
-    if (ok) {
-      const auto actual = revision(destinationPath);
-      entry.resultRevision = afterMove(actual, *created) ? *actual : Revision{};
-    }
-  }
-  if (!destinationCommitted)
-    g_file_delete(target, nullptr, nullptr);
-  g_object_unref(target);
-  return ok;
-}
-
 FileOperationManager::FileOperationManager(Changed changed, WastebinBackend wastebinBackend)
     : m_workerDrain(std::make_shared<WorkerDrain>()), m_changed(std::move(changed)),
       m_wastebinBackend(std::move(wastebinBackend)) {
-  GError* error = nullptr;
-  m_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
-  g_clear_error(&error);
-  if (m_bus != nullptr)
-    m_serviceWatch = g_bus_watch_name_on_connection(
-        m_bus, "org.kde.JobViewServer", G_BUS_NAME_WATCHER_FLAGS_NONE, serviceAppeared, serviceVanished, this, nullptr
-    );
+  m_jobReporter = std::make_unique<filemanager::JobViewReporter>(
+      [this](bool available) {
+        for (const auto& operation : m_operations) {
+          if (operation.finished)
+            continue;
+          if (available) {
+            if (!reportsProgress(operation.kind) || m_jobRevealTimers.contains(operation.id))
+              continue;
+            registerJob(operation);
+            publishJob(operation);
+          }
+          if (m_changed)
+            m_changed(operation);
+        }
+      },
+      [this](std::uint64_t id) { cancel(id); }, [this](std::uint64_t id) { pause(id); },
+      [this](std::uint64_t id) { resume(id); }
+  );
 }
 void FileOperationManager::shutdown() noexcept {
   if (m_alive)
@@ -797,21 +254,7 @@ void FileOperationManager::shutdown() noexcept {
     g_source_remove(timer);
   }
   m_jobRevealTimers.clear();
-  if (m_serviceWatch != 0) {
-    g_bus_unwatch_name(m_serviceWatch);
-    m_serviceWatch = 0;
-  }
-  if (m_bus != nullptr) {
-    for (const auto& [id, subscription] : m_signalSubscriptions) {
-      (void)id;
-      g_dbus_connection_signal_unsubscribe(m_bus, subscription);
-    }
-  }
-  m_signalSubscriptions.clear();
-  if (m_bus != nullptr) {
-    g_object_unref(m_bus);
-    m_bus = nullptr;
-  }
+  m_jobReporter->shutdown();
   if (m_workerDrain) {
     std::unique_lock lock(m_workerDrain->mutex);
     m_workerDrain->cv.wait(lock, [this] { return m_workerDrain->active == 0; });
@@ -862,13 +305,13 @@ bool FileOperationManager::usesMount(const std::filesystem::path& mountPath) con
   return false;
 }
 bool FileOperationManager::hasJobService() const noexcept {
-  if (!m_serviceAvailable)
+  if (!m_jobReporter->available())
     return false;
   return std::ranges::all_of(m_operations, [this](const Operation& operation) {
     return operation.finished
         || !reportsProgress(operation.kind)
         || !operation.progressRevealed
-        || m_jobPaths.contains(operation.id);
+        || m_jobReporter->hasJob(operation.id);
   });
 }
 FileOperationManager::Operation* FileOperationManager::find(std::uint64_t id) {
@@ -978,19 +421,19 @@ bool FileOperationManager::administratorOperationActive(filemanager::TabId tabId
 }
 
 std::uint64_t FileOperationManager::copy(
-    std::vector<std::string> sources, std::string destination, filemanager::BrowserTab* adminTab
+    std::vector<std::string> sources, std::string destination, std::optional<AdminOperationContext> admin
 ) {
-  return start(Kind::Copy, std::move(sources), std::move(destination), {}, 0, {}, {}, {}, false, adminTab);
+  return start(Kind::Copy, std::move(sources), std::move(destination), {}, 0, {}, {}, {}, false, admin);
 }
 std::uint64_t FileOperationManager::duplicate(
-    std::vector<std::string> sources, std::string destination, filemanager::BrowserTab* adminTab
+    std::vector<std::string> sources, std::string destination, std::optional<AdminOperationContext> admin
 ) {
-  return start(Kind::Duplicate, std::move(sources), std::move(destination), {}, 0, {}, {}, {}, false, adminTab);
+  return start(Kind::Duplicate, std::move(sources), std::move(destination), {}, 0, {}, {}, {}, false, admin);
 }
 std::uint64_t FileOperationManager::move(
-    std::vector<std::string> sources, std::string destination, filemanager::BrowserTab* adminTab
+    std::vector<std::string> sources, std::string destination, std::optional<AdminOperationContext> admin
 ) {
-  return start(Kind::Move, std::move(sources), std::move(destination), {}, 0, {}, {}, {}, false, adminTab);
+  return start(Kind::Move, std::move(sources), std::move(destination), {}, 0, {}, {}, {}, false, admin);
 }
 std::uint64_t FileOperationManager::compress(
     std::vector<std::string> sources, std::string output, filemanager::archive_backend::Format format,
@@ -999,7 +442,7 @@ std::uint64_t FileOperationManager::compress(
   if (sources.empty() || !std::ranges::all_of(sources, archivePath) || !archivePath(output))
     return 0;
   return start(
-      Kind::Compress, std::move(sources), std::move(output), {}, 0, {}, {}, {}, false, nullptr,
+      Kind::Compress, std::move(sources), std::move(output), {}, 0, {}, {}, {}, false, std::nullopt,
       ArchiveOptions{format, level, std::move(options)}
   );
 }
@@ -1009,7 +452,7 @@ std::uint64_t FileOperationManager::extract(
   if (!archivePath(source) || !archivePath(destination))
     return 0;
   return start(
-      Kind::Extract, {std::move(source)}, std::move(destination), {}, 0, {}, {}, {}, false, nullptr,
+      Kind::Extract, {std::move(source)}, std::move(destination), {}, 0, {}, {}, {}, false, std::nullopt,
       ArchiveOptions{.extraction = mode}
   );
 }
@@ -1023,7 +466,7 @@ std::uint64_t FileOperationManager::extractSelected(
   if (!archivePath(source))
     return 0;
   return start(
-      Kind::Extract, {std::move(source)}, std::move(destination), {}, 0, {}, {}, {}, false, nullptr,
+      Kind::Extract, {std::move(source)}, std::move(destination), {}, 0, {}, {}, {}, false, std::nullopt,
       ArchiveOptions{
           .selection = std::move(selection), .password = std::move(password), .completion = std::move(completion)
       }
@@ -1034,64 +477,49 @@ std::uint64_t FileOperationManager::rename(std::string source, std::string desti
 }
 std::uint64_t FileOperationManager::renameChecked(
     std::string source, std::string destination, std::uint64_t device, std::uint64_t inode,
-    std::function<void(bool, const std::string&)> completed, filemanager::BrowserTab* adminTab
+    std::function<void(bool, const std::string&)> completed, std::optional<AdminOperationContext> admin
 ) {
   return start(
       Kind::Rename, {std::move(source)}, std::move(destination), {}, 0, {}, std::pair{device, inode},
-      std::move(completed), false, adminTab
+      std::move(completed), false, admin
   );
 }
 
-std::uint64_t FileOperationManager::createFolder(std::string destination, filemanager::BrowserTab* adminTab) {
-  return start(Kind::CreateFolder, {}, std::move(destination), {}, 0, {}, {}, {}, adminTab != nullptr, adminTab);
+std::uint64_t FileOperationManager::createFolder(std::string destination, std::optional<AdminOperationContext> admin) {
+  return start(Kind::CreateFolder, {}, std::move(destination), {}, 0, {}, {}, {}, admin.has_value(), admin);
 }
-std::uint64_t FileOperationManager::createFile(std::string destination, filemanager::BrowserTab* adminTab) {
-  return start(Kind::CreateFile, {}, std::move(destination), {}, 0, {}, {}, {}, adminTab != nullptr, adminTab);
+std::uint64_t FileOperationManager::createFile(std::string destination, std::optional<AdminOperationContext> admin) {
+  return start(Kind::CreateFile, {}, std::move(destination), {}, 0, {}, {}, {}, admin.has_value(), admin);
 }
 
 std::uint64_t FileOperationManager::createFileFromTemplate(
-    std::string templateSource, std::string destination, filemanager::BrowserTab* adminTab
+    std::string templateSource, std::string destination, std::optional<AdminOperationContext> admin
 ) {
-  return start(Kind::CreateFile, {std::move(templateSource)}, std::move(destination),
-               {}, 0, {}, {}, {}, adminTab != nullptr, adminTab);
+  return start(
+      Kind::CreateFile, {std::move(templateSource)}, std::move(destination), {}, 0, {}, {}, {}, admin.has_value(), admin
+  );
 }
 std::uint64_t FileOperationManager::createSymlink(
-    std::string target, std::string destination, bool keepBoth, filemanager::BrowserTab* adminTab
+    std::string target, std::string destination, bool keepBoth, std::optional<AdminOperationContext> admin
 ) {
-  return start(Kind::CreateSymlink, {std::move(target)}, std::move(destination), {}, 0, {}, {}, {}, keepBoth, adminTab);
+  return start(Kind::CreateSymlink, {std::move(target)}, std::move(destination), {}, 0, {}, {}, {}, keepBoth, admin);
 }
 
-bool FileOperationManager::canUndo() const noexcept {
-  return !m_replaying && !active() && !m_undo.empty() && !m_undo.back().blocked;
-}
-bool FileOperationManager::canRedo() const noexcept {
-  return !m_replaying && !active() && !m_redo.empty() && !m_redo.back().blocked;
-}
+bool FileOperationManager::canUndo() const noexcept { return !active() && m_history.canReplay(true); }
+bool FileOperationManager::canRedo() const noexcept { return !active() && m_history.canReplay(false); }
 
-std::string FileOperationManager::undoLabel() const {
-  if (m_undo.empty() || m_undo.back().blocked)
-    return "Undo";
-  const auto& entry = m_undo.back();
-  return std::string("Undo ") + operationName(entry.kind) + " " + quotedBasename(entry.destination);
-}
-
-std::string FileOperationManager::redoLabel() const {
-  if (m_redo.empty() || m_redo.back().blocked)
-    return "Redo";
-  const auto& entry = m_redo.back();
-  return std::string("Redo ") + operationName(entry.kind) + " " + quotedBasename(entry.destination);
-}
-
+std::string FileOperationManager::undoLabel() const { return m_history.label(true); }
+std::string FileOperationManager::redoLabel() const { return m_history.label(false); }
 std::uint64_t FileOperationManager::undo() {
   if (!canUndo())
     return 0;
-  return start(Kind::Undo, {m_undo.back().source}, m_undo.back().destination);
+  return start(Kind::Undo, {m_history.next(true).source}, m_history.next(true).destination);
 }
 
 std::uint64_t FileOperationManager::redo() {
   if (!canRedo())
     return 0;
-  return start(Kind::Redo, {m_redo.back().source}, m_redo.back().destination);
+  return start(Kind::Redo, {m_history.next(false).source}, m_history.next(false).destination);
 }
 std::uint64_t FileOperationManager::trash(std::vector<std::string> sources) {
   return start(Kind::Trash, std::move(sources), {});
@@ -1107,15 +535,14 @@ std::uint64_t FileOperationManager::emptyWastebin(bool confirmed) {
     return 0;
   return start(Kind::EmptyWastebin, {}, {});
 }
-std::uint64_t FileOperationManager::removePermanently(
-    std::vector<std::string> sources, filemanager::BrowserTab* adminTab
-) {
-  return start(Kind::Delete, std::move(sources), {}, {}, 0, {}, {}, {}, false, adminTab);
+std::uint64_t
+FileOperationManager::removePermanently(std::vector<std::string> sources, std::optional<AdminOperationContext> admin) {
+  return start(Kind::Delete, std::move(sources), {}, {}, 0, {}, {}, {}, false, admin);
 }
 
 std::uint64_t FileOperationManager::modifyProperties(
     filemanager::PropertyRequest request, std::uint32_t uid,
-    std::function<void(const filemanager::PropertyResult&)> completed, filemanager::BrowserTab* adminTab
+    std::function<void(const filemanager::PropertyResult&)> completed, std::optional<AdminOperationContext> admin
 ) {
   const auto identity = std::pair{request.device, request.inode};
   for (const auto& [id, target] : m_metadataTargets) {
@@ -1124,7 +551,7 @@ std::uint64_t FileOperationManager::modifyProperties(
       return 0;
   }
   const auto path = request.path.string();
-  const auto id = start(Kind::Properties, {path}, {}, request, uid, std::move(completed), {}, {}, false, adminTab);
+  const auto id = start(Kind::Properties, {path}, {}, request, uid, std::move(completed), {}, {}, false, admin);
   if (id)
     m_metadataTargets[id] = identity;
   return id;
@@ -1135,23 +562,24 @@ std::uint64_t FileOperationManager::start(
     std::optional<filemanager::PropertyRequest> metadata, std::uint32_t uid,
     std::function<void(const filemanager::PropertyResult&)> completedCallback,
     std::optional<std::pair<std::uint64_t, std::uint64_t>> renameIdentity,
-    std::function<void(bool, const std::string&)> renameCompleted, bool keepBoth, filemanager::BrowserTab* adminTab,
-    std::optional<ArchiveOptions> archiveOptions
+    std::function<void(bool, const std::string&)> renameCompleted, bool keepBoth,
+    std::optional<AdminOperationContext> admin, std::optional<ArchiveOptions> archiveOptions
 ) {
 #ifndef NYTHERA_FILES_ARCHIVES
   if (isArchive(kind))
     return 0;
 #endif
-  if (m_replaying || !m_alive || !*m_alive)
+  if (m_history.replaying() || !m_alive || !*m_alive)
     return 0;
   const bool propertyEdit = kind == Kind::Properties && metadata.has_value();
-  if (adminTab && (!adminTab->hasActiveAdminSession() || administratorOperationActive(adminTab->id)
-                   || (!propertyEdit && (!adminTab->capabilities().canMutate || !localKind(kind)))))
+  if (admin
+      && (!admin->active
+          || administratorOperationActive(admin->origin.tabId)
+          || (!propertyEdit && (!admin->canMutate || !filemanager::localOperationKind(kind)))))
     return 0;
-  m_replaying = isReplay(kind);
   std::optional<HistoryEntry> replayEntry;
-  if (m_replaying)
-    replayEntry = (kind == Kind::Undo ? m_undo : m_redo).back();
+  if (isReplay(kind))
+    replayEntry = m_history.beginReplay(kind == Kind::Undo);
   const auto id = m_nextId++;
   Operation operation{
       .id = id,
@@ -1163,12 +591,9 @@ std::uint64_t FileOperationManager::start(
   };
   if (kind == Kind::Properties)
     operation.status = "Preparing property changes / authorisation…";
-  if (adminTab) {
+  if (admin) {
     operation.status = "Preparing Administrator operation…";
-    operation.adminOrigin = AdminOperationOrigin{
-        adminTab->id, adminTab->adminSession.sessionGeneration(), adminTab->session.navigationGeneration(),
-        adminTab->session.path()
-    };
+    operation.adminOrigin = admin->origin;
   }
   m_operations.push_back(operation);
   auto& activePaths = m_activePaths[id];
@@ -1182,7 +607,7 @@ std::uint64_t FileOperationManager::start(
       return;
     }
     activePaths.push_back(lexical);
-    if (adminTab)
+    if (admin)
       return;
     const auto canonical = std::filesystem::weakly_canonical(lexical, error);
     if (!error && canonical != lexical)
@@ -1192,7 +617,7 @@ std::uint64_t FileOperationManager::start(
     for (const auto& source : sources)
       trackPath(source);
   trackPath(destination);
-  if (adminTab || kind == Kind::Restore || kind == Kind::EmptyWastebin || kind == Kind::TrashToHome)
+  if (admin || kind == Kind::Restore || kind == Kind::EmptyWastebin || kind == Kind::TrashToHome)
     activePaths.emplace_back(); // Paths that the GUI cannot resolve require conservative mount protection.
   if (reportsProgress(kind)) {
     struct RevealRequest {
@@ -1225,7 +650,7 @@ std::uint64_t FileOperationManager::start(
     m_jobRevealTimers.emplace(id, timer);
   }
   const auto alive = m_alive;
-  if (m_changed && !adminTab)
+  if (m_changed && !admin)
     m_changed(m_operations.back());
   if (!alive || !*alive)
     return 0;
@@ -1237,10 +662,10 @@ std::uint64_t FileOperationManager::start(
   taskData->replayEntry = std::move(replayEntry);
   taskData->alive = m_alive;
   taskData->drain = m_workerDrain;
-  taskData->conflictResolver = adminTab ? m_adminConflictResolver : m_conflictResolver;
+  taskData->conflictResolver = admin ? m_adminConflictResolver : m_conflictResolver;
   taskData->wastebinBackend = m_wastebinBackend;
   GCancellable* cancellable = g_cancellable_new();
-  if (canSuspend(kind) && !adminTab) {
+  if (canSuspend(kind) && !admin) {
     taskData->pause = std::make_shared<FileTransferPauseState>();
     taskData->boundary = m_transferBoundary;
     m_pauseStates.emplace(id, taskData->pause);
@@ -1298,217 +723,42 @@ std::uint64_t FileOperationManager::start(
     std::lock_guard lock(m_workerDrain->mutex);
     ++m_workerDrain->active;
   }
-  if (adminTab) {
+  if (admin) {
     const auto request = propertyEdit
         ? engine::Request{.kind = engine::Kind::ModifyProperties, .destination = taskData->metadata->path.string(),
                           .properties = taskData->metadata}
-        : engine::Request{*localKind(kind), taskData->sources, taskData->destination, renameIdentity, keepBoth};
-    auto transport = adminTab->adminSession.runOperation(
-        request, operation.adminOrigin->sessionGeneration, cancellable
-    );
+        : engine::Request{*filemanager::localOperationKind(kind), taskData->sources, taskData->destination, renameIdentity, keepBoth};
+    auto transport = admin->session.runOperation(request, operation.adminOrigin->sessionGeneration, cancellable);
     taskData->waitForAdminFrames = std::move(transport.waitForFrames);
-    taskData->replyToAdminConflict = [reply = std::move(transport.sendConflictReply), cancel = transport.cancel](
-                                         auto conflict, const auto& decision
-                                     ) {
-      if (!reply(conflict, decision))
-        return cancel();
-      return true;
+    taskData->replyToAdminConflict = [reply = std::move(transport.sendConflictReply),
+                                      cancel = transport.cancel](auto conflict, const auto& decision) {
+      if (reply(conflict, decision))
+        return true;
+      (void)cancel();
+      return false;
     };
     m_adminControls.emplace(id, std::move(transport));
   }
   g_task_run_in_thread(task, worker);
-  if (adminTab && m_changed)
+  if (admin && m_changed)
     m_changed(m_operations.back());
   g_object_unref(task);
   g_object_unref(cancellable);
   return id;
 }
 
-void FileOperationManager::serviceAppeared(GDBusConnection*, const gchar*, const gchar*, gpointer userData) {
-  auto* self = static_cast<FileOperationManager*>(userData);
-  self->m_serviceAvailable = true;
-  for (const auto& operation : self->m_operations)
-    if (!operation.finished && reportsProgress(operation.kind) && !self->m_jobRevealTimers.contains(operation.id)) {
-      self->registerJob(operation);
-      self->publishJob(operation);
-      if (self->m_changed)
-        self->m_changed(operation);
-    }
-}
-void FileOperationManager::serviceVanished(GDBusConnection*, const gchar*, gpointer userData) {
-  auto* self = static_cast<FileOperationManager*>(userData);
-  self->m_serviceAvailable = false;
-  for (const auto& [id, subscription] : self->m_signalSubscriptions) {
-    (void)id;
-    g_dbus_connection_signal_unsubscribe(self->m_bus, subscription);
-  }
-  self->m_signalSubscriptions.clear();
-  self->m_jobPaths.clear();
-  for (const auto& operation : self->m_operations)
-    if (!operation.finished && self->m_changed)
-      self->m_changed(operation);
-}
-void FileOperationManager::jobSignal(
-    GDBusConnection*, const gchar*, const gchar* path, const gchar*, const gchar* signal, GVariant*, gpointer userData
-) {
-  auto* self = static_cast<FileOperationManager*>(userData);
-  for (const auto& [id, jobPath] : self->m_jobPaths)
-    if (jobPath == path) {
-      if (g_str_equal(signal, "cancelRequested"))
-        self->cancel(id);
-      else if (g_str_equal(signal, "suspendRequested"))
-        self->pause(id);
-      else if (g_str_equal(signal, "resumeRequested"))
-        self->resume(id);
-      return;
-    }
-}
 void FileOperationManager::registerJob(const Operation& operation) {
-  if (m_bus == nullptr || !m_serviceAvailable || m_jobPaths.contains(operation.id))
-    return;
-  GVariantBuilder hints;
-  g_variant_builder_init(&hints, G_VARIANT_TYPE("a{sv}"));
-  g_variant_builder_add(&hints, "{sv}", "title", g_variant_new_string("File operation"));
-  GError* error = nullptr;
-  GVariant* response = g_dbus_connection_call_sync(
-      m_bus, "org.kde.JobViewServer", "/JobViewServer", "org.kde.JobViewServerV2", "requestView",
-      g_variant_new(
-          "(si@a{sv})", "org.nythera.FileManager", canSuspend(operation.kind) ? 3 : 1, g_variant_builder_end(&hints)
-      ),
-      G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 1200, nullptr, &error
-  );
-  if (response == nullptr) {
-    g_clear_error(&error);
-    return;
-  }
-  const gchar* objectPath = nullptr;
-  g_variant_get(response, "(&o)", &objectPath);
-  const std::string ownedPath(objectPath);
-  g_variant_unref(response);
-  m_jobPaths.emplace(operation.id, ownedPath);
-  const guint sub = g_dbus_connection_signal_subscribe(
-      m_bus, "org.kde.JobViewServer", "org.kde.JobViewV3", nullptr, ownedPath.c_str(), nullptr,
-      G_DBUS_SIGNAL_FLAGS_NONE, jobSignal, this, nullptr
-  );
-  m_signalSubscriptions.emplace(operation.id, sub);
-  if (operation.paused)
-    publishJob(operation, true, true);
+  m_jobReporter->registerJob(operation, canSuspend(operation.kind), m_transferRates.contains(operation.id));
 }
 void FileOperationManager::publishJob(const Operation& operation, bool metricsOnly, bool suspensionAcknowledgement) {
-  const auto path = m_jobPaths.find(operation.id);
-  if (m_bus == nullptr || !m_serviceAvailable || path == m_jobPaths.end())
-    return;
-  GVariantBuilder properties;
-  g_variant_builder_init(&properties, G_VARIANT_TYPE("a{sv}"));
-  if (m_transferRates.contains(operation.id)) {
-    g_variant_builder_add(
-        &properties, "{sv}", "displaySpeed", g_variant_new_uint64(operation.displaySpeedBytesPerSecond)
-    );
-    g_variant_builder_add(&properties, "{sv}", "etaSpeed", g_variant_new_uint64(operation.etaBytesPerSecond));
-  }
-  if (suspensionAcknowledgement)
-    g_variant_builder_add(&properties, "{sv}", "suspended", g_variant_new_boolean(operation.paused));
-  if (!metricsOnly) {
-    const char* title = operation.finished      ? operation.resultTitle.c_str()
-        : operation.kind == Kind::Duplicate     ? "Duplicating items"
-        : operation.kind == Kind::Copy          ? "Copying files"
-        : operation.kind == Kind::Move          ? "Moving files"
-        : operation.kind == Kind::Rename        ? "Renaming item"
-        : operation.kind == Kind::Trash         ? "Moving to Trash"
-        : operation.kind == Kind::TrashToHome   ? "Moving to Home Wastebin"
-        : operation.kind == Kind::Delete        ? "Deleting items"
-        : operation.kind == Kind::Restore       ? "Restoring items"
-        : operation.kind == Kind::EmptyWastebin ? "Emptying Wastebin"
-        : operation.kind == Kind::Properties    ? "Changing properties"
-        : operation.kind == Kind::Undo          ? "Undoing file operation"
-        : operation.kind == Kind::Redo          ? "Redoing file operation"
-        : operation.kind == Kind::Compress      ? "Compressing archive"
-        : operation.kind == Kind::Extract       ? "Extracting archive"
-                                                : "Creating item";
-    const auto namedTitle = isArchive(operation.kind) && !operation.finished
-        ? std::string(title)
-            + " "
-            + filemanager::sanitizeFilenameForDisplay(
-                quotedBasename(operation.kind == Kind::Compress ? operation.destination : operation.source)
-            )
-        : std::string(title);
-    g_variant_builder_add(&properties, "{sv}", "title", g_variant_new_string(namedTitle.c_str()));
-    g_variant_builder_add(
-        &properties, "{sv}", "infoMessage",
-        g_variant_new_string(operation.finished ? operation.resultDescription.c_str() : operation.status.c_str())
-    );
-    if (!isArchive(operation.kind))
-      g_variant_builder_add(
-          &properties, "{sv}", "percent", g_variant_new_uint32(static_cast<guint32>(operation.fraction * 100.0))
-      );
-    if (isArchive(operation.kind)) {
-      g_variant_builder_add(&properties, "{sv}", "processedBytes", g_variant_new_uint64(operation.processedBytes));
-      g_variant_builder_add(&properties, "{sv}", "processedItems", g_variant_new_uint64(operation.processedFiles));
-    }
-    if (operation.totalBytes > 0) {
-      g_variant_builder_add(&properties, "{sv}", "processedBytes", g_variant_new_uint64(operation.processedBytes));
-      g_variant_builder_add(&properties, "{sv}", "totalBytes", g_variant_new_uint64(operation.totalBytes));
-      g_variant_builder_add(&properties, "{sv}", "speed", g_variant_new_uint64(operation.speedBytesPerSecond));
-    }
-    if (operation.totalFiles > 0) {
-      g_variant_builder_add(&properties, "{sv}", "processedFiles", g_variant_new_uint64(operation.processedFiles));
-      g_variant_builder_add(&properties, "{sv}", "totalFiles", g_variant_new_uint64(operation.totalFiles));
-      g_variant_builder_add(&properties, "{sv}", "processedItems", g_variant_new_uint64(operation.processedFiles));
-      g_variant_builder_add(&properties, "{sv}", "totalItems", g_variant_new_uint64(operation.totalFiles));
-    }
-    if (!operation.destination.empty()) {
-      char* uri = g_filename_to_uri(operation.destination.c_str(), nullptr, nullptr);
-      if (uri != nullptr) {
-        g_variant_builder_add(&properties, "{sv}", "destUrl", g_variant_new_string(uri));
-        g_free(uri);
-      }
-    }
-  } else {
-    g_variant_builder_add(&properties, "{sv}", "infoMessage", g_variant_new_string(operation.status.c_str()));
-  }
-  g_dbus_connection_call(
-      m_bus, "org.kde.JobViewServer", path->second.c_str(), "org.kde.JobViewV3", "update",
-      g_variant_new("(@a{sv})", g_variant_builder_end(&properties)), nullptr, G_DBUS_CALL_FLAGS_NONE, 1200, nullptr,
-      [](GObject* source, GAsyncResult* result, gpointer) {
-        GError* callError = nullptr;
-        GVariant* reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &callError);
-        if (reply != nullptr)
-          g_variant_unref(reply);
-        g_clear_error(&callError);
-      },
-      nullptr
-  );
+  m_jobReporter->publishJob(operation, m_transferRates.contains(operation.id), metricsOnly, suspensionAcknowledgement);
 }
 void FileOperationManager::finishJob(const Operation& operation) {
   if (const auto timer = m_jobRevealTimers.find(operation.id); timer != m_jobRevealTimers.end()) {
     g_source_remove(timer->second);
     m_jobRevealTimers.erase(timer);
   }
-  const auto path = m_jobPaths.find(operation.id);
-  if (m_bus != nullptr && m_serviceAvailable && path != m_jobPaths.end()) {
-    const guint subscription = m_signalSubscriptions[operation.id];
-    if (subscription != 0)
-      g_dbus_connection_signal_unsubscribe(m_bus, subscription);
-    m_signalSubscriptions.erase(operation.id);
-    GVariantBuilder hints;
-    g_variant_builder_init(&hints, G_VARIANT_TYPE("a{sv}"));
-    GError* error = nullptr;
-    GVariant* reply = g_dbus_connection_call_sync(
-        m_bus, "org.kde.JobViewServer", path->second.c_str(), "org.kde.JobViewV3", "terminate",
-        g_variant_new(
-            "(us@a{sv})",
-            operation.succeeded       ? 0U
-                : operation.cancelled ? 1U
-                                      : 2U,
-            operation.status.c_str(), g_variant_builder_end(&hints)
-        ),
-        nullptr, G_DBUS_CALL_FLAGS_NONE, 1200, nullptr, &error
-    );
-    if (reply != nullptr)
-      g_variant_unref(reply);
-    g_clear_error(&error);
-    m_jobPaths.erase(path);
-  }
+  m_jobReporter->finishJob(operation);
 }
 
 void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCancellable* cancellable) {
@@ -1575,7 +825,8 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
     g_clear_error(&error);
   };
   if (data->replayEntry) {
-    result->ok = replay(*data->replayEntry, data->kind == Kind::Undo, cancellable, &error);
+    result->ok =
+        filemanager::OperationHistory::replay(*data->replayEntry, data->kind == Kind::Undo, cancellable, &error);
     if (!result->ok) {
       result->historyBlocked = g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WRONG_ETAG);
       fail("Could not replay this operation.");
@@ -1584,29 +835,6 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
     return;
   }
 
-  const auto remember =
-      [&](const std::string& source, const std::string& destination, const std::optional<Revision>& sourceRevision,
-          const std::optional<Revision>& resultRevision, FileIdentity sourceParent, FileIdentity destinationParent,
-          std::string linkTarget, std::optional<std::vector<std::uint8_t>> createdContent) {
-        if (!resultRevision
-            || destinationParent == FileIdentity{}
-            || parentIdentity(destination) != destinationParent
-            || (!source.empty()
-                && (sourceParent == FileIdentity{} || !sourceRevision || parentIdentity(source) != sourceParent)))
-          return;
-        const auto& state = *resultRevision;
-        if ((!S_ISREG(state.mode) && !S_ISLNK(state.mode) && !S_ISDIR(state.mode))
-            || state.links > (S_ISDIR(state.mode) ? 2U : 1U))
-          return;
-        if (S_ISDIR(state.mode) && (isTransfer(data->kind) || !emptyDirectory(destination)))
-          return;
-        if ((data->kind == Kind::Rename || data->kind == Kind::Move) && state.device != sourceParent.first)
-          return;
-        result->history.push_back(
-            {data->kind, source, destination, std::move(linkTarget), std::move(createdContent), sourceRevision, state,
-             sourceParent, destinationParent}
-        );
-      };
   engine::TransferCallbacks transferCallbacks;
   transferCallbacks.report = [data](auto bytes, auto totalBytes, auto items, auto totalItems, auto speed) {
     postProgressIdle(data->owner, data->alive, {data->id, bytes, totalBytes, items, totalItems, speed});
@@ -1650,8 +878,10 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
                       frame.sourcePath, frame.destinationPath, frame.hasRemaining, frame.conflictMetadata, cancellable
                   )
                 : ConflictDecision{};
-            if (!g_cancellable_is_cancelled(cancellable))
-              (void)data->replyToAdminConflict(frame.conflictId, decision);
+            if (!g_cancellable_is_cancelled(cancellable)) {
+              const bool replied = data->replyToAdminConflict(frame.conflictId, decision);
+              result->adminSkipSelected |= replied && isTransfer(data->kind) && decision.action == ConflictAction::Skip;
+            }
           }
           break;
         case AdminServerFrameKind::OpCompletedEntry:
@@ -1662,9 +892,11 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
           break;
         case AdminServerFrameKind::OpResult:
           if (data->kind == Kind::Properties)
-            result->metadata = frame.properties.value_or(filemanager::PropertyResult{
-                .cancelled = frame.status == AdminStatusCode::Cancelled, .error = frame.detail
-            });
+            result->metadata = frame.properties.value_or(
+                filemanager::PropertyResult{
+                    .cancelled = frame.status == AdminStatusCode::Cancelled, .error = frame.detail
+                }
+            );
           result->ok = frame.status == AdminStatusCode::Ok;
           result->cancelled = frame.status == AdminStatusCode::Cancelled;
           result->mutated = frame.mutated;
@@ -1679,20 +911,14 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
             data->totalMeasure = {frame.totalBytes, frame.totalItems};
           }
           if (result->customDescription.empty()) {
-            const auto completedCount = data->kind == Kind::Move ? result->movedSources.size()
-                : data->kind == Kind::Delete ? data->completedMeasure.items : result->completedEntries.size();
-            if ((isTransfer(data->kind) || data->kind == Kind::Delete)
-                && completedCount != data->sources.size()
-                && (result->ok || completedCount > 0)) {
-              const auto verb = data->kind == Kind::Copy ? "copied"
-                  : data->kind == Kind::Duplicate ? "duplicated"
-                  : data->kind == Kind::Move ? "moved"
-                                             : "deleted";
+            if (data->kind == Kind::Delete
+                && data->completedMeasure.items != data->sources.size()
+                && (result->ok || data->completedMeasure.items > 0)) {
               result->customDescription =
-                  std::format("{} of {} selected items {}", completedCount, data->sources.size(), verb);
+                  std::format("{} of {} selected items deleted", data->completedMeasure.items, data->sources.size());
               if (!result->message.empty())
                 result->customDescription += ". " + result->message;
-            } else if (result->cancelled) {
+            } else if (result->cancelled && !isTransfer(data->kind)) {
               result->customDescription = result->message;
             }
           }
@@ -1768,14 +994,23 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
     return;
   }
 #endif
-  if (const auto kind = localKind(data->kind)) {
+  if (const auto kind = filemanager::localOperationKind(data->kind)) {
     engine::Request request{
         *kind, std::move(data->sources), std::move(data->destination), data->renameIdentity, data->keepBoth
     };
     const engine::Callbacks callbacks{
         .transfer = std::move(transferCallbacks),
         .resolveConflict = std::move(data->conflictResolver),
-        .recordChange = remember,
+        .recordChange = [data, result](
+                            const auto& source, const auto& destination, const auto& sourceRevision,
+                            const auto& resultRevision, auto sourceParent, auto destinationParent, auto linkTarget,
+                            auto content
+                        ) {
+          filemanager::OperationHistory::record(
+              result->history, data->kind, source, destination, sourceRevision, resultRevision, sourceParent,
+              destinationParent, std::move(linkTarget), std::move(content)
+          );
+        },
     };
     static_cast<engine::Result&>(*result) =
         engine::executeLocalOperation(request, cancellable, data->pause.get(), callbacks);
@@ -1785,532 +1020,19 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
     g_task_return_pointer(task, result, [](gpointer value) { delete static_cast<Result*>(value); });
     return;
   }
-  TransferProgress progress{.callbacks = transferCallbacks, .pause = data->pause.get(), .cancellable = cancellable};
-  if (data->kind == Kind::Restore || data->kind == Kind::EmptyWastebin) {
-    std::vector<std::string> uris = data->sources;
-    if (data->kind == Kind::EmptyWastebin) {
-      const bool enumerated = data->wastebinBackend.enumerateTopLevel
-          ? data->wastebinBackend.enumerateTopLevel(cancellable, uris, result->message)
-          : gioEnumerateTrash(cancellable, uris, result->message);
-      if (!enumerated) {
-        result->ok = false;
-        result->cancelled = cancellable != nullptr && g_cancellable_is_cancelled(cancellable);
-        result->customTitle = result->cancelled ? "Empty Wastebin cancelled" : "Empty Wastebin failed";
-        result->customDescription = result->message;
-        g_task_return_pointer(task, result, [](gpointer value) { delete static_cast<Result*>(value); });
-        return;
-      }
-      if (!data->wastebinBackend.enumerateTopLevel) {
-        const auto invalid =
-            std::ranges::find_if(uris, [](const std::string& uri) { return !isDirectTrashChild(uri); });
-        if (invalid != uris.end()) {
-          result->ok = false;
-          result->message = "The Wastebin provider returned an item outside the trash root.";
-          result->customTitle = "Empty Wastebin failed";
-          result->customDescription = result->message;
-          g_task_return_pointer(task, result, [](gpointer value) { delete static_cast<Result*>(value); });
-          return;
-        }
-      }
-    }
-    const std::size_t requested = uris.size();
-    result->requestedCount = requested;
-    std::size_t restored = 0;
-    std::size_t failed = 0;
-    std::size_t skipped = 0;
-    std::vector<std::string> failures;
-    std::optional<ConflictAction> applyConflictToAll;
-    std::optional<std::pair<GFileType, GFileType>> applyConflictTypes;
-    auto noteFailure = [&](const std::string& uri, const std::string& detail) {
-      ++failed;
-      if (failures.size() < 4) {
-        GFile* file = g_file_new_for_uri(uri.c_str());
-        char* name = g_file_get_basename(file);
-        failures.emplace_back(std::string(name == nullptr ? "item" : name) + ": " + detail);
-        g_free(name);
-        g_object_unref(file);
-      }
-    };
-    for (std::size_t i = 0; i < requested; ++i) {
-      if (g_cancellable_set_error_if_cancelled(cancellable, &error)) {
-        result->cancelled = true;
-        g_clear_error(&error);
-        break;
-      }
-      std::string itemError;
-      bool succeeded = false;
-      if (data->kind == Kind::EmptyWastebin) {
-        if (wastebin_fallback::productionWastebinForbidden()
-            && (uris[i].starts_with("trash:") || isTrashUri(uris[i]))) {
-          succeeded = false;
-          itemError = "Production Wastebin deletion is disabled in test isolation mode.";
-        } else {
-          // The enumerator supplies only the trash backend's direct children.
-          // Deletion stays within GIO so the backend owns recursive trash removal.
-          GFile* item = g_file_new_for_uri(uris[i].c_str());
-          GError* deleteError = nullptr;
-          succeeded = g_file_delete(item, cancellable, &deleteError);
-          result->mutated |= succeeded;
-          if (!succeeded)
-            itemError = deleteError == nullptr ? "Could not delete Wastebin entry." : deleteError->message;
-          g_clear_error(&deleteError);
-          g_object_unref(item);
-        }
-      } else {
-        if (!data->wastebinBackend.originalPath && !isTrashUri(uris[i])) {
-          noteFailure(uris[i], "Restore source is not a GIO trash URI.");
-          continue;
-        }
-        std::string originalPath;
-        const bool resolved = data->wastebinBackend.originalPath
-            ? data->wastebinBackend.originalPath(uris[i], cancellable, originalPath, itemError)
-            : gioOriginalPath(uris[i], cancellable, originalPath, itemError);
-        if (resolved && !originalPath.empty() && originalPath.front() == '/') {
-          const auto original = std::filesystem::path(originalPath);
-          const std::string filename = original.filename().string();
-          std::filesystem::path destination =
-              data->destination.empty() ? original : std::filesystem::path(data->destination) / filename;
-          if (const auto originalNameError = filemanager::invalidFileNameReason(filename); !originalNameError.empty())
-            itemError = "Invalid original location metadata. " + std::string(originalNameError);
-          else if (originalPath.find('\0') != std::string::npos)
-            itemError = "The original location contains a NUL character.";
-          else if (
-              wastebin_fallback::productionWastebinForbidden() && (uris[i].starts_with("trash:") || isTrashUri(uris[i]))
-          ) {
-            itemError = "Production Wastebin restore is disabled in test isolation mode.";
-          } else {
-            GFile* source = g_file_new_for_uri(uris[i].c_str());
-            GFile* target = g_file_new_for_path(destination.string().c_str());
-            GError* sourceQueryError = nullptr;
-            GFileInfo* incoming = g_file_query_info(
-                source, G_FILE_ATTRIBUTE_STANDARD_TYPE, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable,
-                &sourceQueryError
-            );
-            GFileInfo* existing = g_file_query_info(
-                target, G_FILE_ATTRIBUTE_STANDARD_TYPE, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, nullptr
-            );
-            const auto existingBefore =
-                existing != nullptr ? fs_compat::queryEntryIdentity(destination.string().c_str()) : std::nullopt;
-            const auto incomingType = incoming == nullptr ? G_FILE_TYPE_UNKNOWN : g_file_info_get_file_type(incoming);
-            bool replace = false;
-            bool proceed = true;
-            if (incoming == nullptr) {
-              itemError = sourceQueryError == nullptr ? "Could not inspect the Wastebin source item."
-                                                      : sourceQueryError->message;
-              proceed = false;
-            } else if (existing != nullptr) {
-              const auto existingType = g_file_info_get_file_type(existing);
-              ConflictDecision decision{.action = ConflictAction::Cancel};
-              if (applyConflictToAll && applyConflictTypes == std::pair{incomingType, existingType})
-                decision.action = *applyConflictToAll;
-              else if (data->conflictResolver && !g_cancellable_is_cancelled(cancellable)) {
-                const auto metadata =
-                    engine::queryConflictMetadata(source, target, incomingType, existingType, cancellable);
-                decision =
-                    data->conflictResolver(uris[i], destination.string(), i + 1 < requested, metadata, cancellable);
-              }
-              if (decision.applyToAll) {
-                applyConflictToAll = decision.action;
-                applyConflictTypes = std::pair{incomingType, existingType};
-              }
-              if (decision.action == ConflictAction::Skip) {
-                ++skipped;
-                proceed = false;
-              } else if (
-                  decision.action == ConflictAction::Replace
-                  && incomingType != G_FILE_TYPE_UNKNOWN
-                  && incomingType == existingType
-                  && incomingType != G_FILE_TYPE_DIRECTORY
-              ) {
-                replace = true;
-              } else if (decision.action == ConflictAction::Rename) {
-                std::string renamed = decision.alternativeName;
-                if (renamed.empty()) {
-                  const auto stem =
-                      incomingType == G_FILE_TYPE_DIRECTORY ? original.filename().string() : original.stem().string();
-                  const auto extension =
-                      incomingType == G_FILE_TYPE_DIRECTORY ? std::string{} : original.extension().string();
-                  for (unsigned suffix = 1; suffix < 10000; ++suffix) {
-                    const std::string candidate = stem
-                        + " (restored"
-                        + (suffix == 1 ? std::string{} : " " + std::to_string(suffix))
-                        + ")"
-                        + extension;
-                    GFile* parent = g_file_get_parent(target);
-                    GFile* next = g_file_get_child(parent, candidate.c_str());
-                    g_object_unref(parent);
-                    const bool exists = g_file_query_exists(next, cancellable);
-                    if (!exists) {
-                      g_object_unref(target);
-                      target = next;
-                      destination = std::filesystem::path(destination).parent_path() / candidate;
-                      renamed = candidate;
-                      break;
-                    }
-                    g_object_unref(next);
-                  }
-                  if (renamed.empty())
-                    itemError = "Could not find an available restore name.";
-                } else if (const auto reason = filemanager::invalidFileNameReason(renamed); !reason.empty()) {
-                  itemError = reason;
-                } else {
-                  GFile* parent = g_file_get_parent(target);
-                  GFile* next = g_file_get_child(parent, renamed.c_str());
-                  g_object_unref(parent);
-                  if (g_file_query_exists(next, cancellable))
-                    itemError = "The alternative name already exists.";
-                  else {
-                    g_object_unref(target);
-                    target = next;
-                    destination = std::filesystem::path(destination).parent_path() / renamed;
-                  }
-                  if (target != next)
-                    g_object_unref(next);
-                }
-              } else {
-                proceed = false;
-                result->cancelled = true;
-                itemError = "Restore cancelled at the name conflict.";
-              }
-            }
-            if (proceed && itemError.empty())
-              succeeded = gioMoveWithBackup(
-                  source, target, incomingType, replace, existingBefore, cancellable, itemError, result->mutated
-              );
-            g_clear_error(&sourceQueryError);
-            if (incoming != nullptr)
-              g_object_unref(incoming);
-            if (existing != nullptr)
-              g_object_unref(existing);
-            g_object_unref(source);
-            g_object_unref(target);
-          }
-        } else if (itemError.empty()) {
-          itemError = "Original location metadata is unavailable or invalid for this Wastebin item.";
-        }
-      }
-      if (succeeded)
-        ++restored;
-      else if (
-          !itemError.empty() && !(data->kind == Kind::Restore && itemError == "Restore cancelled at the name conflict.")
-      ) {
-        noteFailure(uris[i], itemError);
-      }
-      if (result->cancelled)
-        break;
-    }
-    result->cancelled |= g_cancellable_is_cancelled(cancellable) && restored + skipped < requested;
-    result->ok = failed == 0 && !result->cancelled;
-    result->customTitle = result->cancelled ? operationName(data->kind) + std::string(" cancelled")
-        : failed == 0                       ? operationName(data->kind) + std::string(" completed")
-        : restored + skipped > 0            ? operationName(data->kind) + std::string(" partially completed")
-                                            : operationName(data->kind) + std::string(" failed");
-    std::string label = data->kind == Kind::Restore ? "restored" : "deleted";
-    result->customDescription = std::to_string(restored) + " of " + std::to_string(requested) + " items " + label;
-    if (skipped > 0)
-      result->customDescription += ", " + std::to_string(skipped) + " skipped";
-    if (failed > 0)
-      result->customDescription += ", " + std::to_string(failed) + " failed";
-    if (result->cancelled)
-      result->customDescription += "; operation cancelled";
-    for (const auto& failure : failures)
-      result->customDescription += "; " + failure;
-    if (failed > failures.size())
-      result->customDescription += "; additional failures omitted";
-    if (requested == 0) {
-      result->ok = true;
-      result->customTitle = operationName(data->kind) + std::string(" completed");
-      result->customDescription =
-          data->kind == Kind::EmptyWastebin ? "Wastebin is already empty" : "No items to restore";
-    }
-    g_task_return_pointer(task, result, [](gpointer value) { delete static_cast<Result*>(value); });
-    return;
-  }
-  if (data->kind == Kind::TrashToHome) {
-    const auto count = data->sources.size();
-    data->measures.resize(count);
-    for (std::size_t i = 0; i < count; ++i) {
-      if (!transferCheckpoint(&progress)) {
-        g_cancellable_set_error_if_cancelled(cancellable, &error);
-        fail("Cancelled");
-        break;
-      }
-      GFile* source = g_file_new_for_path(data->sources[i].c_str());
-      const bool measured = measureTree(source, cancellable, data->measures[i], &error);
-      g_object_unref(source);
-      if (!measured) {
-        fail("Could not calculate transfer size");
-        break;
-      }
-      data->totalMeasure.bytes += data->measures[i].bytes;
-      data->totalMeasure.items += data->measures[i].items;
-    }
-    std::filesystem::path trashRoot;
-    std::filesystem::path infoDir;
-    std::filesystem::path filesDir;
-    if (result->message.empty() && !wastebin_fallback::ensureHomeWastebinDirs(trashRoot, infoDir, filesDir, &error)) {
-      fail("Could not prepare Home Wastebin directories.");
-    }
-    if (result->message.empty()) {
-      if (const auto available = wastebin_fallback::queryAvailableBytes(filesDir);
-          available.has_value() && *available < data->totalMeasure.bytes) {
-        result->ok = false;
-        result->message = "Insufficient free space in Home Wastebin ("
-            + wastebin_fallback::formatByteSize(data->totalMeasure.bytes)
-            + " required, "
-            + wastebin_fallback::formatByteSize(*available)
-            + " available).";
-        result->customDescription = result->message;
-      }
-    }
-    if (result->message.empty()) {
-      postProgressIdle(
-          data->owner, data->alive, {data->id, 0, data->totalMeasure.bytes, 0, data->totalMeasure.items, 0}
-      );
-    }
-    std::uint64_t completedBytes = 0;
-    std::uint64_t completedItems = 0;
-    progress.totalBytes = data->totalMeasure.bytes;
-    progress.totalItems = data->totalMeasure.items;
-    progress.lastReport = std::chrono::steady_clock::now();
-    if (progress.pause)
-      progress.reportedPause = progress.pause->pausedTime();
 
-    struct stat filesDirStat{};
-    const std::uint64_t filesDirDevice =
-        lstat(filesDir.c_str(), &filesDirStat) == 0 ? static_cast<std::uint64_t>(filesDirStat.st_dev) : 0;
-
-    for (std::size_t i = 0; i < count && result->message.empty(); ++i) {
-      if (!transferCheckpoint(&progress) || g_cancellable_set_error_if_cancelled(cancellable, &error)) {
-        g_cancellable_set_error_if_cancelled(cancellable, &error);
-        fail("Cancelled");
-        break;
-      }
-      const auto& sourcePath = data->sources[i];
-      const auto sourceBefore = revision(sourcePath);
-      if (!sourceBefore) {
-        result->ok = false;
-        result->message = "The source item is missing or could not be inspected: " + sourcePath;
-        break;
-      }
-      const bool sourceIsDir = S_ISDIR(sourceBefore->mode);
-      const bool sourceIsSymlink = S_ISLNK(sourceBefore->mode);
-      if (!fs_compat::preflightTransferDestination(filesDir, sourceIsDir, sourceIsSymlink, false, &error)) {
-        fail("Home Wastebin filesystem does not support safe file publication.");
-        break;
-      }
-      std::error_code absEc;
-      std::filesystem::path absSource = std::filesystem::absolute(sourcePath, absEc).lexically_normal();
-      if (absEc || absSource.empty())
-        absSource = sourcePath;
-
-      wastebin_fallback::ReservedTrashEntry reserved;
-      if (!wastebin_fallback::reserveHomeTrashEntry(absSource, reserved, &error)) {
-        fail("Could not reserve Home Wastebin entry.");
-        break;
-      }
-
-      bool committedToHomeTrash = false;
-      bool removedSourceDirectly = false;
-      if (filesDirDevice != 0 && sourceBefore->device == filesDirDevice) {
-        const auto directOutcome = fs_compat::moveOrPublishEntryNoReplace(
-            sourcePath.c_str(), reserved.filesPath.c_str(), false, toCompatIdentity(*sourceBefore), sourceIsSymlink
-        );
-        if (directOutcome.ok) {
-          committedToHomeTrash = true;
-          removedSourceDirectly = true;
-          result->ok = true;
-        } else if (directOutcome.splitState) {
-          committedToHomeTrash = true;
-          result->ok = false;
-          result->mutated = true;
-          result->message = "Trashed copy remains in Home Wastebin at "
-              + reserved.filesPath.string()
-              + "; source still exists at "
-              + sourcePath
-              + ": "
-              + directOutcome.message;
-          result->customDescription = result->message;
-        }
-      }
-
-      if (!committedToHomeTrash && result->message.empty()) {
-        char* uuid = g_uuid_string_random();
-        char* leaf = g_strdup_printf(".nythera-trash-partial-%s-%zu", uuid, i);
-        g_free(uuid);
-        GFile* source = g_file_new_for_path(sourcePath.c_str());
-        GFile* filesDirFile = g_file_new_for_path(filesDir.c_str());
-        GFile* staged = g_file_get_child(filesDirFile, leaf);
-        g_object_unref(filesDirFile);
-        g_free(leaf);
-
-        const bool stagedWasAbsent = !entryExistsNoFollow(staged);
-        progress.baseBytes = completedBytes;
-        progress.progressedBytes = completedBytes;
-        progress.completedItems = completedItems;
-        if (stagedWasAbsent)
-          result->ok = copyTree(source, staged, cancellable, &error, &progress, engine::CopyMetadata::DirectoryModeAndTimes);
-        else {
-          g_set_error_literal(
-              &error, G_IO_ERROR, G_IO_ERROR_EXISTS, "Could not allocate a temporary Home Wastebin staging path"
-          );
-          result->ok = false;
-        }
-        if (result->ok
-            && (!transferCheckpoint(&progress) || g_cancellable_set_error_if_cancelled(cancellable, &error))) {
-          g_cancellable_set_error_if_cancelled(cancellable, &error);
-          if (error == nullptr)
-            g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Operation cancelled");
-          result->ok = false;
-        }
-
-        g_autofree char* stagePath = g_file_get_path(staged);
-        const auto stagedRevision = result->ok && stagePath ? revision(stagePath) : std::nullopt;
-        bool publishSplitState = false;
-        bool publishMetadataFailed = false;
-        if (result->ok) {
-          const auto outcome = fs_compat::moveOrPublishEntryNoReplace(
-              stagePath == nullptr ? "" : stagePath, reserved.filesPath.c_str(), true,
-              stagedRevision ? std::optional<fs_compat::EntryIdentity>(toCompatIdentity(*stagedRevision))
-                             : std::nullopt,
-              sourceIsSymlink
-          );
-          result->ok = outcome.ok;
-          if (!outcome.ok) {
-            publishSplitState = outcome.splitState;
-            publishMetadataFailed = outcome.metadataFailed;
-            setErrorFromPublishOutcome(outcome, &error);
-          }
-        }
-        committedToHomeTrash = result->ok || publishSplitState;
-        if (publishSplitState && stagedWasAbsent && entryExistsNoFollow(staged)) {
-          cleanupStagedTree(staged);
-          if (!publishMetadataFailed && !entryExistsNoFollow(staged)) {
-            result->ok = true;
-            publishSplitState = false;
-            g_clear_error(&error);
-          }
-        }
-        if (!committedToHomeTrash) {
-          if (stagedWasAbsent && entryExistsNoFollow(staged))
-            cleanupStagedTree(staged);
-          unlink(reserved.infoPath.c_str());
-        }
-        g_object_unref(staged);
-        g_object_unref(source);
-      }
-
-      if (committedToHomeTrash) {
-        result->mutated = true;
-        if (!removedSourceDirectly && result->ok) {
-          GFile* source = g_file_new_for_path(sourcePath.c_str());
-          const bool cancelledBeforeCleanup =
-              !transferCheckpoint(&progress) || g_cancellable_set_error_if_cancelled(cancellable, &error);
-          if (cancelledBeforeCleanup) {
-            result->ok = false;
-            result->cancelled = true;
-          } else {
-            result->ok = removeTree(source, cancellable, &error, &result->mutated);
-            result->cancelled = error != nullptr && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
-          }
-          if (!result->ok) {
-            const bool sourceStillExists =
-                !sourcePath.empty() ? revision(sourcePath).has_value() : entryExistsNoFollow(source);
-            result->message = std::string("Trashed copy remains in Home Wastebin at ")
-                + reserved.filesPath.string()
-                + (sourceStillExists ? "; source still exists at " + sourcePath
-                                     : "; source was already removed from " + sourcePath)
-                + (result->cancelled
-                       ? " because the operation was cancelled before source cleanup finished"
-                       : ": " + std::string(error == nullptr ? "could not remove source" : error->message));
-            result->customDescription = result->message;
-          }
-          g_object_unref(source);
-        }
-        if (result->ok) {
-          result->movedSources.push_back(sourcePath);
-          completedBytes += data->measures[i].bytes;
-          completedItems += data->measures[i].items;
-          data->completedMeasure.bytes = completedBytes;
-          data->completedMeasure.items = completedItems;
-          progress.baseBytes = completedBytes;
-          progress.progressedBytes = completedBytes;
-          progress.completedItems = completedItems;
-          publishProgress(progress, 0, true);
-        }
-      }
-
-      if (!result->ok) {
-        if (result->message.empty())
-          fail("Could not move item to Home Wastebin");
-        else {
-          result->cancelled |= error != nullptr && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
-          g_clear_error(&error);
-        }
-        break;
-      }
-    }
-    if (result->message.empty())
-      result->ok = true;
-  } else if (data->kind == Kind::Trash) {
-    const auto count = data->sources.size();
-    for (std::size_t i = 0; i < count && result->message.empty(); ++i) {
-      if (g_cancellable_set_error_if_cancelled(cancellable, &error)) {
-        fail("Cancelled");
-        break;
-      }
-      const auto& sourcePath = data->sources[i];
-      GFile* source = g_file_new_for_path(sourcePath.c_str());
-      if (const int injectedErrno = wastebin_fallback::invokeTrashHook(sourcePath.c_str()); injectedErrno != 0) {
-        result->ok = false;
-        g_set_error_literal(&error, G_IO_ERROR, g_io_error_from_errno(injectedErrno), g_strerror(injectedErrno));
-      } else if (
-          std::string isolationError; wastebin_fallback::productionWastebinForbidden()
-          && !wastebin_fallback::validateIsolatedTrashTarget(sourcePath, isolationError)
-      ) {
-        result->ok = false;
-        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, isolationError.c_str());
-      } else {
-        result->ok = g_file_trash(source, cancellable, &error);
-      }
-      result->mutated |= result->ok;
-      if (result->ok) {
-        result->movedSources.push_back(sourcePath);
-      } else if (error == nullptr || !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-        const auto diag = wastebin_fallback::diagnoseTrashFailure(sourcePath, error);
-        if (!diag.summary.empty()) {
-          result->message = diag.summary;
-          result->customDescription = diag.summary;
-        }
-        if (diag.eligibleForHomeFallback) {
-          result->trashFallback = TrashFallbackOffer{
-              .sources = std::vector<std::string>(
-                  data->sources.begin() + static_cast<std::ptrdiff_t>(i), data->sources.end()
-              ),
-              .mountPath = diag.mountRoot.string(),
-              .trashDirectory = diag.trashDirPath.string(),
-              .diagnostic = diag.summary,
-          };
-        }
-      }
-      if (result->ok) {
-        const auto done = static_cast<std::uint64_t>(i + 1);
-        postProgressIdle(data->owner, data->alive, {data->id, 0, 0, done, static_cast<std::uint64_t>(count), 0});
-      }
-      if (!result->ok) {
-        if (result->message.empty())
-          fail("Operation failed");
-        else {
-          result->cancelled |= error != nullptr && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
-          g_clear_error(&error);
-        }
-      }
-      g_object_unref(source);
-    }
-    if (result->message.empty())
-      result->ok = true;
-  }
-  g_task_return_pointer(task, result, [](gpointer ptr) { delete static_cast<Result*>(ptr); });
+  auto wastebin = filemanager::wastebin_operations::execute(
+      data->kind, data->sources, data->destination, data->wastebinBackend, data->conflictResolver, transferCallbacks,
+      cancellable, data->pause.get()
+  );
+  data->totalMeasure = wastebin.totalMeasure;
+  data->completedMeasure = wastebin.completedMeasure;
+  result->customTitle = std::move(wastebin.customTitle);
+  result->requestedCount = wastebin.requestedCount;
+  result->skippedEntries = wastebin.skippedEntries;
+  result->trashFallback = std::move(wastebin.trashFallback);
+  static_cast<engine::Result&>(*result) = std::move(wastebin);
+  g_task_return_pointer(task, result, [](gpointer value) { delete static_cast<Result*>(value); });
 }
 
 void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpointer userData) {
@@ -2335,47 +1057,16 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
       operation->outcomeUncertain = result && result->outcomeUncertain;
       operation->mutated = result && (result->mutated || (isReplay(data->kind) && result->ok));
       if (isReplay(data->kind)) {
-        self->m_replaying = false;
-        const bool undoing = data->kind == Kind::Undo;
-        auto& from = undoing ? self->m_undo : self->m_redo;
-        auto& to = undoing ? self->m_redo : self->m_undo;
-        if (operation->succeeded) {
-          auto before = std::move(from.back());
-          from.pop_back();
-          auto& after = *data->replayEntry;
-          // Rebase only exact matches to the state this replay replaced.
-          // An independently modified item keeps its stale fingerprint.
-          const auto rebase = [&](const std::string& path, const Revision& oldState, const Revision& newState) {
-            for (auto* stack : {&self->m_undo, &self->m_redo}) {
-              for (auto& previous : *stack) {
-                if (previous.source == path && previous.sourceRevision == oldState)
-                  previous.sourceRevision = newState;
-                if (previous.destination == path && previous.resultRevision == oldState)
-                  previous.resultRevision = newState;
-              }
-            }
-          };
-          if (undoing && (after.kind == Kind::Move || after.kind == Kind::Rename))
-            rebase(after.source, *before.sourceRevision, *after.sourceRevision);
-          if (!undoing && after.resultRevision.inode)
-            rebase(after.destination, before.resultRevision, after.resultRevision);
-          if (after.resultRevision.inode)
-            to.push_back(std::move(after));
-        } else if (result && result->historyBlocked) {
-          from.back().blocked = true;
-        }
+        self->m_history.finishReplay(
+            data->kind == Kind::Undo, operation->succeeded, result && result->historyBlocked, *data->replayEntry
+        );
       } else if (result && result->mutated) {
         self->noteExternalMutation();
         operation->undoUnavailable = result->history.empty()
             && data->kind != Kind::Delete
             && data->kind != Kind::EmptyWastebin
             && data->kind != Kind::Properties;
-        constexpr std::size_t historyLimit = 32;
-        for (auto& entry : result->history) {
-          if (self->m_undo.size() == historyLimit)
-            self->m_undo.erase(self->m_undo.begin());
-          self->m_undo.push_back(std::move(entry));
-        }
+        self->m_history.append(std::move(result->history));
       }
       if (data->kind == Kind::CreateSymlink || data->kind == Kind::Compress || operation->adminOrigin)
         operation->destination = data->destination;
@@ -2405,19 +1096,47 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
         operation->requestedItemCount = *result->requestedCount;
       if (result && !result->customTitle.empty())
         operation->resultTitle = result->customTitle;
-      if (result && !result->customDescription.empty())
+      if (isTransfer(data->kind) && result && !result->outcomeUncertain) {
+        const bool hasSkips = result->skippedTransferEntries != 0 || result->adminSkipSelected;
+        const auto published = publishedTransfer(*operation);
+        const auto destination = displayDestination(operation->destination);
+        const std::string location = transferPreposition(data->kind) + destination;
+        if (operation->succeeded) {
+          if (hasSkips)
+            operation->resultTitle = verb + (published.empty() ? " skipped" : " completed with skips");
+          operation->resultDescription = !published.empty() ? published + location
+              : hasSkips ? "No items " + std::string(transferVerb(data->kind)) + location
+                         : "Transfer to " + destination + " completed";
+        } else if (operation->cancelled) {
+          operation->resultDescription = "Transfer to " + destination + " was cancelled";
+          if (!published.empty())
+            operation->resultDescription += " · " + published;
+        } else {
+          // Retain executor recovery diagnostics verbatim, including any preserved backup paths.
+          operation->resultDescription = result->customDescription.empty()
+              ? failedDescription(*operation, result->message)
+              : result->customDescription;
+          operation->resultDescription +=
+              published.empty() ? " · Destination: " + destination : " · " + published + location;
+        }
+        if ((operation->succeeded || operation->cancelled) && !result->customDescription.empty())
+          operation->resultDescription += " · " + result->customDescription;
+        if (result->skippedTransferEntries != 0)
+          operation->resultDescription += " · " + std::to_string(result->skippedTransferEntries) + " skipped";
+        else if (result->adminSkipSelected && result->customDescription.empty())
+          operation->resultDescription += " · Items skipped";
+      } else if (result && !result->customDescription.empty()) {
         operation->resultDescription = result->customDescription;
-      else if (operation->succeeded)
-        operation->resultDescription = completedDescription(*operation);
-      else if (operation->cancelled) {
         if (isTransfer(data->kind))
-          operation->resultDescription = "Transfer to " + displayDestination(operation->destination) + " was cancelled";
-        else
-          operation->resultDescription = verb
-              + " of "
-              + quotedBasename(operation->source.empty() ? operation->destination : operation->source)
-              + " was cancelled";
-      } else {
+          operation->resultDescription += " · Destination: " + displayDestination(operation->destination);
+      } else if (operation->succeeded)
+        operation->resultDescription = completedDescription(*operation);
+      else if (operation->cancelled)
+        operation->resultDescription = verb
+            + " of "
+            + quotedBasename(operation->source.empty() ? operation->destination : operation->source)
+            + " was cancelled";
+      else {
         operation->resultDescription = failedDescription(
             *operation,
             result      ? result->message
@@ -2454,7 +1173,7 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
       operation->status = operation->resultDescription;
       if (operation->undoUnavailable)
         operation->status += " · Undo unavailable for this operation";
-      if (!operation->succeeded && !operation->cancelled && !self->m_jobPaths.contains(operation->id))
+      if (!operation->succeeded && !operation->cancelled && !self->m_jobReporter->hasJob(operation->id))
         self->registerJob(*operation);
       self->publishJob(*operation, false, clearArchiveSuspension);
       self->finishJob(*operation);

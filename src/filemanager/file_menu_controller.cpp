@@ -8,7 +8,6 @@
 #include "filemanager/file_interaction.h"
 #include "filemanager/file_sort.h"
 #include "filemanager/file_view_menu.h"
-#include "filemanager/property_operations.h"
 #include "filemanager/search_dropdown.h"
 #include "render/render_context.h"
 #include "ui/controls/box.h"
@@ -20,47 +19,20 @@
 #include "ui/tooltip/tooltip_manager.h"
 
 #include <algorithm>
-#include <charconv>
 #include <cmath>
-#include <gio/gdesktopappinfo.h>
 #include <linux/input-event-codes.h>
 #include <ranges>
-#include <unordered_set>
 #include <utility>
 
 namespace filemanager {
 
   namespace {
 
-    std::string applicationDisplayName(GAppInfo* app) {
-      const char* name = app ? g_app_info_get_display_name(app) : nullptr;
-      if (!name || !*name)
-        name = app ? g_app_info_get_name(app) : nullptr;
-      return name ? name : "Unknown application";
-    }
-
-    std::vector<std::string> applicationIconNames(GAppInfo* app) {
-      std::vector<std::string> names;
-      GIcon* icon = app ? g_app_info_get_icon(app) : nullptr;
-      if (icon && G_IS_THEMED_ICON(icon)) {
-        const char* const* themedNames = g_themed_icon_get_names(G_THEMED_ICON(icon));
-        for (std::size_t i = 0; themedNames && themedNames[i]; ++i)
-          names.emplace_back(themedNames[i]);
-      }
-      return names;
-    }
-
-    ContextMenuControlEntry applicationMenuEntry(std::int32_t id, GAppInfo* app) {
-      ContextMenuControlEntry entry{.id = id, .label = applicationDisplayName(app)};
-      entry.iconNames = applicationIconNames(app);
-      return entry;
-    }
-
     ContextMenuControlEntry createNewMenuEntry(std::optional<bool> symlinkDirectory) {
       std::vector<ContextMenuControlEntry> children{
-          {.id = 111, .label = "Folder…", .actionGlyph = "folder-plus"},
-          {.id = 112, .label = "Empty File…", .actionGlyph = "file-plus"},
-          {.id = 113, .label = "Text File…", .actionGlyph = "file-text"}
+          {.id = menu_id::kCreateFolder, .label = "Folder…", .actionGlyph = "folder-plus"},
+          {.id = menu_id::kCreateEmptyFile, .label = "Empty File…", .actionGlyph = "file-plus"},
+          {.id = menu_id::kCreateTextFile, .label = "Text File…", .actionGlyph = "file-text"}
       };
       struct OfficeType {
         std::int32_t id;
@@ -70,14 +42,15 @@ namespace filemanager {
       };
       constexpr std::array officeTypes{
           OfficeType{
-              114, "Document…", "application/vnd.oasis.opendocument.text", "templates/filemanager/office/blank.odt"
+              menu_id::kCreateDocument, "Document…", "application/vnd.oasis.opendocument.text",
+              "templates/filemanager/office/blank.odt"
           },
           OfficeType{
-              115, "Spreadsheet…", "application/vnd.oasis.opendocument.spreadsheet",
+              menu_id::kCreateSpreadsheet, "Spreadsheet…", "application/vnd.oasis.opendocument.spreadsheet",
               "templates/filemanager/office/blank.ods"
           },
           OfficeType{
-              116, "Presentation…", "application/vnd.oasis.opendocument.presentation",
+              menu_id::kCreatePresentation, "Presentation…", "application/vnd.oasis.opendocument.presentation",
               "templates/filemanager/office/blank.odp"
           }
       };
@@ -90,14 +63,14 @@ namespace filemanager {
         GAppInfo* selected = nullptr;
         for (GList* item = compatible; item; item = item->next) {
           auto* app = G_APP_INFO(item->data);
-          if (!applicationIconNames(app).empty()) {
+          if (!FileLaunchController::applicationIconNames(app).empty()) {
             selected = app;
             break;
           }
         }
         if (selected) {
           ContextMenuControlEntry entry{.id = type.id, .label = type.label};
-          entry.gutterIconNames = applicationIconNames(selected);
+          entry.gutterIconNames = FileLaunchController::applicationIconNames(selected);
           officeEntries.push_back(std::move(entry));
         }
         for (GList* item = compatible; item; item = item->next)
@@ -120,7 +93,7 @@ namespace filemanager {
       }
       children.push_back({.id = menu_id::kManualSymlink, .label = "Symlink…", .actionGlyph = "link"});
       ContextMenuControlEntry createNew{
-          .id = 110,
+          .id = menu_id::kCreateNewSubmenu,
           .label = "Create New",
           .hasSubmenu = true,
           .submenuEntries = std::move(children),
@@ -136,11 +109,13 @@ namespace filemanager {
       WaylandConnection& wayland, RenderContext& renderContext, AnimationManager& menuAnimations,
       InputDispatcher& dispatcher, FileManagerSettings& settings, FileOperationManager& operations, TabManager& tabs,
       FileListHeaderController& listHeader, PlacesSidebarController& places, ChecksumDialogController& checksumDialog,
-      NativeDataTransfer& transfer, Callbacks callbacks
+      HelpDialogController& helpDialog, ProtectedFileManager& protectedFiles, FileLaunchController& launcher,
+      FileClipboardController& clipboard, NativeDataTransfer& transfer, Callbacks callbacks
   )
       : m_wayland(wayland), m_renderContext(renderContext), m_menuAnimations(menuAnimations), m_dispatcher(dispatcher),
         m_settings(settings), m_operations(operations), m_tabs(tabs), m_listHeader(listHeader), m_places(places),
-        m_checksumDialog(checksumDialog), m_transfer(transfer), m_callbacks(std::move(callbacks)) {}
+        m_checksumDialog(checksumDialog), m_helpDialog(helpDialog), m_protectedFiles(protectedFiles),
+        m_launcher(launcher), m_clipboard(clipboard), m_transfer(transfer), m_callbacks(std::move(callbacks)) {}
 
   FileMenuController::~FileMenuController() {
     m_menuAnimations.cancel(m_menuUnderlineAnimation);
@@ -149,16 +124,12 @@ namespace filemanager {
 
   void FileMenuController::loadInitialPreference() { m_showApplicationMenuBar = m_settings.showApplicationMenuBar(); }
 
-  void FileMenuController::initializePopups(
-      ConfigService& configService, LayerPopupHostRegistry& pickerHosts,
-      std::function<void(const ContextMenuControlEntry&)> onActivate
-  ) {
-    m_applicationPicker = std::make_unique<SearchPickerPopup>();
-    m_applicationPicker->initialize(m_wayland, configService, m_renderContext, pickerHosts);
+  void FileMenuController::initializePopups(ConfigService& configService, LayerPopupHostRegistry& pickerHosts) {
+    m_launcher.initializePicker(configService, pickerHosts);
 
     m_contextMenuPopup = std::make_unique<ContextMenuPopup>(m_wayland, m_renderContext);
     m_contextMenuPopup->setHighlightOnOpen(false);
-    m_contextMenuPopup->setOnActivate(std::move(onActivate));
+    m_contextMenuPopup->setOnActivate([this](const ContextMenuControlEntry& entry) { activateEntry(entry); });
     m_contextMenuPopup->setOnDismissed([this] {
       m_applicationMenuOpen.reset();
       m_applicationMenuHovered.reset();
@@ -287,7 +258,7 @@ namespace filemanager {
 
   void FileMenuController::closeAll() {
     closeContextMenu();
-    closeApplicationPicker();
+    m_launcher.closeApplicationPicker();
   }
 
   void FileMenuController::closeContextMenu() {
@@ -295,24 +266,9 @@ namespace filemanager {
       m_contextMenuPopup->close();
   }
 
-  void FileMenuController::closeApplicationPicker() {
-    if (auto request = std::exchange(m_applicationMimeRequest, {}))
-      g_cancellable_cancel(request.get());
-    if (m_applicationPicker)
-      m_applicationPicker->close();
-  }
-
   bool FileMenuController::isContextMenuOpen() const { return m_contextMenuPopup && m_contextMenuPopup->isOpen(); }
 
-  bool FileMenuController::isApplicationPickerOpen() const {
-    return m_applicationPicker && m_applicationPicker->isOpen();
-  }
-
-  bool FileMenuController::hasOpenPopup() const { return isContextMenuOpen() || isApplicationPickerOpen(); }
-
-  bool FileMenuController::handleAppPickerPointer(const PointerEvent& event) {
-    return m_applicationPicker && m_applicationPicker->onPointerEvent(event);
-  }
+  bool FileMenuController::hasOpenPopup() const { return isContextMenuOpen() || m_launcher.isApplicationPickerOpen(); }
 
   bool FileMenuController::handlePointer(const PointerEvent& event) {
     auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr;
@@ -353,12 +309,8 @@ namespace filemanager {
   }
 
   bool FileMenuController::handleKeyboard(const KeyboardEvent& event) {
-    if (m_applicationPicker
-        && m_applicationPicker->isOpen()
-        && m_wayland.lastKeyboardSurface() == m_applicationPicker->wlSurface()) {
-      m_applicationPicker->onKeyboardEvent(event);
+    if (m_launcher.handleKeyboard(event))
       return true;
-    }
     if (m_contextMenuPopup && m_contextMenuPopup->isOpen()) {
       m_contextMenuPopup->onKeyboardEvent(event);
       return true;
@@ -463,11 +415,7 @@ namespace filemanager {
     const auto selectedEntry = selectedPath ? std::ranges::find(session.entries(), *selectedPath, &FileEntry::absPath)
                                             : session.entries().end();
     const bool selectedDirectory = selectedEntry != session.entries().end() && selectedEntry->isDir;
-    const bool canOpenSelection = selectedEntry != session.entries().end()
-        && (selectedDirectory
-            || !tab.administratorBrowsing
-            || userCanReadPath(selectedEntry->absPath)
-            || static_cast<bool>(m_callbacks.onOpenProtectedFile));
+    const bool canOpenSelection = selectedEntry != session.entries().end();
     bool selectedDirectorySaved = false;
     if (selectedDirectory)
       selectedDirectorySaved = m_places.isPersonalPlaceSaved(selectedEntry->absPath);
@@ -477,7 +425,7 @@ namespace filemanager {
          .shortcut = "Ctrl+T",
          .actionIconNames = {"tab-new-symbolic", "tab-new"},
          .actionGlyph = "plus"},
-        {.id = 30001,
+        {.id = menu_id::kFileNewWindow,
          .label = "New Window",
          .enabled = !session.browsingTrash(),
          .shortcut = "Ctrl+N",
@@ -485,7 +433,7 @@ namespace filemanager {
          .actionGlyph = "app-window"},
         newItemMenu(),
         {.separator = true},
-        {.id = 30002,
+        {.id = menu_id::kFileOpen,
          .label = "Open",
          .enabled = canOpenSelection,
          .shortcut = "Enter",
@@ -496,26 +444,26 @@ namespace filemanager {
          .enabled = !session.browsingTrash() && selectedDirectory,
          .actionIconNames = {"tab-new-symbolic", "tab-new"},
          .actionGlyph = "plus"},
-        {.id = 30003,
+        {.id = menu_id::kFileOpenWith,
          .label = "Open With…",
          .enabled = caps.canLaunchApps
              && !session.browsingTrash()
              && selectedPaths.size() == 1
              && canOpenSelection
              && !selectedEntry->isDir},
-        {.id = 30004,
+        {.id = menu_id::kFileOpenNewWindow,
          .label = "Open in New Window",
          .enabled = !session.browsingTrash() && !session.browsingArchive() && selectedDirectory,
          .actionIconNames = {"window-new-symbolic", "window-new"},
          .actionGlyph = "app-window"},
         {.separator = true},
-        {.id = 30005,
+        {.id = menu_id::kFilePinToPlaces,
          .label = "Add to Places",
          .enabled = caps.canPinToPlaces && !session.browsingTrash() && selectedDirectory && !selectedDirectorySaved,
          .actionIconNames = {"bookmark-new-symbolic", "bookmark-new"},
          .actionGlyph = "bookmark-plus"},
         {.separator = true},
-        {.id = 30006,
+        {.id = menu_id::kFileProperties,
          .label = "Properties",
          .enabled = caps.canOpenProperties
              && !session.browsingTrash()
@@ -530,18 +478,17 @@ namespace filemanager {
          .enabled = m_tabs.canReopenClosedTab(),
          .shortcut = "Ctrl+Shift+T"},
         {.id = menu_id::kCloseTab, .label = "Close Tab", .shortcut = "Ctrl+W"},
-        {.id = 30007, .label = "Quit", .shortcut = "Ctrl+Q"},
+        {.id = menu_id::kQuit, .label = "Quit", .shortcut = "Ctrl+Q"},
     };
     if (selectedPath
         && selectedPaths.size() == 1
         && tab.hasActiveAdminSession()
-        && m_callbacks.hasProtectedCopy
-        && m_callbacks.hasProtectedCopy(tab.id, *selectedPath)) {
-      const auto properties = std::ranges::find(entries, 30006, &ContextMenuControlEntry::id);
+        && m_protectedFiles.hasEdit(tab.id, *selectedPath)) {
+      const auto properties = std::ranges::find(entries, menu_id::kFileProperties, &ContextMenuControlEntry::id);
       entries.insert(std::next(properties), {.id = menu_id::kSaveProtectedChanges, .label = "Save Changes Back"});
     }
     for (auto& entry : entries)
-      if (entry.id == 110)
+      if (entry.id == menu_id::kCreateNewSubmenu)
         entry.enabled =
             (caps.canCreate || caps.canCreateBasic) && !session.browsingTrash() && session.currentDirectoryWritable();
     return entries;
@@ -560,7 +507,7 @@ namespace filemanager {
     const bool canRename = caps.canRename && !m_places.hasActiveDeviceOperations() && !m_operations.replaying();
     const bool modalOpen = m_callbacks.isModalOpen && m_callbacks.isModalOpen();
     const bool renaming = m_callbacks.isRenaming && m_callbacks.isRenaming();
-    const std::size_t pendingClipboard = m_callbacks.pendingClipboardReads ? m_callbacks.pendingClipboardReads() : 0;
+    const std::size_t pendingClipboard = m_clipboard.pendingClipboardReads();
     const bool canReplay = caps.canUndo
         && !m_places.hasActiveDeviceOperations()
         && !m_operations.replaying()
@@ -582,19 +529,26 @@ namespace filemanager {
          .shortcut = "Ctrl+Shift+Z",
          .actionGlyph = "arrow-forward-up"},
         {.separator = true},
-        {.id = 2,
+        {.id = menu_id::kCut,
          .label = "Cut",
          .enabled =
              caps.canMutate && caps.canCopyItems && local && hasSelection && !m_places.hasActiveDeviceOperations(),
          .shortcut = "Ctrl+X",
          .actionGlyph = "scissors"},
-        {.id = 1,
+        {.id = menu_id::kCopy,
          .label = "Copy",
          .enabled = caps.canCopyItems && local && hasSelection && !m_places.hasActiveDeviceOperations(),
          .shortcut = "Ctrl+C",
          .actionGlyph = "copy"},
-        {.id = 3, .label = "Paste", .enabled = local && canPaste, .shortcut = "Ctrl+V", .actionGlyph = "U+EA6F"},
-        {.id = 59, .label = "Copy Location", .enabled = caps.canCopyItems && local && oneItem, .actionGlyph = "link"},
+        {.id = menu_id::kPaste,
+         .label = "Paste",
+         .enabled = local && canPaste,
+         .shortcut = "Ctrl+V",
+         .actionGlyph = "U+EA6F"},
+        {.id = menu_id::kCopyLocation,
+         .label = "Copy Location",
+         .enabled = caps.canCopyItems && local && oneItem,
+         .actionGlyph = "link"},
         {.separator = true},
         {.id = menu_id::kSelectAll,
          .label = "Select All",
@@ -611,8 +565,8 @@ namespace filemanager {
           canMutate && hasSelection && std::ranges::none_of(m_operations.operations(), [](const auto& operation) {
             return operation.kind == FileOperationManager::Kind::EmptyWastebin && !operation.finished;
           });
-      entries.push_back({.id = 70, .label = "Restore", .enabled = restoring});
-      entries.push_back({.id = 71, .label = "Restore to…", .enabled = restoring});
+      entries.push_back({.id = menu_id::kRestore, .label = "Restore", .enabled = restoring});
+      entries.push_back({.id = menu_id::kRestoreTo, .label = "Restore to…", .enabled = restoring});
       return entries;
     }
     entries.insert(
@@ -622,17 +576,20 @@ namespace filemanager {
              .label = "Duplicate",
              .enabled = canCreate && hasSelection,
              .actionGlyph = "copy"},
-            {.id = 4,
+            {.id = menu_id::kRename,
              .label = "Rename",
              .enabled = canRename && hasSelection,
              .shortcut = "F2",
              .actionGlyph = "pencil"},
-            {.id = 5,
+            {.id = menu_id::kTrash,
              .label = "Move to Wastebin",
              .enabled = caps.canTrash && canMutate && hasSelection,
              .shortcut = "Delete",
              .actionGlyph = "trash"},
-            {.id = 6, .label = "Delete Permanently", .enabled = canMutate && hasSelection, .shortcut = "Shift+Delete"},
+            {.id = menu_id::kDeletePermanently,
+             .label = "Delete Permanently",
+             .enabled = canMutate && hasSelection,
+             .shortcut = "Shift+Delete"},
             {.separator = true},
         }
     );
@@ -685,7 +642,7 @@ namespace filemanager {
                 m_listHeader.sortField(), m_listHeader.sortOrder(), session.foldersFirst(), session.hiddenLast(),
                 m_listHeader.searchView()
             ),
-            {.id = 50,
+            {.id = menu_id::kShowHidden,
              .label = "Show Hidden Files",
              .checkmark = true,
              .toggleState = session.displayedHiddenItems() ? 1 : 0,
@@ -749,7 +706,7 @@ namespace filemanager {
              .shortcut = "Ctrl+0",
              .actionGlyph = "zoom-reset"},
             {.separator = true},
-            {.id = 13, .label = "Refresh", .shortcut = "Ctrl+R", .actionGlyph = "refresh"},
+            {.id = menu_id::kRefresh, .label = "Refresh", .shortcut = "Ctrl+R", .actionGlyph = "refresh"},
             {.id = menu_id::kAlwaysShowTabBar,
              .label = "Always Show Tab Bar",
              .checkmark = true,
@@ -765,33 +722,6 @@ namespace filemanager {
         }
     );
     return entries;
-  }
-
-  std::vector<std::string> FileMenuController::externalToolTargets(external_tools::Tool tool) const {
-    const auto& tab = m_tabs.activeTab();
-    const auto& session = tab.session;
-    if (session.browsingTrash() || !tab.capabilities().canRunExternalTools || session.loading())
-      return {};
-    if (tool == external_tools::Tool::Compare) {
-      const auto& selectedPaths = m_callbacks.selectedPaths();
-      if (selectedPaths.size() != 2 || !m_callbacks.selectedPathsOrdered)
-        return {};
-      auto paths = m_callbacks.selectedPathsOrdered();
-      if (tab.hasActiveAdminSession() && std::ranges::any_of(paths, [&](const std::string& path) {
-            if (userCanReadPath(path)) {
-              std::error_code error;
-              return !std::filesystem::is_regular_file(path, error);
-            }
-            const auto entry = std::ranges::find(session.entries(), std::filesystem::path(path), &FileEntry::absPath);
-            return entry == session.entries().end()
-                || entry->isDir
-                || (!entry->isSymlink && entry->type.starts_with("inode/"));
-          }))
-        return {};
-      return paths;
-    }
-    return !tab.administratorBrowsing || userCanReadPath(session.path(), true) ? std::vector{session.path().string()}
-                                                                               : std::vector<std::string>{};
   }
 
   std::vector<ContextMenuControlEntry> FileMenuController::archiveMenuEntries() const {
@@ -850,64 +780,8 @@ namespace filemanager {
   }
 
   std::vector<ContextMenuControlEntry> FileMenuController::toolsMenuEntries() {
-    namespace tools = external_tools;
     const auto& tab = m_tabs.activeTab();
-    const auto caps = tab.capabilities();
-    const auto applications = tools::discover();
-    constexpr std::array labels{"Open Terminal Here", "Analyse Disk Usage…", "Compare Files…"};
-    constexpr std::array fallbackGlyphs{"terminal-2", "chart-pie", "file-diff"};
-    const auto iconsFor = [](GDesktopAppInfo* app) {
-      auto names = applicationIconNames(G_APP_INFO(app));
-      if (GIcon* icon = g_app_info_get_icon(G_APP_INFO(app)); G_IS_FILE_ICON(icon)) {
-        if (char* path = g_file_get_path(g_file_icon_get_file(G_FILE_ICON(icon)))) {
-          names.emplace_back(path);
-          g_free(path);
-        }
-      }
-      return names;
-    };
-
-    m_externalTools.clear();
-    std::vector<ContextMenuControlEntry> rows;
-    for (std::size_t i = 0; i < labels.size(); ++i) {
-      const auto tool = static_cast<tools::Tool>(i);
-      const auto& apps = applications[i];
-      const auto targets = externalToolTargets(tool);
-      ContextMenuControlEntry entry{
-          .id = menu_id::kFirstToolMenuRow + static_cast<int>(i),
-          .label = labels[i],
-          .enabled = caps.canRunExternalTools
-              && !apps.choices.empty()
-              && (tools::validTargets(tool, targets)
-                  || (tool == tools::Tool::Compare
-                      && tab.hasActiveAdminSession()
-                      && m_callbacks.onOpenProtectedFile
-                      && targets.size() == 2)),
-          .hasSubmenu = true,
-          .attachSubmenuContent = true,
-          .splitSubmenu = true,
-          .gutterFallbackGlyph = fallbackGlyphs[i],
-      };
-      if (apps.preferred)
-        entry.gutterIconNames = iconsFor(apps.preferred.get());
-      if (entry.enabled) {
-        for (const auto& choice : apps.choices) {
-          const auto id = menu_id::kFirstExternalToolApp + static_cast<int>(m_externalTools.size());
-          m_externalTools.emplace_back(tool, choice);
-          if (choice.app == apps.preferred) {
-            entry.id = id;
-            entry.activateMainSection = true;
-          }
-          entry.submenuEntries.push_back({
-              .id = id,
-              .label = applicationDisplayName(G_APP_INFO(choice.app.get())),
-              .gutterIconNames = iconsFor(choice.app.get()),
-              .gutterFallbackGlyph = fallbackGlyphs[i],
-          });
-        }
-      }
-      rows.push_back(std::move(entry));
-    }
+    std::vector<ContextMenuControlEntry> rows = m_launcher.externalToolMenuRows();
 #ifdef NYTHERA_FILES_ARCHIVES
     auto archiveEntries = archiveMenuEntries();
     rows.push_back({.separator = true});
@@ -1054,45 +928,6 @@ namespace filemanager {
     return m_contextMenuPopup->isOpen();
   }
 
-  void
-  FileMenuController::appendOpenWithEntries(const FileEntry& target, std::vector<ContextMenuControlEntry>& entries) {
-    std::vector<ContextMenuControlEntry> alternatives;
-    std::string mimeStorage = target.type;
-    if (mimeStorage.empty()) {
-      if (gchar* guessed = g_content_type_guess(target.absPath.filename().c_str(), nullptr, 0, nullptr)) {
-        mimeStorage = guessed;
-        g_free(guessed);
-      }
-    }
-    if (!mimeStorage.empty()) {
-      const char* mime = mimeStorage.c_str();
-      std::shared_ptr<GAppInfo> defaultApp(g_app_info_get_default_for_type(mime, FALSE), g_object_unref);
-      if (defaultApp) {
-        entries.front() = applicationMenuEntry(10, defaultApp.get());
-        entries.front().label = "Open with " + applicationDisplayName(defaultApp.get());
-        entries.front().gutterIconNames = std::move(entries.front().iconNames);
-        entries.front().iconNames.clear();
-      }
-
-      GList* compatible = g_app_info_get_all_for_type(mime);
-      for (GList* item = compatible; item; item = item->next) {
-        auto* app = G_APP_INFO(item->data);
-        if (!g_app_info_get_id(app) || (defaultApp && g_app_info_equal(defaultApp.get(), app))) {
-          g_object_unref(app);
-          continue;
-        }
-        const auto appId = static_cast<std::int32_t>(20000 + m_openWithApplications.size());
-        alternatives.push_back(applicationMenuEntry(appId, app));
-        m_openWithApplications.emplace_back(app, g_object_unref);
-      }
-      g_list_free(compatible);
-    }
-    ContextMenuControlEntry openWith{.id = 80, .label = "Open With", .hasSubmenu = true};
-    openWith.submenuEntries = std::move(alternatives);
-    openWith.submenuEntries.push_back({.id = 81, .label = "Other Application…"});
-    entries.insert(entries.begin() + 1, std::move(openWith));
-  }
-
   void FileMenuController::openContextMenu(std::size_t index, float x, float y, bool highlightOnOpen) {
     const auto& tab = m_tabs.activeTab();
     const auto& session = tab.session;
@@ -1101,7 +936,7 @@ namespace filemanager {
     if (index >= session.entries().size() || !m_contextMenuPopup || !surface)
       return;
     m_contextMenuTarget = session.entries()[index].absPath;
-    m_openWithApplications.clear();
+    m_launcher.clearOpenWithApplications();
     const std::string path = session.entries()[index].absPath.string();
     if (!m_callbacks.selectedPaths().contains(path) && m_callbacks.onSelectSingleForContextMenu)
       m_callbacks.onSelectSingleForContextMenu(index);
@@ -1109,13 +944,13 @@ namespace filemanager {
     if (session.browsingArchive()) {
       const auto& selected = session.entries()[index];
       std::vector<ContextMenuControlEntry> entries{
-          {.id = 10, .label = "Open", .enabled = !selected.isSymlink, .actionGlyph = "folder-open"},
+          {.id = menu_id::kOpen, .label = "Open", .enabled = !selected.isSymlink, .actionGlyph = "folder-open"},
           {.id = menu_id::kOpenArchiveMemberWith,
            .label = "Open With…",
            .enabled = !selected.isDir && !selected.isSymlink},
-          {.id = 1, .label = "Copy", .shortcut = "Ctrl+C", .actionGlyph = "copy"},
+          {.id = menu_id::kCopy, .label = "Copy", .shortcut = "Ctrl+C", .actionGlyph = "copy"},
           {.id = menu_id::kExtractSelected, .label = "Extract Selected…", .actionGlyph = "archive"},
-          {.id = 22, .label = "Properties", .shortcut = "Alt+Enter", .actionGlyph = "file-info"},
+          {.id = menu_id::kProperties, .label = "Properties", .shortcut = "Alt+Enter", .actionGlyph = "file-info"},
       };
       openMainContextMenu(
           {.entries = std::move(entries), .anchor = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 1, 1}},
@@ -1124,74 +959,76 @@ namespace filemanager {
       return;
     }
     const bool targetIsDir = session.entries()[index].isDir;
-    const bool canOpenTarget = targetIsDir
-        || !tab.administratorBrowsing
-        || userCanReadPath(path)
-        || static_cast<bool>(m_callbacks.onOpenProtectedFile);
+    const bool canOpenTarget = true;
     std::vector<ContextMenuControlEntry> entries{
-        {.id = 10,
+        {.id = menu_id::kOpen,
          .label = "Open",
          .enabled = canOpenTarget,
          .actionIconNames = {"folder-open-symbolic", "folder-open"},
          .actionGlyph = "folder-open"},
-        {.id = 1,
+        {.id = menu_id::kCopy,
          .label = "Copy",
          .enabled = caps.canCopyItems,
          .shortcut = "Ctrl+C",
          .actionIconNames = {"edit-copy-symbolic", "edit-copy"},
          .actionGlyph = "copy"},
-        {.id = 2,
+        {.id = menu_id::kCut,
          .label = "Cut",
          .enabled = caps.canMutate && caps.canCopyItems,
          .shortcut = "Ctrl+X",
          .actionIconNames = {"edit-cut-symbolic", "edit-cut"},
          .actionGlyph = "scissors"},
-        {.id = 3,
+        {.id = menu_id::kPaste,
          .label = "Paste",
          .enabled = caps.canMutate,
          .shortcut = "Ctrl+V",
          .actionIconNames = {"edit-paste-symbolic", "edit-paste"},
          .actionGlyph = "U+EA6F"},
-        {.id = 4,
+        {.id = menu_id::kRename,
          .label = "Rename",
          .enabled = caps.canRename,
          .shortcut = "F2",
          .actionIconNames = {"document-edit-symbolic", "document-edit"},
          .actionGlyph = "pencil"},
-        {.id = 5,
+        {.id = menu_id::kTrash,
          .label = "Move to Trash",
          .enabled = caps.canTrash && caps.canMutate,
          .shortcut = "Delete",
          .actionIconNames = {"user-trash-symbolic", "user-trash"},
          .actionGlyph = "trash"},
-        {.id = 6, .label = "Delete permanently", .enabled = caps.canMutate, .shortcut = "Shift+Delete"}
+        {.id = menu_id::kDeletePermanently,
+         .label = "Delete permanently",
+         .enabled = caps.canMutate,
+         .shortcut = "Shift+Delete"}
     };
     if (session.browsingTrash())
       entries = {
-          {.id = 10,
+          {.id = menu_id::kOpen,
            .label = "Open",
            .actionIconNames = {"folder-open-symbolic", "folder-open"},
            .actionGlyph = "folder-open"},
-          {.id = 70, .label = "Restore"},
-          {.id = 71, .label = "Restore to…"},
+          {.id = menu_id::kRestore, .label = "Restore"},
+          {.id = menu_id::kRestoreTo, .label = "Restore to…"},
       };
     else {
       if (!targetIsDir && caps.canLaunchApps && canOpenTarget) {
-        appendOpenWithEntries(session.entries()[index], entries);
+        m_launcher.appendOpenWithEntries(session.entries()[index], entries);
 #ifdef NYTHERA_FILES_ARCHIVES
         if (!tab.administratorBrowsing && !session.entries()[index].isSymlink) {
           const auto format = archive_backend::formatFromName(session.entries()[index].name);
           if (format && std::ranges::any_of(archive_backend::capabilities(), [&](const auto& cap) {
                 return cap.format == *format && cap.extract;
               })) {
-            entries.front() = {.id = 10, .label = "Open", .actionGlyph = "folder-open"};
+            entries.front() = {.id = menu_id::kOpen, .label = "Open", .actionGlyph = "folder-open"};
           }
         }
 #endif
       } else if (!targetIsDir) {
         entries.insert(
             entries.begin() + 1,
-            ContextMenuControlEntry{.id = 80, .label = "Open With", .enabled = false, .hasSubmenu = true}
+            ContextMenuControlEntry{
+                .id = menu_id::kOpenWithSubmenu, .label = "Open With", .enabled = false, .hasSubmenu = true
+            }
         );
       }
       if (session.entries()[index].isSymlink) {
@@ -1211,7 +1048,7 @@ namespace filemanager {
         );
       if (targetIsDir)
         entries.push_back(
-            {.id = 60,
+            {.id = menu_id::kOpenFolderNewWindow,
              .label = "Open in New Window",
              .actionIconNames = {"window-new-symbolic", "window-new"},
              .actionGlyph = "app-window"}
@@ -1226,14 +1063,14 @@ namespace filemanager {
         );
       if (targetIsDir)
         entries.push_back(
-            {.id = 20,
+            {.id = menu_id::kPinTargetToPlaces,
              .label = "Add to Places",
              .enabled = caps.canPinToPlaces,
              .actionIconNames = {"bookmark-new-symbolic", "bookmark-new"},
              .actionGlyph = "bookmark-plus"}
         );
       entries.push_back(
-          {.id = 59,
+          {.id = menu_id::kCopyLocation,
            .label = "Copy Location",
            .enabled = caps.canCopyItems,
            .actionIconNames = {"insert-link-symbolic", "insert-link"},
@@ -1245,7 +1082,7 @@ namespace filemanager {
         entries.push_back({.id = kQuickLookMenuId, .label = "Quick Look", .shortcut = "Space", .actionGlyph = "eye"});
       if (!m_callbacks.selectedPaths().empty())
         entries.push_back(
-            {.id = 22,
+            {.id = menu_id::kProperties,
              .label = "Properties",
              .enabled = caps.canOpenProperties,
              .shortcut = "Alt+Enter",
@@ -1254,8 +1091,7 @@ namespace filemanager {
         );
       if (m_callbacks.selectedPaths().size() == 1
           && tab.hasActiveAdminSession()
-          && m_callbacks.hasProtectedCopy
-          && m_callbacks.hasProtectedCopy(tab.id, path))
+          && m_protectedFiles.hasEdit(tab.id, path))
         entries.push_back({.id = menu_id::kSaveProtectedChanges, .label = "Save Changes Back"});
     }
     const bool canCreate = caps.canCreate && !session.browsingTrash() && session.currentDirectoryWritable();
@@ -1332,19 +1168,19 @@ namespace filemanager {
     if (m_callbacks.onClearSelectionForEmptyMenu)
       m_callbacks.onClearSelectionForEmptyMenu();
     std::vector<ContextMenuControlEntry> entries{
-        {.id = 3,
+        {.id = menu_id::kPaste,
          .label = "Paste here",
          .enabled = caps.canMutate,
          .actionIconNames = {"edit-paste-symbolic", "edit-paste"},
          .actionGlyph = "U+EA6F"}
     };
     if (session.browsingTrash())
-      entries = {{.id = 72, .label = "Empty Wastebin…"}};
+      entries = {{.id = menu_id::kEmptyWastebin, .label = "Empty Wastebin…"}};
     else {
       if ((caps.canCreate || caps.canCreateBasic) && session.currentDirectoryWritable())
         entries.push_back(newItemMenu());
       entries.push_back(
-          {.id = 21,
+          {.id = menu_id::kPinCurrentToPlaces,
            .label = "Add this folder to Places",
            .enabled = caps.canPinToPlaces,
            .actionIconNames = {"bookmark-new-symbolic", "bookmark-new"},
@@ -1473,294 +1309,682 @@ namespace filemanager {
     m_contextMenuPopup->open(std::move(request));
   }
 
-  void FileMenuController::openApplicationChooser() {
+  void FileMenuController::activateEntry(const ContextMenuControlEntry& entry) {
+    if (dispatchSearchAndArchiveAction(entry) || dispatchToolsAndAdminAction(entry))
+      return;
+    if (dispatchTabAndPreviewAction(entry) || dispatchFileAndLaunchAction(entry))
+      return;
+    if (dispatchPlacesAction(entry) || dispatchSelectionAndClipboardAction(entry))
+      return;
+    if (dispatchFileMutationAction(entry))
+      return;
+    (void)dispatchViewAndSortAction(entry);
+  }
+
+  bool FileMenuController::dispatchSearchAndArchiveAction(const ContextMenuControlEntry& entry) {
+    if (m_callbacks.activateArchiveAction && m_callbacks.activateArchiveAction(entry.id))
+      return true;
+    if (m_callbacks.activateSearchScopeEntry && m_callbacks.activateSearchScopeEntry(entry))
+      return true;
+    if (m_callbacks.activateSearchFilterEntry && m_callbacks.activateSearchFilterEntry(entry))
+      return true;
+    if (entry.id >= menu_id::kFirstSearchMode
+        && entry.id < menu_id::kFirstSearchMode + static_cast<int>(kSearchModeLabels.size())) {
+      if (m_callbacks.selectSearchMode)
+        m_callbacks.selectSearchMode(static_cast<SearchMode>(entry.id - menu_id::kFirstSearchMode));
+      return true;
+    }
+    return false;
+  }
+
+  bool FileMenuController::dispatchToolsAndAdminAction(const ContextMenuControlEntry& entry) {
+    auto& tab = m_tabs.activeTab();
+    const auto caps = tab.capabilities();
+    if (entry.id == menu_id::kSaveProtectedChanges) {
+      if (const auto selected = m_callbacks.selectedPath ? m_callbacks.selectedPath() : std::nullopt;
+          selected && m_callbacks.selectedPaths().size() == 1)
+        m_protectedFiles.saveChanges(tab, *selected);
+      return true;
+    }
+    if (entry.id == menu_id::kActAsAdministrator) {
+      if (m_callbacks.enterAdministratorMode)
+        m_callbacks.enterAdministratorMode(tab.id, std::nullopt);
+      return true;
+    }
+    if (entry.id == menu_id::kOpenFolderAsAdministrator) {
+      if (m_contextMenuTarget && m_callbacks.enterAdministratorMode)
+        m_callbacks.enterAdministratorMode(tab.id, *m_contextMenuTarget);
+      return true;
+    }
+    if (entry.id == menu_id::kCalculateChecksum || entry.id == menu_id::kVerifyChecksum) {
+      if (entry.enabled && caps.canChecksum && m_callbacks.showChecksumDialog)
+        m_callbacks.showChecksumDialog(entry.id == menu_id::kVerifyChecksum);
+      return true;
+    }
+    if (m_helpDialog.handleMenuAction(entry.id))
+      return true;
+    if (entry.id >= menu_id::kFirstExternalToolApp) {
+      if (!caps.canRunExternalTools) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("External tools are disabled in Administrator Mode");
+        return true;
+      }
+      m_launcher.launchExternalTool(static_cast<std::size_t>(entry.id - menu_id::kFirstExternalToolApp));
+      return true;
+    }
+    return false;
+  }
+
+  bool FileMenuController::dispatchFileAndLaunchAction(const ContextMenuControlEntry& entry) {
     const auto& tab = m_tabs.activeTab();
     const auto& session = tab.session;
-    if (!m_applicationPicker || !m_contextMenuTarget || session.browsingTrash() || !tab.capabilities().canLaunchApps)
-      return;
-    const auto targetEntry = std::ranges::find(session.entries(), *m_contextMenuTarget, &FileEntry::absPath);
-    std::string mime = targetEntry != session.entries().end() ? targetEntry->type : std::string{};
-    if (mime.empty()) {
-      g_autofree char* guessed = g_content_type_guess(m_contextMenuTarget->filename().c_str(), nullptr, 0, nullptr);
-      if (guessed)
-        mime = guessed;
-    }
-    closeApplicationPicker();
-    if (!session.search().active()) {
-      showApplicationChooser(std::move(mime));
-      return;
-    }
-
-    // The chooser uses the actual MIME type for recommendations and for setting the default app.
-    struct Request {
-      FileMenuController* owner;
-      std::shared_ptr<GCancellable> cancel;
-      TabId tabId;
-      std::uint64_t navigation;
-      std::string query;
-      std::filesystem::path path;
-    };
-    m_applicationMimeRequest = std::shared_ptr<GCancellable>(g_cancellable_new(), g_object_unref);
-    g_autoptr(GFile) file = g_file_new_for_path(m_contextMenuTarget->c_str());
-    g_file_query_info_async(
-        file, G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE, G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT,
-        m_applicationMimeRequest.get(),
-        [](GObject* source, GAsyncResult* result, gpointer data) {
-          const std::unique_ptr<Request> request(static_cast<Request*>(data));
-          g_autoptr(GFileInfo) info = g_file_query_info_finish(G_FILE(source), result, nullptr);
-          if (g_cancellable_is_cancelled(request->cancel.get()))
-            return;
-          auto& self = *request->owner;
-          self.m_applicationMimeRequest.reset();
-          const auto& active = self.m_tabs.activeTab();
-          if (active.id != request->tabId
-              || active.session.navigationGeneration() != request->navigation
-              || !active.session.search().active()
-              || active.session.search().query() != request->query
-              || self.m_contextMenuTarget != request->path
-              || !self.m_applicationPicker
-              || !active.capabilities().canLaunchApps)
-            return;
-          const auto* detectedType =
-              info ? g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE) : nullptr;
-          self.showApplicationChooser(detectedType ? detectedType : "");
-        },
-        new Request{
-            this, m_applicationMimeRequest, tab.id, session.navigationGeneration(), session.search().query(),
-            *m_contextMenuTarget
+    const auto caps = tab.capabilities();
+    const auto selectedPath = m_callbacks.selectedPath ? m_callbacks.selectedPath() : std::nullopt;
+    if (entry.id >= menu_id::kFileNewWindow && entry.id <= menu_id::kShowMenuBar) {
+      switch (entry.id) {
+      case menu_id::kFileNewWindow:
+        if (!session.browsingTrash() && m_callbacks.launchNewWindow)
+          m_callbacks.launchNewWindow(session.browsingArchive() ? session.path().parent_path() : session.path());
+        break;
+      case menu_id::kFileOpen:
+        if (m_callbacks.activateSelected)
+          m_callbacks.activateSelected();
+        break;
+      case menu_id::kFileOpenWith:
+        if (session.browsingArchive()) {
+          if (selectedPath && m_callbacks.openArchiveMember)
+            m_callbacks.openArchiveMember(*selectedPath, true);
+          break;
         }
-    );
-  }
-
-  void FileMenuController::showApplicationChooser(std::string mime) {
-    const auto& tab = m_tabs.activeTab();
-    m_applicationChooserMime = std::move(mime);
-    m_applicationChooserApps.clear();
-    std::vector<SearchPickerOption> options;
-    std::unordered_set<std::string> recommendedIds;
-    std::unordered_set<std::string> associatedIds;
-    if (!m_applicationChooserMime.empty()) {
-      GList* recommended = g_app_info_get_recommended_for_type(m_applicationChooserMime.c_str());
-      for (GList* item = recommended; item; item = item->next) {
-        const char* id = g_app_info_get_id(G_APP_INFO(item->data));
-        if (id && *id)
-          recommendedIds.emplace(id);
-      }
-      g_list_free_full(recommended, g_object_unref);
-      associatedIds = recommendedIds;
-      GList* associated = g_app_info_get_all_for_type(m_applicationChooserMime.c_str());
-      for (GList* item = associated; item; item = item->next) {
-        const char* id = g_app_info_get_id(G_APP_INFO(item->data));
-        if (id && *id)
-          associatedIds.emplace(id);
-      }
-      g_list_free_full(associated, g_object_unref);
-    }
-
-    std::unordered_set<std::string> seen;
-    auto appendApps = [&](GList* apps) {
-      for (GList* item = apps; item; item = item->next) {
-        auto* app = G_APP_INFO(item->data);
-        const char* id = g_app_info_get_id(app);
-        if (!id
-            || !*id
-            || !g_app_info_should_show(app)
-            || (!g_app_info_supports_files(app) && !g_app_info_supports_uris(app))
-            || !seen.emplace(id).second) {
-          g_object_unref(app);
-          continue;
+        if (!caps.canLaunchApps) {
+          if (m_callbacks.onStatus)
+            m_callbacks.onStatus("Opening files with external applications is disabled in Administrator Mode");
+          return true;
         }
-        const bool compatible = associatedIds.contains(id);
-        const std::size_t index = m_applicationChooserApps.size();
-        options.push_back(
-            SearchPickerOption{
-                .value = std::to_string(index),
-                .label = applicationDisplayName(app),
-                .description = compatible ? "Compatible with this file" : "Installed application",
-                .iconNames = applicationIconNames(app),
-                .compatible = compatible
-            }
-        );
-        m_applicationChooserApps.emplace_back(app, g_object_unref);
-      }
-      g_list_free(apps);
-    };
-
-    if (!m_applicationChooserMime.empty()) {
-      GAppInfo* defaultApp = g_app_info_get_default_for_type(m_applicationChooserMime.c_str(), FALSE);
-      if (defaultApp != nullptr) {
-        const char* id = g_app_info_get_id(defaultApp);
-        if (id && *id) {
-          associatedIds.emplace(id);
-          GList* defaultList = nullptr;
-          defaultList = g_list_append(defaultList, defaultApp);
-          appendApps(defaultList);
-        } else {
-          g_object_unref(defaultApp);
+        if (selectedPath) {
+          m_contextMenuTarget = *selectedPath;
+          m_launcher.openApplicationChooser(*selectedPath);
         }
-      }
-    }
-
-    if (!m_applicationChooserMime.empty()) {
-      appendApps(g_app_info_get_recommended_for_type(m_applicationChooserMime.c_str()));
-      appendApps(g_app_info_get_all_for_type(m_applicationChooserMime.c_str()));
-    }
-    appendApps(g_app_info_get_all());
-    m_applicationPicker->setOnSelectWithOption(
-        [this, tabId = tab.id, target = *m_contextMenuTarget](const std::string& value, bool setAsDefault) {
-          const auto* origin = m_tabs.findTab(tabId);
-          if (!origin || !origin->capabilities().canLaunchApps)
-            return;
-          std::size_t index = 0;
-          const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), index);
-          if (error != std::errc{} || end != value.data() + value.size() || index >= m_applicationChooserApps.size()) {
-            if (m_callbacks.onStatus)
-              m_callbacks.onStatus("The selected application is no longer available");
-            return;
-          }
-          GAppInfo* app = m_applicationChooserApps[index].get();
-          if (setAsDefault) {
-            GError* defaultError = nullptr;
-            if (!filemanager::savePropertyDefaultApplication(app, m_applicationChooserMime, &defaultError)) {
-              if (m_callbacks.onStatus)
-                m_callbacks.onStatus(defaultError ? defaultError->message : "Could not save the default application");
-              g_clear_error(&defaultError);
-            }
-          }
-          if (launchProtectedApplication(*origin, app, target))
-            return;
-          GError* launchError = nullptr;
-          if (!launchApplicationForFile(app, target, &launchError)) {
-            if (m_callbacks.onStatus)
-              m_callbacks.onStatus(
-                  launchError ? launchError->message : "Could not open this file with the selected application"
-              );
-          } else if (!setAsDefault) {
-            if (m_callbacks.onStatus)
-              m_callbacks.onStatus("");
-          }
-          g_clear_error(&launchError);
+        break;
+      case menu_id::kFileOpenNewWindow:
+        if (!session.browsingArchive() && selectedPath && m_callbacks.launchNewWindow)
+          m_callbacks.launchNewWindow(*selectedPath);
+        break;
+      case menu_id::kFilePinToPlaces:
+        if (!caps.canPinToPlaces) {
+          if (m_callbacks.onStatus)
+            m_callbacks.onStatus("Pinning locations to Places is disabled in Administrator Mode");
+          return true;
         }
-    );
-    auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr;
-    SearchPickerPopupRequest request{
-        .title = "Open With",
-        .options = std::move(options),
-        .placeholder = "Search applications…",
-        .emptyText = "No matching applications",
-        .optionToggleChecked = false,
-        .showCancelButton = true,
-        .explicitConfirmation = true,
-        .showAllApplicationsToggle = true,
-        .preferredWidth = 500.0F,
-        .preferredHeight = 500.0F,
-        .nativeWindow = true,
-        .nativeAppId = "dev.nythera.FileManager.OpenWith",
-        .nativeParent = surface ? surface->xdgToplevel() : nullptr,
-        .nativeParentSurface = surface ? surface->wlSurface() : nullptr
-    };
-    if (!m_applicationChooserMime.empty())
-      request.optionToggleLabel = "Set as default for this file type";
-    m_applicationPicker->open(std::move(request));
-  }
-
-  bool FileMenuController::launchOpenWithApp(std::size_t index) {
-    if (!m_tabs.activeTab().capabilities().canLaunchApps
-        || index >= m_openWithApplications.size()
-        || !m_contextMenuTarget)
-      return false;
-    if (launchProtectedApplication(m_tabs.activeTab(), m_openWithApplications[index].get(), *m_contextMenuTarget))
-      return true;
-    GError* error = nullptr;
-    if (!launchApplicationForFile(m_openWithApplications[index].get(), *m_contextMenuTarget, &error)) {
-      if (m_callbacks.onStatus)
-        m_callbacks.onStatus(error ? error->message : "Could not open this file with the selected application");
-    } else if (m_callbacks.onStatus) {
-      m_callbacks.onStatus("");
-    }
-    g_clear_error(&error);
-    return true;
-  }
-
-  bool FileMenuController::launchExternalTool(std::size_t index) {
-    if (!m_tabs.activeTab().capabilities().canRunExternalTools || index >= m_externalTools.size())
-      return false;
-    const auto [tool, choice] = m_externalTools[index];
-    const auto targets = externalToolTargets(tool);
-    const auto& tab = m_tabs.activeTab();
-    if (tab.hasActiveAdminSession()
-        && tool == external_tools::Tool::Compare
-        && targets.size() == 2
-        && m_callbacks.onOpenProtectedFile
-        && std::ranges::any_of(targets, [](const auto& path) { return !userCanReadPath(path); })) {
-      auto prepare = [open = m_callbacks.onOpenProtectedFile, id = tab.id](
-                         const std::filesystem::path& path, std::function<void(const std::filesystem::path&)> ready
-                     ) {
-        if (userCanReadPath(path))
-          ready(path);
-        else
-          open(id, path, std::move(ready));
-      };
-      prepare(
-          targets.front(),
-          [prepare, second = targets.back(), choice, status = m_callbacks.onStatus](const auto& first) {
-            prepare(second, [first, choice, status](const auto& last) {
-              const std::array paths{first.string(), last.string()};
-              g_autoptr(GError) error = nullptr;
-              const bool launched = external_tools::launch(choice, external_tools::Tool::Compare, paths, &error);
-              if (status)
-                status(
-                    launched ? "Opened comparison. Use Save Changes Back for edited temporary copies."
-                             : (error ? error->message : "Could not open the comparison.")
-                );
-            });
-          }
-      );
+        if (selectedPath && m_callbacks.pinPlace)
+          m_callbacks.pinPlace(*selectedPath);
+        break;
+      case menu_id::kFileProperties:
+        if (!caps.canOpenProperties) {
+          if (m_callbacks.onStatus)
+            m_callbacks.onStatus("Properties is unavailable in Administrator Mode");
+          return true;
+        }
+        if (selectedPath && !m_callbacks.selectedPaths().empty() && m_callbacks.openProperties)
+          m_callbacks.openProperties(*selectedPath);
+        break;
+      case menu_id::kQuit:
+        if (m_callbacks.requestQuit)
+          m_callbacks.requestQuit();
+        break;
+      case menu_id::kShowMenuBar:
+        toggleMenuBarVisibility();
+        break;
+      }
       return true;
     }
-    GError* error = nullptr;
-    if (external_tools::launch(choice, tool, targets, &error)) {
-      if (m_callbacks.onStatus)
-        m_callbacks.onStatus("");
-    } else if (m_callbacks.onStatus) {
-      m_callbacks.onStatus(error ? error->message : "Could not launch the selected tool");
+    if (entry.id >= menu_id::kFirstOpenWithApp && entry.id < menu_id::kFileNewWindow && m_contextMenuTarget) {
+      if (!caps.canLaunchApps) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Opening files with external applications is disabled in Administrator Mode");
+        return true;
+      }
+      const auto index = static_cast<std::size_t>(entry.id - menu_id::kFirstOpenWithApp);
+      if (!m_launcher.launchOpenWithApp(index, *m_contextMenuTarget) && m_callbacks.onStatus)
+        m_callbacks.onStatus("That application is no longer available");
+      return true;
     }
-    g_clear_error(&error);
-    return true;
+    if (entry.id == menu_id::kOpenWithOther) {
+      if (session.browsingArchive())
+        return true;
+      if (!caps.canLaunchApps) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Opening files with external applications is disabled in Administrator Mode");
+        return true;
+      }
+      if (m_contextMenuTarget)
+        m_launcher.openApplicationChooser(*m_contextMenuTarget);
+      return true;
+    }
+    if (entry.id == menu_id::kOpen) {
+      if (m_contextMenuTarget && m_callbacks.activatePath)
+        m_callbacks.activatePath(*m_contextMenuTarget);
+      return true;
+    }
+    if (entry.id == menu_id::kProperties) {
+      if (!caps.canOpenProperties) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Properties is unavailable in Administrator Mode");
+        return true;
+      }
+      if (m_contextMenuTarget && !m_callbacks.selectedPaths().empty() && m_callbacks.openProperties)
+        m_callbacks.openProperties(*m_contextMenuTarget);
+      return true;
+    }
+    if (entry.id == menu_id::kOpenFolderNewWindow && !session.browsingArchive() && m_contextMenuTarget) {
+      if (m_callbacks.launchNewWindow)
+        m_callbacks.launchNewWindow(*m_contextMenuTarget);
+      return true;
+    }
+    return false;
   }
 
-  bool FileMenuController::launchProtectedApplication(
-      const BrowserTab& tab, GAppInfo* app, const std::filesystem::path& path
-  ) {
-    if (!tab.administratorBrowsing || userCanReadPath(path) || !m_callbacks.onOpenProtectedFile)
+  bool FileMenuController::dispatchTabAndPreviewAction(const ContextMenuControlEntry& entry) {
+    const auto& tab = m_tabs.activeTab();
+    const auto& session = tab.session;
+    const bool openInBackground = m_callbacks.openTabsInBackground && m_callbacks.openTabsInBackground();
+    const bool alwaysShowBar = m_callbacks.alwaysShowTabBar && m_callbacks.alwaysShowTabBar();
+    const auto selectedPath = m_callbacks.selectedPath ? m_callbacks.selectedPath() : std::nullopt;
+    switch (entry.id) {
+    case menu_id::kNewTab:
+    case menu_id::kTabContextNew:
+      if (m_callbacks.openNewTab)
+        m_callbacks.openNewTab();
+      return true;
+    case menu_id::kReopenClosedTab:
+      if (m_callbacks.reopenClosedTab)
+        m_callbacks.reopenClosedTab();
+      return true;
+    case menu_id::kCloseTab:
+      if (m_callbacks.closeTab)
+        m_callbacks.closeTab(tab.id);
+      return true;
+    case kQuickLookMenuId:
+      if (m_callbacks.openQuickLook)
+        m_callbacks.openQuickLook();
+      return true;
+    case menu_id::kPreviewHidden:
+      if (m_callbacks.setPreviewMode)
+        m_callbacks.setPreviewMode(PreviewMode::Hidden);
+      return true;
+    case menu_id::kPreviewInformation:
+      if (m_callbacks.setPreviewMode)
+        m_callbacks.setPreviewMode(PreviewMode::Information);
+      return true;
+    case menu_id::kPreviewFull:
+      if (m_callbacks.setPreviewMode)
+        m_callbacks.setPreviewMode(PreviewMode::Full);
+      return true;
+    case menu_id::kThumbnailsNever:
+      if (m_callbacks.setThumbnailPolicy)
+        m_callbacks.setThumbnailPolicy(ThumbnailPolicy::Never);
+      return true;
+    case menu_id::kThumbnailsLocal:
+      if (m_callbacks.setThumbnailPolicy)
+        m_callbacks.setThumbnailPolicy(ThumbnailPolicy::Local);
+      return true;
+    case menu_id::kThumbnailsAll:
+      if (m_callbacks.setThumbnailPolicy)
+        m_callbacks.setThumbnailPolicy(ThumbnailPolicy::All);
+      return true;
+    case menu_id::kInspectThumbnailCache:
+      if (m_callbacks.inspectThumbnailCache)
+        m_callbacks.inspectThumbnailCache(false);
+      return true;
+    case menu_id::kClearThumbnailCache:
+      if (m_callbacks.inspectThumbnailCache)
+        m_callbacks.inspectThumbnailCache(true);
+      return true;
+    case kGoToLinkTargetMenuId:
+      if (m_contextMenuTarget && m_callbacks.goToLinkTarget)
+        m_callbacks.goToLinkTarget(*m_contextMenuTarget);
+      return true;
+    case menu_id::kOpenContainingFolder:
+      if (m_contextMenuTarget
+          && session.search().active()
+          && std::ranges::find(session.entries(), *m_contextMenuTarget, &FileEntry::absPath) != session.entries().end()
+          && m_callbacks.navigate) {
+        m_callbacks.navigate(m_contextMenuTarget->parent_path());
+      }
+      return true;
+    case menu_id::kOpenFolderInNewTab:
+      if (!session.browsingArchive()
+          && m_contextMenuTarget
+          && !session.browsingTrash()
+          && m_callbacks.openFolderInNewTab)
+        m_callbacks.openFolderInNewTab(*m_contextMenuTarget, !openInBackground);
+      return true;
+    case menu_id::kFileOpenInNewTab:
+      if (!session.browsingTrash() && selectedPath) {
+        const auto found = std::ranges::find(session.entries(), *selectedPath, &FileEntry::absPath);
+        if (found != session.entries().end() && found->isDir) {
+          if (session.browsingArchive())
+            m_tabs.openTab({session.path(), found->absPath.native()}, tab.viewState, !openInBackground);
+          else if (m_callbacks.openFolderInNewTab)
+            m_callbacks.openFolderInNewTab(*selectedPath, !openInBackground);
+        }
+      }
+      return true;
+    case menu_id::kAlwaysShowTabBar:
+      if (m_callbacks.setAlwaysShowTabBar)
+        m_callbacks.setAlwaysShowTabBar(!alwaysShowBar);
+      return true;
+    case menu_id::kOpenTabsInBackground:
+      if (m_callbacks.setOpenTabsInBackground)
+        m_callbacks.setOpenTabsInBackground(!openInBackground);
+      return true;
+    case menu_id::kTabContextDuplicate:
+      if (m_callbacks.duplicateTab && m_callbacks.contextMenuTabId)
+        m_callbacks.duplicateTab(m_callbacks.contextMenuTabId());
+      return true;
+    case menu_id::kTabContextClose:
+      if (m_callbacks.closeTab && m_callbacks.contextMenuTabId)
+        m_callbacks.closeTab(m_callbacks.contextMenuTabId());
+      return true;
+    case menu_id::kTabContextCloseOthers:
+      if (m_callbacks.closeOtherTabs && m_callbacks.contextMenuTabId)
+        m_callbacks.closeOtherTabs(m_callbacks.contextMenuTabId());
+      return true;
+    case menu_id::kTabContextCloseRight:
+      if (m_callbacks.closeTabsToRight && m_callbacks.contextMenuTabId)
+        m_callbacks.closeTabsToRight(m_callbacks.contextMenuTabId());
+      return true;
+    default:
       return false;
-    auto application = std::shared_ptr<GAppInfo>(G_APP_INFO(g_object_ref(app)), g_object_unref);
-    m_callbacks.onOpenProtectedFile(tab.id, path, [application, status = m_callbacks.onStatus](const auto& temporary) {
-      g_autoptr(GError) error = nullptr;
-      const bool opened = launchApplicationForFile(application.get(), temporary, &error);
-      if (status)
-        status(
-            opened ? "Opened a temporary copy. Use Save Changes Back to update the original."
-                   : (error ? error->message : "Could not open the temporary copy.")
+    }
+  }
+
+  bool FileMenuController::dispatchPlacesAction(const ContextMenuControlEntry& entry) {
+    const auto caps = m_tabs.activeTab().capabilities();
+    const bool openInBackground = m_callbacks.openTabsInBackground && m_callbacks.openTabsInBackground();
+    if (entry.id == menu_id::kPlaceOpenInNewTab && m_places.placeMenuTarget()) {
+      const auto place = *m_places.placeMenuTarget();
+      const bool activate = !openInBackground;
+      if (place.identity == "personal:trash" && m_callbacks.openFolderInNewTab)
+        m_callbacks.openFolderInNewTab(std::filesystem::path("trash:/"), activate);
+      else if (place.mounted && !place.path.empty() && m_callbacks.openFolderInNewTab)
+        m_callbacks.openFolderInNewTab(place.path, activate);
+      return true;
+    }
+    if (entry.id == menu_id::kPinTargetToPlaces) {
+      if (!caps.canPinToPlaces) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Pinning locations to Places is disabled in Administrator Mode");
+        return true;
+      }
+      if (m_contextMenuTarget && m_callbacks.pinPlace)
+        m_callbacks.pinPlace(*m_contextMenuTarget);
+      return true;
+    }
+    if (entry.id == menu_id::kPinCurrentToPlaces) {
+      if (!caps.canPinToPlaces) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Pinning locations to Places is disabled in Administrator Mode");
+        return true;
+      }
+      if (m_callbacks.pinPlace)
+        m_callbacks.pinPlace(m_tabs.activeTab().session.path());
+      return true;
+    }
+    if (entry.id == menu_id::kPlaceToggleShowHidden) {
+      m_places.toggleShowHiddenMounts();
+      return true;
+    }
+    if ((entry.id == menu_id::kPlaceHide || entry.id == menu_id::kPlaceUnhide) && m_places.placeMenuTarget()) {
+      m_places.setPlaceHidden(*m_places.placeMenuTarget(), entry.id == menu_id::kPlaceHide);
+      return true;
+    }
+    if ((entry.id == menu_id::kPlaceProperties || entry.id == menu_id::kPlaceOpenNewWindow)
+        && m_places.placeMenuTarget()) {
+      const auto place = *m_places.placeMenuTarget();
+      if (entry.id == menu_id::kPlaceOpenNewWindow) {
+        if (place.mounted && !place.path.empty() && m_callbacks.launchNewWindow)
+          m_callbacks.launchNewWindow(place.path);
+      } else if (!caps.canOpenProperties) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Properties is unavailable in Administrator Mode");
+      } else if (place.mounted && !place.path.empty() && m_callbacks.openProperties) {
+        m_callbacks.openProperties(place.path);
+      } else if (m_callbacks.openVolumeProperties) {
+        m_callbacks.openVolumeProperties(place);
+      }
+      return true;
+    }
+    if (entry.id >= menu_id::kPlaceOpen && entry.id <= menu_id::kPlaceEject && m_places.placeMenuTarget()) {
+      auto place = *m_places.placeMenuTarget();
+      if (entry.id == menu_id::kPlaceOpen) {
+        if (place.identity == "personal:trash" && m_callbacks.navigateTrash)
+          m_callbacks.navigateTrash();
+        else if (place.mounted && !place.path.empty() && m_callbacks.navigate)
+          m_callbacks.navigate(place.path);
+      } else if (entry.id == menu_id::kPlaceRemove) {
+        m_places.removeSavedPlace(place.identity);
+      } else if (entry.id == menu_id::kPlacePin) {
+        if (!caps.canPinToPlaces) {
+          if (m_callbacks.onStatus)
+            m_callbacks.onStatus("Pinning locations to Places is disabled in Administrator Mode");
+          return true;
+        }
+        if (m_callbacks.pinPlace)
+          m_callbacks.pinPlace(place.path);
+      } else {
+        m_places.operatePlace(
+            place,
+            entry.id == menu_id::kPlaceMount         ? PlaceOperation::Mount
+                : entry.id == menu_id::kPlaceUnmount ? PlaceOperation::Unmount
+                                                     : PlaceOperation::Eject
         );
-    });
-    return true;
+      }
+      return true;
+    }
+    return false;
   }
 
-  bool FileMenuController::launchApplicationForFile(GAppInfo* app, const std::filesystem::path& path, GError** error) {
-    if (!app || path.empty()) {
-      g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "No application or file was selected.");
+  bool FileMenuController::dispatchSelectionAndClipboardAction(const ContextMenuControlEntry& entry) {
+    if (entry.id >= menu_id::kLocationCut && entry.id <= menu_id::kLocationSelectAll) {
+      if (m_callbacks.handleLocationInputAction)
+        m_callbacks.handleLocationInputAction(entry.id);
+      return true;
+    }
+    if (entry.id == menu_id::kCopyLocation) {
+      if (m_contextMenuTarget) {
+        m_clipboard.writeDesktopClipboard(m_contextMenuTarget->string(), "text/plain;charset=utf-8");
+      } else if (m_callbacks.selectedPathsOrdered) {
+        const auto paths = m_callbacks.selectedPathsOrdered();
+        if (paths.size() == 1)
+          m_clipboard.writeDesktopClipboard(paths.front(), "text/plain;charset=utf-8");
+      }
+      return true;
+    }
+    auto& tab = m_tabs.activeTab();
+    switch (entry.id) {
+    case menu_id::kSelectAll:
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      if (m_callbacks.changeSelection)
+        m_callbacks.changeSelection(SelectionChange::All);
+      return true;
+    case menu_id::kDeselectAll:
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      if (m_callbacks.changeSelection)
+        m_callbacks.changeSelection(SelectionChange::None);
+      return true;
+    case menu_id::kInvertSelection:
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      if (m_callbacks.changeSelection)
+        m_callbacks.changeSelection(SelectionChange::Invert);
+      return true;
+    case menu_id::kCopy:
+      if (m_places.hasActiveDeviceOperations()) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Wait for the device operation to finish");
+        return true;
+      }
+      if (m_callbacks.copyToDesktopClipboard)
+        m_callbacks.copyToDesktopClipboard(false);
+      return true;
+    case menu_id::kCut:
+      if (m_places.hasActiveDeviceOperations()) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Wait for the device operation to finish");
+        return true;
+      }
+      if (m_callbacks.copyToDesktopClipboard)
+        m_callbacks.copyToDesktopClipboard(true);
+      return true;
+    case menu_id::kPaste:
+      if (m_places.hasActiveDeviceOperations()) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Wait for the device operation to finish");
+        return true;
+      }
+      if (m_operations.replaying()) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Wait for Undo or Redo to finish");
+        return true;
+      }
+      m_clipboard.pasteClipboard();
+      return true;
+    default:
       return false;
     }
-    GFile* file = g_file_new_for_path(path.c_str());
-    GList files{file, nullptr, nullptr};
-    char* uri = g_file_get_uri(file);
-    GList uris{uri, nullptr, nullptr};
-    const gboolean launched = g_app_info_supports_files(app) ? g_app_info_launch(app, &files, nullptr, error)
-                                                             : g_app_info_launch_uris(app, &uris, nullptr, error);
-    g_free(uri);
-    g_object_unref(file);
-    return launched == TRUE;
+  }
+
+  bool FileMenuController::dispatchFileMutationAction(const ContextMenuControlEntry& entry) {
+    const auto& tab = m_tabs.activeTab();
+    const auto& session = tab.session;
+    const auto caps = tab.capabilities();
+    const bool createsItem = entry.id >= menu_id::kCreateFolder && entry.id <= menu_id::kSelectionSymlink;
+    if (m_places.hasActiveDeviceOperations()
+        && ((entry.id >= menu_id::kCopy && entry.id <= menu_id::kDeletePermanently)
+            || createsItem
+            || entry.id == menu_id::kDuplicate
+            || entry.id == menu_id::kUndo
+            || entry.id == menu_id::kRedo)) {
+      if (m_callbacks.onStatus)
+        m_callbacks.onStatus("Wait for the device operation to finish");
+      return true;
+    }
+    if (m_operations.replaying()
+        && ((entry.id >= menu_id::kPaste && entry.id <= menu_id::kDeletePermanently)
+            || (entry.id >= menu_id::kRestore && entry.id <= menu_id::kEmptyWastebin)
+            || createsItem
+            || entry.id == menu_id::kDuplicate)) {
+      if (m_callbacks.onStatus)
+        m_callbacks.onStatus("Wait for Undo or Redo to finish");
+      return true;
+    }
+    switch (entry.id) {
+    case menu_id::kDuplicate:
+      if (!caps.canCreate || !caps.canMutate) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("This action is unavailable in Administrator Mode");
+        return true;
+      }
+      if (m_callbacks.duplicateSelection)
+        m_callbacks.duplicateSelection();
+      return true;
+    case menu_id::kSelectionSymlink:
+      if (!caps.canCreate || !caps.canMutate) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("This action is unavailable in Administrator Mode");
+        return true;
+      }
+      if (m_callbacks.createSelectionSymlink)
+        m_callbacks.createSelectionSymlink();
+      return true;
+    case menu_id::kManualSymlink:
+      if (!caps.canCreate || !caps.canMutate) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("This action is unavailable in Administrator Mode");
+        return true;
+      }
+      if (m_callbacks.showSymlinkDialog)
+        m_callbacks.showSymlinkDialog();
+      return true;
+    case menu_id::kUndo:
+    case menu_id::kRedo: {
+      if (!caps.canUndo) {
+        if (m_callbacks.onStatus)
+          m_callbacks.onStatus("Undo and Redo are unavailable in Administrator Mode");
+        return true;
+      }
+      const bool modalOpen = m_callbacks.isModalOpen && m_callbacks.isModalOpen();
+      const bool renaming = m_callbacks.isRenaming && m_callbacks.isRenaming();
+      if (!modalOpen && !renaming && !m_transfer.busy() && m_clipboard.pendingClipboardReads() == 0) {
+        if (entry.id == menu_id::kUndo && m_operations.canUndo())
+          m_operations.undo();
+        else if (entry.id == menu_id::kRedo && m_operations.canRedo())
+          m_operations.redo();
+      }
+      return true;
+    }
+    case menu_id::kRestore:
+    case menu_id::kRestoreTo:
+      if (m_callbacks.restoreWastebinSelection)
+        m_callbacks.restoreWastebinSelection(entry.id == menu_id::kRestoreTo);
+      return true;
+    case menu_id::kEmptyWastebin:
+      if (m_callbacks.confirmEmptyWastebin)
+        m_callbacks.confirmEmptyWastebin();
+      return true;
+    case menu_id::kRename:
+      if (m_callbacks.beginRename)
+        m_callbacks.beginRename();
+      return true;
+    case menu_id::kTrash:
+      if (!session.browsingTrash()) {
+        if (!caps.canMutate || !caps.canTrash) {
+          if (m_callbacks.onStatus)
+            m_callbacks.onStatus("This action is unavailable in Administrator Mode");
+          return true;
+        }
+        if (m_callbacks.selectedPathsOrdered) {
+          auto targets = m_callbacks.selectedPathsOrdered();
+          if (!targets.empty())
+            m_operations.trash(std::move(targets));
+        }
+      }
+      return true;
+    case menu_id::kDeletePermanently:
+      if (!session.browsingTrash() && m_callbacks.confirmPermanentDelete)
+        m_callbacks.confirmPermanentDelete();
+      return true;
+    default:
+      break;
+    }
+    if ((entry.id >= menu_id::kCreateDocument && entry.id <= menu_id::kCreatePresentation)
+        || (entry.id >= menu_id::kCreateFolder && entry.id <= menu_id::kCreateTextFile)) {
+      if (m_callbacks.createNewItem)
+        m_callbacks.createNewItem(entry.id);
+      return true;
+    }
+    return false;
+  }
+
+  bool FileMenuController::dispatchViewAndSortAction(const ContextMenuControlEntry& entry) {
+    auto& tab = m_tabs.activeTab();
+    auto& session = tab.session;
+    if (entry.id == menu_id::kRefresh) {
+      if (session.browsingArchive())
+        session.reloadArchive();
+      else if (m_callbacks.enumerate)
+        m_callbacks.enumerate(session.path());
+      return true;
+    }
+    if (entry.id == menu_id::kToggleViewMode || entry.id == menu_id::kListView || entry.id == menu_id::kGridView) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      if (m_callbacks.setGridMode)
+        m_callbacks.setGridMode(
+            entry.id == menu_id::kToggleViewMode ? !m_listHeader.gridMode() : entry.id == menu_id::kGridView
+        );
+      return true;
+    }
+    if (entry.id >= menu_id::kZoomIn && entry.id <= menu_id::kResetZoom) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      if (m_callbacks.adjustViewScale)
+        m_callbacks.adjustViewScale(
+            entry.id == menu_id::kResetZoom
+                ? kFileViewDefaultScale
+                : m_listHeader.viewScale() + (entry.id == menu_id::kZoomIn ? kFileViewZoomStep : -kFileViewZoomStep)
+        );
+      return true;
+    }
+    if (entry.id == menu_id::kFitAllColumns) {
+      m_listHeader.requestFit(std::nullopt);
+      return true;
+    }
+    if (entry.id >= menu_id::kFirstFitColumn
+        && entry.id < menu_id::kFirstFitColumn + static_cast<int>(kFileColumns.size())) {
+      m_listHeader.requestFit(static_cast<FileColumn>(entry.id - menu_id::kFirstFitColumn));
+      return true;
+    }
+    if (entry.id >= menu_id::kFirstColumnAction
+        && entry.id < menu_id::kFirstColumnAction + static_cast<int>(kFileColumns.size())) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      const auto column = static_cast<FileColumn>(entry.id - menu_id::kFirstColumnAction);
+      if (column != FileColumn::Name && !(m_listHeader.searchView() && column == FileColumn::Accessed)) {
+        auto& visible = m_listHeader.columnLayout().visible[columnIndex(column)];
+        visible = !visible;
+        if (column == FileColumn::Size && !visible) {
+          if (session.search().active()) {
+            session.updateVisibleSearchFolders({});
+          } else {
+            for (const auto& tabPtr : m_tabs.tabs())
+              tabPtr->session.clearFolderCounts();
+          }
+        }
+        if (!m_listHeader.gridMode())
+          m_listHeader.updateColumnHeaders();
+        m_listHeader.persistColumnLayout();
+      }
+      return true;
+    }
+    if (entry.id >= menu_id::kSortName && entry.id <= menu_id::kSortAccessed) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      const auto field = static_cast<FileDialogSortField>(entry.id - menu_id::kSortName);
+      if (field != m_listHeader.sortField() && m_callbacks.setSortField)
+        m_callbacks.setSortField(field);
+      return true;
+    }
+    if (entry.id == menu_id::kSortType || (entry.id == menu_id::kSortLocation && m_listHeader.searchView())) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      const auto field = entry.id == menu_id::kSortLocation ? FileDialogSortField::Location : FileDialogSortField::Type;
+      if (m_listHeader.sortField() != field && m_callbacks.setSortField)
+        m_callbacks.setSortField(field);
+      return true;
+    }
+    if (entry.id == menu_id::kSortAscending || entry.id == menu_id::kSortDescending) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      const auto requested =
+          entry.id == menu_id::kSortAscending ? FileDialogSortOrder::Ascending : FileDialogSortOrder::Descending;
+      if (m_listHeader.sortOrder() != requested && m_callbacks.toggleSortOrder)
+        m_callbacks.toggleSortOrder();
+      return true;
+    }
+    if (entry.id == menu_id::kShowHidden) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      if (session.search().active()) {
+        if (m_callbacks.toggleSearchHidden)
+          m_callbacks.toggleSearchHidden();
+      } else {
+        session.setShowHidden(!session.showHidden());
+        if (m_callbacks.persistFileViewState)
+          m_callbacks.persistFileViewState();
+        if (m_callbacks.enumerate)
+          m_callbacks.enumerate(session.path());
+      }
+      return true;
+    }
+    if (entry.id == menu_id::kFoldersFirst || entry.id == menu_id::kHiddenLast) {
+      if (m_callbacks.recordAdminTabUserActivity)
+        m_callbacks.recordAdminTabUserActivity(tab);
+      if (entry.id == menu_id::kFoldersFirst)
+        session.setFoldersFirst(!session.foldersFirst());
+      else
+        session.setHiddenLast(!session.hiddenLast());
+      if (m_callbacks.persistFileViewState)
+        m_callbacks.persistFileViewState();
+      session.sortEntries(true);
+      if (m_callbacks.syncSortOrHiddenEntries)
+        m_callbacks.syncSortOrHiddenEntries();
+      return true;
+    }
+    return false;
   }
 
 } // namespace filemanager

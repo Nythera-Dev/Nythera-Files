@@ -104,7 +104,7 @@ namespace filemanager {
     m_dialogHost.showDialog(
         verify ? "Verify Checksum" : "Calculate Checksum", filename.get(),
         {{"Close", kCloseChecksum}, {"Copy", kCopyChecksum}, {verify ? "Verify" : "Calculate", kRunChecksum}},
-        [this](int) { dismiss(); }, nullptr, false, false, std::move(custom)
+        [this](int) { dismiss(); }, nullptr, std::move(custom)
     );
   }
 

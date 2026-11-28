@@ -1,6 +1,7 @@
 #pragma once
 
 #include "filemanager/file_manager_settings.h"
+#include "filemanager/path_resolution_cache.h"
 #include "filemanager/places_model.h"
 #include "ui/controls/context_menu_popup.h"
 
@@ -27,13 +28,9 @@ class ProgressBar;
 class ScrollView;
 class ToplevelSurface;
 
-namespace filemanager {
+struct PointerEvent;
 
-  struct PlacePathResolution {
-    bool exists = false;
-    bool isDirectory = false;
-    std::filesystem::path canonicalPath;
-  };
+namespace filemanager {
 
   class PlacesSidebarController {
   public:
@@ -46,7 +43,8 @@ namespace filemanager {
       std::function<void(const std::filesystem::path&, bool recordHistory)> onNavigate;
       std::function<void(std::vector<ContextMenuControlEntry>, float x, float y)> onShowMenu;
       std::function<void(std::uint32_t serial)> onInputSerial;
-      std::function<void(std::string title, std::string message, bool password, std::function<void(std::optional<std::string>)>)>
+      std::function<
+          void(std::string title, std::string message, bool password, std::function<void(std::optional<std::string>)>)>
           onTextPrompt;
       std::function<void(
           std::string title, std::string message, std::vector<std::pair<std::string, int>> choices,
@@ -56,12 +54,19 @@ namespace filemanager {
       std::function<void(std::string)> onStatus;
       std::function<void()> onUpdateNavigationControls;
       std::function<void()> onRequestLayout;
+      std::function<void()> onRequestRedraw;
+      std::function<void(std::uint32_t serial, std::uint32_t shape)> onSetCursorShape;
+      std::function<void()> onCancelPointerCapture;
+      std::function<void(const PointerEvent&, float x, float y)> onPointerAxis;
       std::function<void()> onClearDropPlace;
       std::function<void(const std::filesystem::path& mountPath)> onMountRemoved;
       std::function<void(const Place& place)> onOpenPlaceInBackgroundTab;
     };
 
-    PlacesSidebarController(FileManagerSettings& settings, FileOperationManager& operations, Callbacks callbacks);
+    PlacesSidebarController(
+        FileManagerSettings& settings, FileOperationManager& operations, PathResolutionCache& pathCache,
+        Callbacks callbacks
+    );
     ~PlacesSidebarController();
 
     void attachUi(ScrollView* scroll, Flex* content);
@@ -96,18 +101,11 @@ namespace filemanager {
     void updateActiveHighlight(const std::filesystem::path& currentPath, bool browsingTrash);
     void invalidateMountCapacitiesForPath(const std::filesystem::path& path);
 
-    void cancelPathResolutions();
-    void resolvePathAsync(
-        const std::filesystem::path& path, std::function<void(const PlacePathResolution&)> onResolved = {},
-        bool refreshSidebar = true
-    );
-    void cacheResolvedPath(const std::filesystem::path& path, const PlacePathResolution& resolved);
-    [[nodiscard]] bool samePersonalPlace(const std::filesystem::path& first, const std::filesystem::path& second) const;
-    [[nodiscard]] std::optional<bool>
-    sameDirectoryPathCached(const std::filesystem::path& first, const std::filesystem::path& second) const;
-    void compareDirectoriesAsync(
-        const std::filesystem::path& first, const std::filesystem::path& second, std::function<void(bool)> onResolved
-    );
+    [[nodiscard]] bool gestureActive() const noexcept { return m_reorderId.has_value(); }
+    [[nodiscard]] bool isReordering() const noexcept { return m_reordering; }
+    void cancelGesture();
+    bool handleActiveReorderPointer(const PointerEvent& event, float x, float y, std::uint32_t pointerSerial);
+    bool tryBeginReorderPress(const PointerEvent& event, float x, float y);
 
     [[nodiscard]] std::optional<std::filesystem::path> dropDestinationAt(float x, float y) const;
     [[nodiscard]] std::optional<std::size_t> rowIndexAt(float x, float y) const;
@@ -136,7 +134,8 @@ namespace filemanager {
       std::chrono::steady_clock::time_point updatedAt;
     };
 
-    void mountPassword(GMountOperation* op, GAskPasswordFlags flags, std::string user, std::string domain, unsigned step);
+    void
+    mountPassword(GMountOperation* op, GAskPasswordFlags flags, std::string user, std::string domain, unsigned step);
     void requestPlaceCapacity(const PlaceCapacityView& place, bool forceRefresh = false);
     void completePlaceCapacityQuery(
         const std::string& identity, const std::string& requestKey, GCancellable* cancellable, GFileInfo* info,
@@ -146,6 +145,7 @@ namespace filemanager {
 
     FileManagerSettings& m_settings;
     FileOperationManager& m_operations;
+    PathResolutionCache& m_pathCache;
     Callbacks m_callbacks;
 
     std::unique_ptr<PlacesModel> m_model;
@@ -169,11 +169,11 @@ namespace filemanager {
     std::unordered_set<std::string> m_deviceOperations;
     std::vector<std::shared_ptr<GMountOperation>> m_mountPrompts;
 
-    std::unordered_map<std::string, PlacePathResolution> m_placePathCache;
-    std::unordered_set<std::string> m_placePathPending;
-    GCancellable* m_placePathCancellable = nullptr;
-    std::uint64_t m_placePathGeneration = 0;
-    std::function<bool(const std::filesystem::path&, std::function<void(PlacePathResolution)>)> m_placePathResolveHook;
+    bool m_reordering = false;
+    std::optional<std::string> m_reorderId;
+    std::optional<std::string> m_reorderBefore;
+    float m_dragStartX = 0.0F;
+    float m_dragStartY = 0.0F;
 
     std::shared_ptr<int> m_placesAlive = std::make_shared<int>(0);
     std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);

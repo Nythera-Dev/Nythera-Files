@@ -95,7 +95,7 @@ public:
              });
     }));
     session.m_entries = {{.name = "item", .absPath = "trash:/item"}};
-    tab.selectedPaths = {"trash:/item"};
+    tab.m_selectedPaths = {"trash:/item"};
     const auto selectedTrashEditMenus = manager.editMenuEntries();
     const auto enabledRestore = findMenuEntry(selectedTrashEditMenus, 70);
     const auto enabledRestoreTo = findMenuEntry(selectedTrashEditMenus, 71);
@@ -132,7 +132,7 @@ public:
     // Even a failed batch must refresh the currently browsed destination and
     // preserve its result after asynchronous enumeration completes.
     session.m_browsingTrash = false;
-    tab.selectedPaths.clear();
+    tab.m_selectedPaths.clear();
     session.m_path = root;
     const auto generation = session.m_enumerationGeneration;
     const auto id = manager.m_operations.restore({"file:///not-a-wastebin-entry"});

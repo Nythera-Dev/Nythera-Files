@@ -75,6 +75,26 @@ void FileManager::navigateLocation(filemanager::BrowserLocation location, bool r
     activeSession().navigateLocation(std::move(location), recordHistory);
 }
 
+void FileManager::navigateBack() {
+  auto& session = activeSession();
+  if (session.backHistory().empty())
+    return;
+  auto path = session.backHistory().back();
+  session.backHistory().pop_back();
+  session.forwardHistory().push_back(session.location());
+  navigateLocation(std::move(path), false);
+}
+
+void FileManager::navigateForward() {
+  auto& session = activeSession();
+  if (session.forwardHistory().empty())
+    return;
+  auto path = session.forwardHistory().back();
+  session.forwardHistory().pop_back();
+  session.backHistory().push_back(session.location());
+  navigateLocation(std::move(path), false);
+}
+
 void FileManager::navigateUp() {
   const auto& session = activeSession();
   if (session.browsingArchive() && !session.archiveDirectory()->empty()) {
@@ -141,11 +161,11 @@ void FileManager::openArchiveMember(const std::filesystem::path& member, bool wi
     if (withApplication) {
       if (tabId == m_tabs.activeTabId()) {
         m_menus.setContextMenuTarget(path);
-        m_menus.openApplicationChooser();
+        m_launcher.openApplicationChooser(path);
       }
     } else {
       g_autoptr(GFile) file = g_file_new_for_path(path.c_str());
-      launchFileUri(tabId, file);
+      m_launcher.launchFileUri(tabId, file);
     }
   });
 }
@@ -239,8 +259,8 @@ bool FileManager::activateArchiveAction(int id) {
     return true;
   }
   if (id == kOpenArchiveMemberWith) {
-    if (activeSession().browsingArchive() && activeTab().selectedPath)
-      openArchiveMember(*activeTab().selectedPath, true);
+    if (activeSession().browsingArchive() && activeTab().selectedPath())
+      openArchiveMember(*activeTab().selectedPath(), true);
     return true;
   }
   if (id < kArchiveCompress || id > kAvoidRedundantExtractionFolders)
@@ -394,7 +414,7 @@ void FileManager::showCompressDialog(std::vector<std::string> sources, const std
     m_modalDialog.requestLayout();
   };
   m_modalDialog.showDialog(
-      "Compress To…", {}, {{"Cancel", 0}, {"Compress", 1}},
+      "Compress To…", {}, {{"Cancel", 0, filemanager::DialogChoiceStyle::Cancel}, {"Compress", 1}},
       [this, form, sources = std::move(sources), tabId, navigation](int result) mutable {
         const auto* tab = m_tabs.findTab(tabId);
         if (result == 1
@@ -406,7 +426,7 @@ void FileManager::showCompressDialog(std::vector<std::string> sources, const std
               std::move(sources), std::move(form->output), form->format, form->level, std::move(form->options)
           );
       },
-      m_surface.get(), false, false,
+      m_surface.get(),
       filemanager::ModalDialogHost::CustomContent{
           .buildFields =
               [=, this](Flex& root, float width) {

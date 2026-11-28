@@ -1,5 +1,6 @@
 #include "filemanager/archive/archive_backend.h"
 #include "filemanager/file_operation_manager.h"
+#include "filemanager/job_view_reporter.h"
 #include "test_isolation.h"
 
 #include <algorithm>
@@ -20,9 +21,10 @@ public:
   }
   static void signal(FileOperationManager& manager, std::uint64_t id, const char* name) {
     const std::string path = "/test/transfer";
-    manager.m_jobPaths[id] = path;
-    FileOperationManager::jobSignal(nullptr, nullptr, path.c_str(), nullptr, name, nullptr, &manager);
-    manager.m_jobPaths.erase(id);
+    auto& reporter = *manager.m_jobReporter;
+    reporter.m_jobPaths[id] = path;
+    filemanager::JobViewReporter::jobSignal(nullptr, nullptr, path.c_str(), nullptr, name, nullptr, &reporter);
+    reporter.m_jobPaths.erase(id);
   }
 };
 

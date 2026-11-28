@@ -124,7 +124,7 @@ namespace filemanager {
 
     template <typename T>
     bool saveSetting(
-        const fs::path& path, std::string key, const T& value,
+        const fs::path& path, std::string key, const T& value, std::string& writtenContent,
         const std::vector<CustomSearch>* expectedProfiles = nullptr
     ) {
       const TomlFileEdits edits{path, {{{std::move(key)}, printToml(value)}}};
@@ -135,8 +135,10 @@ namespace filemanager {
               if (!current || current->profiles != *expectedProfiles)
                 return "Custom searches changed while saving";
             }
-            if (staged.size() == 1 && parseSearchSettings(toml::parse(staged.front().content)))
+            if (staged.size() == 1 && parseSearchSettings(toml::parse(staged.front().content))) {
+              writtenContent = staged.front().content;
               return std::nullopt;
+            }
             return "Invalid Files search settings";
           }
       );
@@ -166,16 +168,27 @@ namespace filemanager {
   }
 
   bool FileManagerSettings::saveStandardSearchOptions(SearchOptions options) {
+    if (m_configDir.empty())
+      return false;
     toml::table fields{{"show_hidden", options.showHidden}, {"follow_symlinks", options.followSymlinks}};
     fields.is_inline(true);
-    return !m_configDir.empty() && saveSetting(searchSettingsPath(), "options", fields) && reloadSearchSettings();
+    const auto path = searchSettingsPath();
+    std::string written;
+    if (!saveSetting(path, "options", fields, written))
+      return false;
+    recordSelfWrite(path, std::move(written));
+    return reloadSearchSettings();
   }
 
   bool FileManagerSettings::saveSearchExclusions(const SearchLocations& exclusions) {
-    return !m_configDir.empty()
-        && std::ranges::all_of(exclusions, validSearchLocation)
-        && saveSetting(searchSettingsPath(), "exclusions", writeLocations(exclusions))
-        && reloadSearchSettings();
+    if (m_configDir.empty() || !std::ranges::all_of(exclusions, validSearchLocation))
+      return false;
+    const auto path = searchSettingsPath();
+    std::string written;
+    if (!saveSetting(path, "exclusions", writeLocations(exclusions), written))
+      return false;
+    recordSelfWrite(path, std::move(written));
+    return reloadSearchSettings();
   }
 
   bool FileManagerSettings::editCustomSearch(
@@ -218,7 +231,11 @@ namespace filemanager {
       value.is_inline(true);
       values.push_back(std::move(value));
     }
-    return saveSetting(path, "profiles", values, &settings->profiles) && reloadSearchSettings();
+    std::string written;
+    if (!saveSetting(path, "profiles", values, written, &settings->profiles))
+      return false;
+    recordSelfWrite(path, std::move(written));
+    return reloadSearchSettings();
   }
 
 } // namespace filemanager

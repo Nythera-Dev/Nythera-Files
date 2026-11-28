@@ -1,5 +1,7 @@
 #include "filemanager/wastebin_fallback.h"
 
+#include "filemanager/byte_size_format.h"
+
 #include <array>
 #include <cerrno>
 #include <cmath>
@@ -605,21 +607,7 @@ namespace filemanager::wastebin_fallback {
     return std::nullopt;
   }
 
-  std::string formatByteSize(std::uint64_t bytes) {
-    constexpr std::array<const char*, 6> units{"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
-    double value = static_cast<double>(bytes);
-    std::size_t unitIndex = 0;
-    while (value >= 1024.0 && unitIndex + 1 < units.size()) {
-      value /= 1024.0;
-      ++unitIndex;
-    }
-    std::ostringstream oss;
-    if (unitIndex == 0 || value >= 10.0)
-      oss << static_cast<std::uint64_t>(std::llround(value)) << ' ' << units[unitIndex];
-    else
-      oss << std::fixed << std::setprecision(1) << value << ' ' << units[unitIndex];
-    return oss.str();
-  }
+  std::string formatByteSize(std::uint64_t bytes) { return filemanager::formatAdaptiveBinaryByteSize(bytes); }
 
   int invokeTrashHook(const char* sourcePath) noexcept {
     if (!g_trashTestHook)
