@@ -35,6 +35,8 @@ namespace filemanager {
     auto& targetPath = location.path;
     if (isTrashTabPath(targetPath))
       targetPath = "trash:/";
+    else if (isRecentTabPath(targetPath))
+      targetPath = "recent:/";
     else if (!targetPath.empty())
       targetPath = normalizeTabPath(targetPath);
 
@@ -580,6 +582,7 @@ namespace filemanager {
                 m_callbacks.onActiveStatus(*tab, std::move(msg));
             },
         .archivePassword = m_callbacks.archivePassword,
+        .recentItems = m_callbacks.recentItems,
     };
   }
 

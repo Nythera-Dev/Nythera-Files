@@ -6,6 +6,10 @@
 #include "config/toml_persistence.h"
 #include "core/log.h"
 #include "filemanager/file_column_serialization.h"
+#include "filemanager/runtime_file_lock.h"
+#include "render/core/color.h"
+#include "ui/palette.h"
+#include "util/string_utils.h"
 
 #include <algorithm>
 #include <charconv>
@@ -14,6 +18,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <sstream>
 
 namespace filemanager {
@@ -86,6 +91,76 @@ namespace filemanager {
       return toml::node_view(left) == toml::node_view(right);
     }
 
+    const toml::node* preferenceDefault(const ConfigKeyPath& path) {
+      // Optional Shell overrides have no stored default. An explicit value can
+      // match Shell today and still override future changes.
+      static const auto defaults = [] {
+        auto values = toml::parse(R"(
+          [files]
+          fzf_search = true
+          search_default_mode = "contiguous"
+          search_grid_view = false
+          grid_view = false
+          show_hidden = false
+          folders_first = true
+          hidden_last = true
+          search_sort_field = 0
+          sort_field = 0
+          search_sort_descending = false
+          sort_descending = false
+          show_menu_bar = true
+          always_show_tab_bar = false
+          open_tabs_in_background = false
+          admin_inactivity_timeout_seconds = 600
+          view_scale = 1.0
+          search_view_scale = 1.0
+          preview_mode = "full"
+          avoid_redundant_extraction_folders = true
+          thumbnail_policy = "local"
+          thumbnail_max_file_mib = 64
+          thumbnail_cache_mib = 1024
+          startup_location = "home"
+          startup_custom_path = ""
+          restore_tabs = false
+          remember_window_geometry = true
+          external_open_mode = "new_tab"
+          confirm_close_multiple_tabs = true
+          confirm_close_active_operations = true
+          branding_mode = "full"
+          new_tab_location = "home"
+          new_tab_custom_path = ""
+          new_tab_position = "end"
+          middle_click_folder = "background_tab"
+          click_activation = "double"
+          address_bar_mode = "breadcrumbs"
+          show_places_personal = true
+          show_places_devices = true
+          show_places_network = true
+          show_places_capacity = true
+          recent_activity_enabled = true
+          show_recent_sidebar = true
+          show_frequent_locations = true
+          frequent_locations_count = 5
+          recent_retention = "30d"
+
+          [theme]
+          inherit_shell = true
+          theme_file = ""
+        )");
+        auto& files = *values["files"].as_table();
+        files.insert("list_column_layout", serializeFileColumnLayout(FileColumnLayout{}));
+        files.insert("search_column_layout", serializeSearchFileColumnLayout(kDefaultSearchColumnLayout));
+        return values;
+      }();
+      return find(defaults, path);
+    }
+
+    bool matchesDefault(const toml::node& value, const toml::node& defaultValue) {
+      if (defaultValue.is_floating_point() && value.is_number())
+        return value.value<double>() == defaultValue.value<double>();
+      return equal(&value, &defaultValue);
+    }
+
     std::optional<PanelTransparencyMode> transparency(toml::node_view<const toml::node> node) {
       const auto name = node.value_exact<std::string_view>();
       for (const auto& option : kPanelTransparencyModes) {
@@ -131,9 +206,41 @@ namespace filemanager {
     return m_preferences["files"]["readline_shortcuts"].value_or(m_shellConfig.config().shell.readlineShortcuts);
   }
 
+  std::optional<bool> FileManagerSettings::readlineShortcutsOverride() const {
+    return m_preferences["files"]["readline_shortcuts"].value_exact<bool>();
+  }
+
+  bool FileManagerSettings::setReadlineShortcuts(std::optional<bool> enabled) {
+    return save({{{"files", "readline_shortcuts"}, enabled ? std::optional(literal(*enabled)) : std::nullopt}});
+  }
+
   PanelTransparencyMode FileManagerSettings::transparencyMode() const {
     return transparency(m_preferences["theme"]["transparency_mode"])
-        .value_or(m_shellConfig.config().shell.panel.transparencyMode);
+        .value_or(
+            inheritShellTheme() ? m_shellConfig.config().shell.panel.transparencyMode : PanelTransparencyMode::Solid
+        );
+  }
+
+  std::optional<PanelTransparencyMode> FileManagerSettings::transparencyModeOverride() const {
+    return transparency(m_preferences["theme"]["transparency_mode"]);
+  }
+
+  bool FileManagerSettings::setTransparencyMode(std::optional<PanelTransparencyMode> mode) {
+    if (!mode) {
+      return reset({"theme", "transparency_mode"});
+    }
+    for (const auto& option : kPanelTransparencyModes) {
+      if (option.value == *mode) {
+        return save({{{"theme", "transparency_mode"}, literal(std::string(option.key))}});
+      }
+    }
+    return false;
+  }
+
+  bool FileManagerSettings::hasPreferenceKey(const ConfigKeyPath& path) const {
+    const auto* value = find(m_preferences, path);
+    const auto* defaultValue = preferenceDefault(path);
+    return value && (!defaultValue || !matchesDefault(*value, *defaultValue));
   }
 
   void FileManagerSettings::doAddPollFds(std::vector<pollfd>& fds) {
@@ -181,13 +288,17 @@ namespace filemanager {
   }
 
   bool FileManagerSettings::save(std::vector<Change> changes) {
+    m_lastSaveError.clear();
     if (changes.empty())
       return true;
-    if (m_configDir.empty())
+    if (m_configDir.empty()) {
+      m_lastSaveError = "Configuration directory is unavailable";
       return false;
+    }
     auto current = mergeConfigWithSources(m_configDir.string());
     if (auto error = validateFilesConfiguration(current)) {
-      kLog.warn("Cannot save Files configuration: {}", error->origin.prefixed(error->message));
+      m_lastSaveError = error->origin.prefixed(error->message);
+      kLog.warn("Cannot save Files configuration: {}", m_lastSaveError);
       reportProblem(std::move(*error));
       return false;
     }
@@ -201,10 +312,19 @@ namespace filemanager {
       else
         found->edits.push_back({change.first, change.second});
     };
-    for (const auto& change : changes) {
-      const auto& [key, value] = change;
-      if (key.size() < 2 || (key.front() != "files" && key.front() != "theme"))
+    for (auto& change : changes) {
+      auto& [key, value] = change;
+      if (key.size() < 2 || (key.front() != "files" && key.front() != "theme")) {
+        m_lastSaveError = "Invalid configuration key path";
         return false;
+      }
+      if (value) {
+        if (const auto* defaultValue = preferenceDefault(key)) {
+          const auto proposed = toml::parse("value = " + *value);
+          if (const auto* node = proposed.get("value"); node && matchesDefault(*node, *defaultValue))
+            value.reset();
+        }
+      }
       if (!value) {
         for (const auto& source : current.sources.definitions(key))
           append(source.origin.file, change);
@@ -224,6 +344,11 @@ namespace filemanager {
         }
       }
       append(destination, change);
+    }
+
+    if (files.empty()) {
+      accept(std::move(current), hadExternalChanges);
+      return true;
     }
 
     std::optional<SourcedMergeResult> candidate;
@@ -254,11 +379,12 @@ namespace filemanager {
               recorded.push_back({alias, file.content});
             }
           }
-          (void)recordApplicationConfigWrites(kOwner, recorded);
+          (void)recordValidatedApplicationConfigWrites(kOwner, recorded, m_configDir, *candidate);
           return std::nullopt;
         });
     if (!result.ok()) {
       clearApplicationConfigWrites(kOwner);
+      m_lastSaveError = result.error;
       kLog.warn("Cannot save Files configuration: {}", result.error);
       for (const auto& path : result.rollbackFailures)
         kLog.error("Could not restore '{}'", path.string());
@@ -270,7 +396,42 @@ namespace filemanager {
     return true;
   }
 
-  bool FileManagerSettings::reset(const ConfigKeyPath& path) { return save({{path, std::nullopt}}); }
+  bool FileManagerSettings::reset(const ConfigKeyPath& path) {
+    if (path.size() == 2 && path[0] == "theme" && path[1] == "colors") {
+      return clearAllThemeColorOverrides();
+    }
+    return save({{path, std::nullopt}});
+  }
+
+  bool FileManagerSettings::resetKeys(std::span<const ConfigKeyPath> paths) {
+    std::vector<Change> changes;
+    changes.reserve(paths.size());
+    for (const auto& path : paths) {
+      if (path.size() == 2 && path[0] == "theme" && path[1] == "colors") {
+        if (const auto* colors = m_preferences["theme"]["colors"].as_table()) {
+          for (const auto& [key, _] : *colors) {
+            changes.emplace_back(ConfigKeyPath{"theme", "colors", std::string(key.str())}, std::nullopt);
+          }
+        }
+      }
+      changes.emplace_back(path, std::nullopt);
+    }
+    return save(std::move(changes));
+  }
+
+  bool FileManagerSettings::fzfSearchEnabled() const { return m_preferences["files"]["fzf_search"].value_or(true); }
+
+  bool FileManagerSettings::setFzfSearchEnabled(bool enabled) {
+    return save({{{"files", "fzf_search"}, literal(enabled)}});
+  }
+
+  SearchMode FileManagerSettings::searchDefaultMode() const {
+    return searchModeFromConfig(m_preferences["files"]["search_default_mode"].value_or(std::string_view{}));
+  }
+
+  bool FileManagerSettings::setSearchDefaultMode(SearchMode mode) {
+    return save({{{"files", "search_default_mode"}, literal(std::string(searchModeToConfig(mode)))}});
+  }
 
   FileViewSettings FileManagerSettings::loadFileView(bool search) const {
     const auto files = m_preferences["files"];
@@ -422,8 +583,24 @@ namespace filemanager {
     return m_preferences["files"]["thumbnail_max_file_mib"].value_or(64);
   }
 
+  bool FileManagerSettings::setThumbnailMaxFileMiB(int mib) {
+    if (mib < 1 || mib > 64) {
+      m_lastSaveError = "Thumbnail max file size must be between 1 and 64 MiB";
+      return false;
+    }
+    return save({{{"files", "thumbnail_max_file_mib"}, literal(static_cast<std::int64_t>(mib))}});
+  }
+
   int FileManagerSettings::thumbnailCacheMiB() const {
     return m_preferences["files"]["thumbnail_cache_mib"].value_or(1024);
+  }
+
+  bool FileManagerSettings::setThumbnailCacheMiB(int mib) {
+    if (mib < 16 || mib > 8192) {
+      m_lastSaveError = "Thumbnail cache budget must be between 16 and 8192 MiB";
+      return false;
+    }
+    return save({{{"files", "thumbnail_cache_mib"}, literal(static_cast<std::int64_t>(mib))}});
   }
 
   float FileManagerSettings::loadPreviewWidth() const {
@@ -431,7 +608,7 @@ namespace filemanager {
   }
 
   bool FileManagerSettings::savePreviewWidth(float width) {
-    return m_state.setString(kOwner, "preview_width", std::to_string(width));
+    return updateRuntimeState([&] { return m_state.setString(kOwner, "preview_width", std::to_string(width)); });
   }
 
   float FileManagerSettings::loadSidebarWidth(float defaultWidth, float minWidth, float maxWidth) const {
@@ -439,7 +616,7 @@ namespace filemanager {
   }
 
   bool FileManagerSettings::saveSidebarWidth(float width) {
-    return m_state.setString(kOwner, "sidebar_width", std::to_string(width));
+    return updateRuntimeState([&] { return m_state.setString(kOwner, "sidebar_width", std::to_string(width)); });
   }
 
   float FileManagerSettings::loadStatusHeight(float defaultHeight, float minHeight, float maxHeight) const {
@@ -447,7 +624,7 @@ namespace filemanager {
   }
 
   bool FileManagerSettings::saveStatusHeight(float height) {
-    return m_state.setString(kOwner, "status_height", std::to_string(height));
+    return updateRuntimeState([&] { return m_state.setString(kOwner, "status_height", std::to_string(height)); });
   }
 
   std::vector<SavedPlace> FileManagerSettings::loadSavedPlaces() const {
@@ -520,7 +697,7 @@ namespace filemanager {
   }
 
   bool FileManagerSettings::setPlacesSectionExpanded(std::string_view key, bool expanded) {
-    return m_state.setBool(kOwner, key, expanded);
+    return updateRuntimeState([&] { return m_state.setBool(kOwner, key, expanded); });
   }
 
   std::string FileManagerSettings::dialogSizeStateKey(std::string_view title, bool conflictDialog) {
@@ -571,7 +748,7 @@ namespace filemanager {
 
   bool FileManagerSettings::saveDialogSize(std::string_view key, std::uint32_t width, std::uint32_t height) {
     const auto size = std::to_string(width) + "x" + std::to_string(height);
-    return m_state.setString(kOwner, key, size);
+    return updateRuntimeState([&] { return m_state.setString(kOwner, key, size); });
   }
 
   std::optional<std::pair<std::uint32_t, std::uint32_t>>
@@ -585,5 +762,519 @@ namespace filemanager {
 
   bool FileManagerSettings::savePropertiesSize(std::uint32_t width, std::uint32_t height) {
     return saveDialogSize("properties_window_size", width, height);
+  }
+
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> FileManagerSettings::loadSettingsWindowSize() const {
+    return loadWindowSize("settings_window_size", 640, 420);
+  }
+
+  bool FileManagerSettings::saveSettingsWindowSize(std::uint32_t width, std::uint32_t height) {
+    return saveDialogSize("settings_window_size", width, height);
+  }
+
+  // Stage 2: General preferences
+
+  StartupLocation FileManagerSettings::startupLocation() const {
+    const auto value = m_preferences["files"]["startup_location"].value_or<std::string_view>("home");
+    if (value == "last")
+      return StartupLocation::Last;
+    if (value == "custom")
+      return StartupLocation::Custom;
+    return StartupLocation::Home;
+  }
+
+  bool FileManagerSettings::setStartupLocation(StartupLocation location) {
+    const std::string_view key = location == StartupLocation::Last ? "last"
+        : location == StartupLocation::Custom                      ? "custom"
+                                                                   : "home";
+    return save({{{"files", "startup_location"}, literal(std::string(key))}});
+  }
+
+  fs::path FileManagerSettings::startupCustomPath() const {
+    return fs::path(m_preferences["files"]["startup_custom_path"].value_or<std::string_view>(""));
+  }
+
+  bool FileManagerSettings::setStartupCustomPath(const fs::path& path) {
+    return save({{{"files", "startup_custom_path"}, literal(path.string())}});
+  }
+
+  bool FileManagerSettings::restoreTabs() const { return m_preferences["files"]["restore_tabs"].value_or(false); }
+
+  bool FileManagerSettings::setRestoreTabs(bool restore) {
+    return save({{{"files", "restore_tabs"}, literal(restore)}});
+  }
+
+  bool FileManagerSettings::rememberWindowGeometry() const {
+    return m_preferences["files"]["remember_window_geometry"].value_or(true);
+  }
+
+  bool FileManagerSettings::setRememberWindowGeometry(bool remember) {
+    return save({{{"files", "remember_window_geometry"}, literal(remember)}});
+  }
+
+  ExternalOpenMode FileManagerSettings::externalOpenMode() const {
+    const auto value = m_preferences["files"]["external_open_mode"].value_or<std::string_view>("new_tab");
+    return value == "new_window" ? ExternalOpenMode::NewWindow : ExternalOpenMode::NewTab;
+  }
+
+  bool FileManagerSettings::setExternalOpenMode(ExternalOpenMode mode) {
+    return save(
+        {{{"files", "external_open_mode"},
+          literal(std::string(mode == ExternalOpenMode::NewWindow ? "new_window" : "new_tab"))}}
+    );
+  }
+
+  bool FileManagerSettings::confirmCloseMultipleTabs() const {
+    return m_preferences["files"]["confirm_close_multiple_tabs"].value_or(true);
+  }
+
+  bool FileManagerSettings::setConfirmCloseMultipleTabs(bool confirm) {
+    return save({{{"files", "confirm_close_multiple_tabs"}, literal(confirm)}});
+  }
+
+  bool FileManagerSettings::confirmCloseActiveOperations() const {
+    return m_preferences["files"]["confirm_close_active_operations"].value_or(true);
+  }
+
+  bool FileManagerSettings::setConfirmCloseActiveOperations(bool confirm) {
+    return save({{{"files", "confirm_close_active_operations"}, literal(confirm)}});
+  }
+
+  // Stage 2: Appearance preferences
+
+  bool FileManagerSettings::inheritShellTheme() const { return m_preferences["theme"]["inherit_shell"].value_or(true); }
+
+  bool FileManagerSettings::setInheritShellTheme(bool inherit) {
+    return save({{{"theme", "inherit_shell"}, literal(inherit)}});
+  }
+
+  fs::path FileManagerSettings::themeFile() const {
+    return fs::path(m_preferences["theme"]["theme_file"].value_or<std::string_view>(""));
+  }
+
+  bool FileManagerSettings::setThemeFile(const fs::path& path) {
+    if (path.empty())
+      return reset({"theme", "theme_file"});
+    return save({{{"theme", "theme_file"}, literal(path.string())}});
+  }
+
+  std::map<ColorRole, Color> FileManagerSettings::themeColorOverrides() const {
+    std::map<ColorRole, Color> overrides;
+    const auto* colors = m_preferences["theme"]["colors"].as_table();
+    if (colors == nullptr)
+      return overrides;
+    for (const auto& [key, value] : *colors) {
+      const auto role = colorRoleFromToken(key.str());
+      const auto hexText = value.value_exact<std::string_view>();
+      if (!role || !hexText)
+        continue;
+      Color parsed;
+      if (tryParseHexColor(*hexText, parsed))
+        overrides.emplace(*role, parsed);
+    }
+    return overrides;
+  }
+
+  std::optional<Color> FileManagerSettings::themeColorOverride(ColorRole role) const {
+    const auto hexText = m_preferences["theme"]["colors"][colorRoleToken(role)].value_exact<std::string_view>();
+    if (!hexText)
+      return std::nullopt;
+    Color parsed;
+    if (tryParseHexColor(*hexText, parsed))
+      return parsed;
+    return std::nullopt;
+  }
+
+  bool FileManagerSettings::setThemeColorOverride(ColorRole role, std::optional<Color> color) {
+    const ConfigKeyPath key{"theme", "colors", std::string(colorRoleToken(role))};
+    if (!color)
+      return save({{key, std::nullopt}});
+    const std::string hexText = color->a < 0.999F ? formatRgbaHex(*color) : formatRgbHex(*color);
+    return save({{key, literal(hexText)}});
+  }
+
+  bool FileManagerSettings::clearAllThemeColorOverrides() {
+    std::vector<Change> changes;
+    if (const auto* colors = m_preferences["theme"]["colors"].as_table()) {
+      for (const auto& [key, _] : *colors)
+        changes.emplace_back(ConfigKeyPath{"theme", "colors", std::string(key.str())}, std::nullopt);
+    }
+    changes.emplace_back(ConfigKeyPath{"theme", "colors"}, std::nullopt);
+    return save(std::move(changes));
+  }
+
+  std::optional<std::string> FileManagerSettings::fontFamilyOverride() const {
+    if (const auto value = m_preferences["files"]["font_family"].value_exact<std::string_view>()) {
+      const auto trimmed = StringUtils::trim(*value);
+      if (!trimmed.empty())
+        return trimmed;
+    }
+    return std::nullopt;
+  }
+
+  std::string FileManagerSettings::effectiveFontFamily() const {
+    if (auto ovr = fontFamilyOverride())
+      return *ovr;
+    if (inheritShellTheme() && !m_shellConfig.config().shell.fontFamily.empty())
+      return m_shellConfig.config().shell.fontFamily;
+    return "sans-serif";
+  }
+
+  bool FileManagerSettings::setFontFamilyOverride(std::optional<std::string> family) {
+    if (!family || StringUtils::trim(*family).empty())
+      return reset({"files", "font_family"});
+    return save({{{"files", "font_family"}, literal(StringUtils::trim(*family))}});
+  }
+
+  std::optional<std::string> FileManagerSettings::iconThemeOverride() const {
+    if (const auto value = m_preferences["files"]["icon_theme"].value_exact<std::string_view>()) {
+      const auto trimmed = StringUtils::trim(*value);
+      if (!trimmed.empty())
+        return trimmed;
+    }
+    return std::nullopt;
+  }
+
+  bool FileManagerSettings::setIconThemeOverride(std::optional<std::string> theme) {
+    if (!theme || StringUtils::trim(*theme).empty())
+      return reset({"files", "icon_theme"});
+    return save({{{"files", "icon_theme"}, literal(StringUtils::trim(*theme))}});
+  }
+
+  std::optional<bool> FileManagerSettings::animationsEnabledOverride() const {
+    return m_preferences["files"]["animations_enabled"].value_exact<bool>();
+  }
+
+  bool FileManagerSettings::effectiveAnimationsEnabled() const {
+    if (const auto ovr = animationsEnabledOverride())
+      return *ovr;
+    if (inheritShellTheme())
+      return m_shellConfig.config().shell.animation.enabled;
+    return true;
+  }
+
+  bool FileManagerSettings::setAnimationsEnabledOverride(std::optional<bool> enabled) {
+    if (!enabled)
+      return reset({"files", "animations_enabled"});
+    return save({{{"files", "animations_enabled"}, literal(*enabled)}});
+  }
+
+  std::optional<float> FileManagerSettings::animationSpeedOverride() const {
+    if (const auto value = m_preferences["files"]["animation_speed"].value<double>())
+      return static_cast<float>(std::clamp(*value, 0.25, 4.0));
+    return std::nullopt;
+  }
+
+  float FileManagerSettings::effectiveAnimationSpeed() const {
+    if (const auto ovr = animationSpeedOverride())
+      return *ovr;
+    if (inheritShellTheme())
+      return std::clamp(m_shellConfig.config().shell.animation.speed, 0.25F, 4.0F);
+    return 1.0F;
+  }
+
+  bool FileManagerSettings::setAnimationSpeedOverride(std::optional<float> speed) {
+    if (!speed)
+      return reset({"files", "animation_speed"});
+    const float clamped = std::clamp(*speed, 0.25F, 4.0F);
+    return save({{{"files", "animation_speed"}, std::format("{:.2f}", clamped)}});
+  }
+
+  std::optional<bool> FileManagerSettings::hazeEnabledOverride() const {
+    return m_preferences["files"]["haze_enabled"].value_exact<bool>();
+  }
+
+  bool FileManagerSettings::effectiveHazeEnabled() const {
+    if (const auto ovr = hazeEnabledOverride())
+      return *ovr;
+    if (inheritShellTheme())
+      return m_shellConfig.config().shell.panel.hazeEnabled;
+    return false;
+  }
+
+  bool FileManagerSettings::setHazeEnabledOverride(std::optional<bool> enabled) {
+    if (!enabled)
+      return reset({"files", "haze_enabled"});
+    return save({{{"files", "haze_enabled"}, literal(*enabled)}});
+  }
+
+  BrandingMode FileManagerSettings::brandingMode() const {
+    const auto value = m_preferences["files"]["branding_mode"].value_or<std::string_view>("full");
+    if (value == "glyph")
+      return BrandingMode::Compact;
+    if (value == "off")
+      return BrandingMode::Off;
+    return BrandingMode::Full;
+  }
+
+  bool FileManagerSettings::setBrandingMode(BrandingMode mode) {
+    const std::string_view key = mode == BrandingMode::Compact ? "glyph" : mode == BrandingMode::Off ? "off" : "full";
+    return save({{{"files", "branding_mode"}, literal(std::string(key))}});
+  }
+
+  // Stage 2: Navigation preferences
+
+  NewTabLocation FileManagerSettings::newTabLocation() const {
+    const auto value = m_preferences["files"]["new_tab_location"].value_or<std::string_view>("home");
+    if (value == "current")
+      return NewTabLocation::Current;
+    if (value == "custom")
+      return NewTabLocation::Custom;
+    if (value == "startup")
+      return NewTabLocation::Startup;
+    return NewTabLocation::Home;
+  }
+
+  bool FileManagerSettings::setNewTabLocation(NewTabLocation location) {
+    const std::string_view key = location == NewTabLocation::Current ? "current"
+        : location == NewTabLocation::Custom                         ? "custom"
+        : location == NewTabLocation::Startup                        ? "startup"
+                                                                     : "home";
+    return save({{{"files", "new_tab_location"}, literal(std::string(key))}});
+  }
+
+  fs::path FileManagerSettings::newTabCustomPath() const {
+    return fs::path(m_preferences["files"]["new_tab_custom_path"].value_or<std::string_view>(""));
+  }
+
+  bool FileManagerSettings::setNewTabCustomPath(const fs::path& path) {
+    return save({{{"files", "new_tab_custom_path"}, literal(path.string())}});
+  }
+
+  NewTabPosition FileManagerSettings::newTabPosition() const {
+    const auto value = m_preferences["files"]["new_tab_position"].value_or<std::string_view>("end");
+    return value == "after_current" ? NewTabPosition::AfterCurrent : NewTabPosition::End;
+  }
+
+  bool FileManagerSettings::setNewTabPosition(NewTabPosition position) {
+    return save(
+        {{{"files", "new_tab_position"},
+          literal(std::string(position == NewTabPosition::AfterCurrent ? "after_current" : "end"))}}
+    );
+  }
+
+  MiddleClickFolderAction FileManagerSettings::middleClickFolder() const {
+    const auto value = m_preferences["files"]["middle_click_folder"].value_or<std::string_view>("background_tab");
+    if (value == "foreground_tab")
+      return MiddleClickFolderAction::ForegroundTab;
+    if (value == "new_window")
+      return MiddleClickFolderAction::NewWindow;
+    if (value == "none")
+      return MiddleClickFolderAction::None;
+    return MiddleClickFolderAction::BackgroundTab;
+  }
+
+  bool FileManagerSettings::setMiddleClickFolder(MiddleClickFolderAction action) {
+    const std::string_view key = action == MiddleClickFolderAction::ForegroundTab ? "foreground_tab"
+        : action == MiddleClickFolderAction::NewWindow                            ? "new_window"
+        : action == MiddleClickFolderAction::None                                 ? "none"
+                                                                                  : "background_tab";
+    return save({{{"files", "middle_click_folder"}, literal(std::string(key))}});
+  }
+
+  ClickActivation FileManagerSettings::clickActivation() const {
+    const auto value = m_preferences["files"]["click_activation"].value_or<std::string_view>("double");
+    return value == "single" ? ClickActivation::Single : ClickActivation::Double;
+  }
+
+  bool FileManagerSettings::setClickActivation(ClickActivation activation) {
+    return save(
+        {{{"files", "click_activation"},
+          literal(std::string(activation == ClickActivation::Single ? "single" : "double"))}}
+    );
+  }
+
+  AddressBarMode FileManagerSettings::addressBarMode() const {
+    const auto value = m_preferences["files"]["address_bar_mode"].value_or<std::string_view>("breadcrumbs");
+    return value == "full_path" ? AddressBarMode::FullPath : AddressBarMode::Breadcrumbs;
+  }
+
+  bool FileManagerSettings::setAddressBarMode(AddressBarMode mode) {
+    return save(
+        {{{"files", "address_bar_mode"},
+          literal(std::string(mode == AddressBarMode::FullPath ? "full_path" : "breadcrumbs"))}}
+    );
+  }
+
+  bool FileManagerSettings::showPlacesPersonal() const {
+    return m_preferences["files"]["show_places_personal"].value_or(true);
+  }
+
+  bool FileManagerSettings::setShowPlacesPersonal(bool show) {
+    return save({{{"files", "show_places_personal"}, literal(show)}});
+  }
+
+  bool FileManagerSettings::showPlacesDevices() const {
+    return m_preferences["files"]["show_places_devices"].value_or(true);
+  }
+
+  bool FileManagerSettings::setShowPlacesDevices(bool show) {
+    return save({{{"files", "show_places_devices"}, literal(show)}});
+  }
+
+  bool FileManagerSettings::showPlacesNetwork() const {
+    return m_preferences["files"]["show_places_network"].value_or(true);
+  }
+
+  bool FileManagerSettings::setShowPlacesNetwork(bool show) {
+    return save({{{"files", "show_places_network"}, literal(show)}});
+  }
+
+  bool FileManagerSettings::showPlacesCapacity() const {
+    return m_preferences["files"]["show_places_capacity"].value_or(true);
+  }
+
+  bool FileManagerSettings::setShowPlacesCapacity(bool show) {
+    return save({{{"files", "show_places_capacity"}, literal(show)}});
+  }
+
+  bool FileManagerSettings::recentActivityEnabled() const {
+    return m_preferences["files"]["recent_activity_enabled"].value_or(true);
+  }
+
+  bool FileManagerSettings::setRecentActivityEnabled(bool enabled) {
+    return save({{{"files", "recent_activity_enabled"}, literal(enabled)}});
+  }
+
+  bool FileManagerSettings::showRecentSidebar() const {
+    return m_preferences["files"]["show_recent_sidebar"].value_or(true);
+  }
+
+  bool FileManagerSettings::setShowRecentSidebar(bool show) {
+    return save({{{"files", "show_recent_sidebar"}, literal(show)}});
+  }
+
+  bool FileManagerSettings::showFrequentLocations() const {
+    return m_preferences["files"]["show_frequent_locations"].value_or(true);
+  }
+
+  bool FileManagerSettings::setShowFrequentLocations(bool show) {
+    return save({{{"files", "show_frequent_locations"}, literal(show)}});
+  }
+
+  int FileManagerSettings::frequentLocationsCount() const {
+    return static_cast<int>(
+        std::clamp<std::int64_t>(m_preferences["files"]["frequent_locations_count"].value_or(std::int64_t{5}), 1, 20)
+    );
+  }
+
+  bool FileManagerSettings::setFrequentLocationsCount(int count) {
+    if (count < 1 || count > 20) {
+      m_lastSaveError = "Frequent locations count must be between 1 and 20";
+      return false;
+    }
+    return save({{{"files", "frequent_locations_count"}, literal(static_cast<std::int64_t>(count))}});
+  }
+
+  RecentRetention FileManagerSettings::recentRetention() const {
+    const auto value = m_preferences["files"]["recent_retention"].value_or<std::string_view>("30d");
+    if (value == "7d")
+      return RecentRetention::Days7;
+    if (value == "90d")
+      return RecentRetention::Days90;
+    if (value == "indefinite")
+      return RecentRetention::Indefinite;
+    return RecentRetention::Days30;
+  }
+
+  bool FileManagerSettings::setRecentRetention(RecentRetention retention) {
+    const std::string_view key = retention == RecentRetention::Days7 ? "7d"
+        : retention == RecentRetention::Days90                       ? "90d"
+        : retention == RecentRetention::Indefinite                   ? "indefinite"
+                                                                     : "30d";
+    return save({{{"files", "recent_retention"}, literal(std::string(key))}});
+  }
+
+  // Stage 2: Runtime state persistence
+
+  fs::path FileManagerSettings::stateDir() const {
+    if (!m_state.path().empty())
+      return m_state.path().parent_path();
+    const auto dir = FileUtils::applicationStateDir(FileUtils::Application::Files);
+    return dir.empty() ? fs::path{} : fs::path(dir);
+  }
+
+  bool FileManagerSettings::updateRuntimeState(const std::function<bool()>& update) {
+    const RuntimeFileLock lock(m_state.path());
+    if (!lock)
+      return false;
+    m_state.loadReadOnly();
+    return m_state.parseError().empty() && update();
+  }
+
+  std::optional<WindowGeometryState> FileManagerSettings::loadMainWindowGeometry() const {
+    const auto size = loadWindowSize("main_window_size", 560, 380);
+    if (!size)
+      return std::nullopt;
+    return WindowGeometryState{
+        .width = size->first,
+        .height = size->second,
+        .maximized = m_state.boolValue(kOwner, "main_window_maximized").value_or(false),
+    };
+  }
+
+  bool FileManagerSettings::saveMainWindowGeometry(const WindowGeometryState& geometry) {
+    return updateRuntimeState([&] {
+      const auto size = std::format("{}x{}", geometry.width, geometry.height);
+      return m_state.setString(kOwner, "main_window_size", size)
+          && m_state.setBool(kOwner, "main_window_maximized", geometry.maximized);
+    });
+  }
+
+  std::optional<fs::path> FileManagerSettings::loadLastVisitedLocation() const {
+    const auto stored = m_state.stringValue(kOwner, "last_visited_location");
+    if (!stored || stored->empty())
+      return std::nullopt;
+    fs::path p(*stored);
+    return p.is_absolute() ? std::optional(p) : std::nullopt;
+  }
+
+  bool FileManagerSettings::saveLastVisitedLocation(const fs::path& path) {
+    if (path.empty() || !path.is_absolute())
+      return false;
+    return updateRuntimeState([&] { return m_state.setString(kOwner, "last_visited_location", path.string()); });
+  }
+
+  SavedTabsState FileManagerSettings::loadLastWindowTabs() const {
+    SavedTabsState result;
+    const auto stored = m_state.stringValue(kOwner, "last_window_tabs");
+    if (!stored || stored->empty())
+      return result;
+    try {
+      const auto root = nlohmann::json::parse(*stored);
+      if (!root.is_object())
+        return result;
+      if (const auto it = root.find("paths"); it != root.end() && it->is_array()) {
+        for (const auto& entry : *it) {
+          if (!entry.is_string())
+            continue;
+          const fs::path p(entry.get<std::string>());
+          if (p.is_absolute())
+            result.paths.push_back(p);
+        }
+      }
+      result.activeIndex = root.value("active", std::size_t{0});
+      if (!result.paths.empty() && result.activeIndex >= result.paths.size())
+        result.activeIndex = 0;
+    } catch (const std::exception&) {
+    }
+    return result;
+  }
+
+  bool FileManagerSettings::saveLastWindowTabs(const SavedTabsState& tabs) {
+    try {
+      nlohmann::json pathsJson = nlohmann::json::array();
+      for (const auto& p : tabs.paths) {
+        if (!p.empty() && p.is_absolute())
+          pathsJson.push_back(p.string());
+      }
+      const nlohmann::json root = {
+          {"paths", std::move(pathsJson)},
+          {"active", tabs.activeIndex},
+      };
+      return updateRuntimeState([&] { return m_state.setString(kOwner, "last_window_tabs", root.dump()); });
+    } catch (const std::exception&) {
+      return false;
+    }
   }
 } // namespace filemanager

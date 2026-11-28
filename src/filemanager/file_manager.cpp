@@ -20,13 +20,20 @@
 #include "filemanager/file_transfer_payload.h"
 #include "filemanager/file_view_menu.h"
 #include "filemanager/folder_size.h"
+#include "filemanager/path_autocomplete.h"
 #include "filemanager/permanent_delete_prompt.h"
 #include "filemanager/property_operations.h"
 #include "filemanager/startup_path.h"
 #include "i18n/i18n_service.h"
+#include "render/animation/motion_service.h"
+#include "render/animation/surface_haze.h"
 #include "render/core/renderer.h"
 #include "render/render_target.h"
 #include "render/scene/input_area.h"
+#include "system/icon_resolver.h"
+#include "theme/builtin_palettes.h"
+#include "theme/fixed_palette.h"
+#include "theme/fixed_palette_json.h"
 #include "ui/builders.h"
 #include "ui/controls/box.h"
 #include "ui/controls/button.h"
@@ -397,6 +404,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
           },
       .onActiveTabChanged =
           [this](filemanager::BrowserTab& active, const filemanager::TabViewState&) {
+            recordLocationVisit(active);
             applyActiveView();
             m_statusMessage = active.lastStatusMessage;
             m_statusMessageTimer.stop();
@@ -498,13 +506,24 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
             }
           },
       .onActiveAfterNavigatePathSet =
-          [this](filemanager::BrowserTab&, const std::filesystem::path& path, bool) {
+          [this](filemanager::BrowserTab& active, const std::filesystem::path& path, bool) {
             if (m_locationInput != nullptr)
               m_locationInput->setValue(path.string());
             rebuildBreadcrumbs();
             updateNavigationControls();
             updateWindowTitle();
             m_tabBar.markDirty();
+            recordLocationVisit(active);
+            if (m_settings.addressBarMode() == filemanager::AddressBarMode::FullPath && !m_editingLocation) {
+              if (m_locationInput != nullptr) {
+                m_locationInput->setVisible(true);
+                m_locationInput->setParticipatesInLayout(true);
+              }
+              if (m_breadcrumbBar != nullptr) {
+                m_breadcrumbBar->setVisible(false);
+                m_breadcrumbBar->setParticipatesInLayout(false);
+              }
+            }
           },
       .onActiveEnumerateStarted =
           [this](filemanager::BrowserTab&, const std::filesystem::path& path, bool) {
@@ -605,11 +624,26 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
           [this](const std::filesystem::path& path) { m_places.invalidateMountCapacitiesForPath(path); },
       .onResolvePathAsync = [this](const std::filesystem::path& path) { m_pathCache.resolveAsync(path); },
       .archivePassword = m_modalDialog.makeArchivePasswordResolver(),
+      .recentItems =
+          [this] {
+            if (!m_settings.recentActivityEnabled())
+              return std::vector<filemanager::RecentActivityItem>{};
+            (void)m_recentActivity.load();
+            return m_recentActivity.recentItems();
+          },
   };
 }
 
 FileManager::FileManager(std::string initialPath)
-    : m_operations([this](const FileOperationManager::Operation& operation) {
+    : FileManager(
+          StartupOptions{
+              .explicitPath = initialPath.empty() ? std::nullopt : std::optional<std::filesystem::path>(initialPath),
+              .forceNewWindow = true,
+          }
+      ) {}
+
+FileManager::FileManager(StartupOptions options)
+    : m_startupOptions(std::move(options)), m_operations([this](const FileOperationManager::Operation& operation) {
         if (operation.adminOrigin) {
           const auto& origin = *operation.adminOrigin;
           auto* tab = m_tabs.findTab(origin.tabId);
@@ -796,10 +830,7 @@ FileManager::FileManager(std::string initialPath)
         syncProgressWindow();
       }),
       m_adapter(std::make_unique<Adapter>(*this)),
-      m_tabs(
-          initialPath.empty() ? std::filesystem::current_path() : std::filesystem::path(initialPath),
-          loadInitialTabViewState(m_settings), makeTabManagerCallbacks()
-      ),
+      m_tabs(initialWindowLocation(), loadInitialTabViewState(m_settings), makeTabManagerCallbacks()),
       m_menus(
           m_wayland, m_renderContext, m_menuAnimations, m_dispatcher, m_settings, m_operations, m_tabs, m_listHeader,
           m_places, m_checksumDialog, m_helpDialog, m_protectedFiles, m_launcher, m_clipboard, m_transfer,
@@ -870,6 +901,7 @@ FileManager::FileManager(std::string initialPath)
                                         const std::filesystem::path& path, bool activate
                                     ) { (void)openFolderInNewTab(path, activate); },
               .openQuickLook = [this] { (void)openQuickLook(); },
+              .openPreferences = [this] { openPreferences(); },
               .setPreviewMode = [this](filemanager::PreviewMode mode) { setPreviewMode(mode); },
               .setThumbnailPolicy = [this](filemanager::ThumbnailPolicy policy) { setThumbnailPolicy(policy); },
               .inspectThumbnailCache = [this](bool clear) { inspectThumbnailCache(clear); },
@@ -958,6 +990,10 @@ FileManager::FileManager(std::string initialPath)
               .fileDropTabAt = [this](float x, float y) { return m_tabBar.fileDropTabAt(x, y); },
           }
       ) {
+  if (const auto stateDir = m_settings.stateDir(); !stateDir.empty())
+    m_recentActivity.setStoragePath(stateDir / "recent_activity.json");
+  m_recentActivity.setRetention(m_settings.recentRetention());
+  (void)m_recentActivity.load();
   m_menus.loadInitialPreference();
   m_alwaysShowTabBar = m_settings.alwaysShowTabBar();
   m_openTabsInBackground = m_settings.openTabsInBackground();
@@ -1388,7 +1424,7 @@ int FileManager::run() {
   m_configService.addReloadCallback(
       [this] {
         Input::setReadlineShortcutsEnabled(m_settings.readlineShortcuts());
-        m_themeService.apply();
+        applyThemeAndAppearance();
         IconResolver::invalidateThemeContent();
         if (m_grid)
           m_grid->notifyDataChanged();
@@ -1397,6 +1433,8 @@ int FileManager::run() {
         updateAdminHeaderUi();
         m_modalDialog.updateTheme();
         m_customSearches.updateTheme();
+        if (m_settingsWindow)
+          m_settingsWindow->updateTheme();
         if (m_surface)
           m_surface->requestLayout();
         if (m_modalDialog.isOpen())
@@ -1407,7 +1445,10 @@ int FileManager::run() {
   );
   m_settings.setReloadCallback([this](const toml::table& previous) { applyFilesPreferences(previous); });
   applyThumbnailLimits();
-  m_themeService.apply();
+  m_themeService.setResolvedCallback([this](const nythera::theme::GeneratedPalette& generated, std::string_view) {
+    applyFilesPalette(generated);
+  });
+  applyThemeAndAppearance();
   m_wayland.setNativeDataTransfer(&m_transfer);
   m_wayland.setTextInputService(&m_textInputService);
   m_wayland.setKeyboardFocusCallback([this](wl_surface* /*surface*/, bool entered) {
@@ -1426,6 +1467,7 @@ int FileManager::run() {
     throw std::runtime_error("Wayland compositor, shm, and xdg-shell are required");
   m_sharedContext.initialize(m_wayland.display());
   m_renderContext.initialize(m_sharedContext);
+  m_renderContext.setTextFontFamily(m_settings.effectiveFontFamily());
   m_renderContext.setTextBaseDirection(i18n::Service::instance().rtl());
   TooltipManager::instance().initialize(m_wayland, &m_configService, &m_renderContext);
   TooltipManager::instance().setFreshHoverPolicy([this] {
@@ -1466,18 +1508,26 @@ int FileManager::run() {
   m_surface = std::make_unique<ToplevelSurface>(m_wayland);
   m_surface->setRenderContext(&m_renderContext);
   m_surface->setAnimationManager(&m_menuAnimations);
+  m_surface->setCloseRequestCallback([this] { return handleWindowCloseRequest(); });
+  m_surface->setHazeProfile("windows");
   m_surface->setClosedCallback([this] {
+    saveWindowSessionState();
+    m_instanceRetryTimer.stop();
+    m_instanceCoordinator.stop();
     m_customSearches.forceCloseImmediate();
     if (m_modalDialog.isOpen())
       m_modalDialog.forceCloseImmediate();
     m_windowOpen = false;
-    m_tabs.shutdownAll();
+    if (!m_operations.active())
+      m_tabs.shutdownAll();
     if (m_destinationPicker) {
       m_destinationPicker->closeFileDialogWithoutResult();
       FileDialog::cancelIfPending();
     }
     if (m_propertiesWindow)
       m_propertiesWindow->close();
+    if (m_settingsWindow)
+      m_settingsWindow->close();
     cancelFileGesture();
     TooltipManager::instance().forceDestroy();
     m_places.cancelCapacityQueries();
@@ -1508,6 +1558,7 @@ int FileManager::run() {
           self->m_tabBar.detachUi();
           self->m_transfers.detachUi();
           self->m_root.reset();
+          self->syncProgressWindow();
           self->m_appBar = nullptr;
           self->m_windowMoveArea = nullptr;
           self->m_windowResizeAreas.fill(nullptr);
@@ -1533,15 +1584,18 @@ int FileManager::run() {
   m_surface->setPrepareFrameCallback([this](bool update, bool layout) { prepareFrame(update, layout); });
   m_windowTitle =
       filemanager::windowTitleForPath(activeSession().path(), g_get_home_dir(), activeTab().hasActiveAdminSession());
+  const auto geometry = (m_settings.rememberWindowGeometry() ? m_settings.loadMainWindowGeometry() : std::nullopt)
+                            .value_or(filemanager::WindowGeometryState{});
   ToplevelSurfaceConfig config{
-      .width = 1120,
-      .height = 760,
+      .width = geometry.width,
+      .height = geometry.height,
       .minWidth = 560,
       .minHeight = 380,
       .maxWidth = 0,
       .maxHeight = 0,
       .title = m_windowTitle,
-      .appId = "dev.nythera.FileManager"
+      .appId = "dev.nythera.FileManager",
+      .maximized = geometry.maximized,
   };
   wl_output* output = m_wayland.outputs().empty() ? nullptr : m_wayland.outputs().front().output;
   if (!m_surface->initialize(output, config))
@@ -1558,7 +1612,9 @@ int FileManager::run() {
   m_pickerHosts.registerHost(
       [this](wl_surface* surface) -> std::optional<LayerPopupParentContext> {
         auto* parent = m_surface.get();
-        if (activeModalDialog().ownsSurface(surface))
+        if (m_settingsWindow && m_settingsWindow->wlSurface() == surface)
+          parent = m_settingsWindow->surface();
+        else if (activeModalDialog().ownsSurface(surface))
           parent = activeModalDialog().surface();
         if (!parent || surface != parent->wlSurface())
           return std::nullopt;
@@ -1590,6 +1646,8 @@ int FileManager::run() {
       return;
     if (m_propertiesWindow && m_propertiesWindow->isOpen() && m_propertiesWindow->ownsSurface(event.surface))
       m_propertiesWindow->handlePointer(event);
+    else if (m_settingsWindow && m_settingsWindow->isOpen() && m_settingsWindow->ownsSurface(event.surface))
+      (void)m_settingsWindow->handlePointer(event);
     else
       handlePointer(event);
   });
@@ -1613,6 +1671,10 @@ int FileManager::run() {
         && m_propertiesWindow->ownsSurface(m_wayland.lastKeyboardSurface())
     )
       m_propertiesWindow->handleKeyboard(event);
+    else if (
+        m_settingsWindow && m_settingsWindow->isOpen() && m_settingsWindow->ownsSurface(m_wayland.lastKeyboardSurface())
+    )
+      m_settingsWindow->handleKeyboard(event);
     else if (m_modalDialog.isOpen()) {
       // While a nested editor is open, the management surface stays visible but modal.
       if (!m_customSearches.isChildOpen())
@@ -1628,7 +1690,26 @@ int FileManager::run() {
     if (m_transfers.isDraggingFiles() && m_surface)
       m_surface->requestUpdate();
   });
+  restoreWindowTabs();
   navigate(activeSession().path(), false);
+  if (!m_recentActivity.storagePath().empty()) {
+    (void)m_settingsFileWatcher.watch(
+        m_recentActivity.storagePath(),
+        [this] {
+          if (m_windowOpen && m_settings.recentActivityEnabled() && activeSession().browsingRecent())
+            enumerate(activeSession().path());
+        },
+        FileWatcher::WatchTrigger::WriteCompleted
+    );
+  }
+  startInstanceCoordinator();
+  if (!m_instanceCoordinator.listening() && !filemanager::InstanceCoordinator::defaultSocketPath().empty()) {
+    m_instanceRetryTimer.startRepeating(std::chrono::seconds(1), [this] {
+      startInstanceCoordinator();
+      if (m_instanceCoordinator.listening())
+        m_instanceRetryTimer.stop();
+    });
+  }
   m_settings.setProblemCallback(filemanager::notifyInvalidConfiguration);
   m_settings.setManualReloadCallback(filemanager::notifyConfigurationReloaded);
   TimerPollSource timers;
@@ -1636,8 +1717,15 @@ int FileManager::run() {
   MainLoop loop(
       m_wayland,
       [this, &timers, &keyRepeat] {
-        return std::vector<PollSource*>{&m_gioPollSource, &m_configPollSource, &m_settings, &m_pickerThumbnails,
-                                        &timers,          &keyRepeat,          &m_transfer};
+        return std::vector<PollSource*>{&m_gioPollSource,
+                                        &m_configPollSource,
+                                        &m_settings,
+                                        &m_pickerThumbnails,
+                                        &timers,
+                                        &keyRepeat,
+                                        &m_transfer,
+                                        &m_instanceCoordinator,
+                                        &m_settingsFileWatchSource};
       },
       [this] { return !m_running && !m_transfer.ownsSelection() && !m_transfer.busy(); },
       [this] {
@@ -1937,6 +2025,43 @@ void FileManager::createNewItem(int id) {
     m_createRequests[opId] = CreateRequest{tab.id, session.navigationGeneration(), *destination};
 }
 
+void FileManager::openPreferences() {
+  if (!m_settingsWindow) {
+    m_settingsWindow = std::make_unique<filemanager::SettingsWindow>(
+        m_wayland, m_renderContext, m_configService, m_settings,
+        filemanager::SettingsWindow::Callbacks{
+            .onPreferencesChanged = [this](const toml::table& previous) { applyFilesPreferences(previous); },
+            .onSearchSettingsChanged =
+                [this](const filemanager::SearchSettings& previous) { refreshSearchSettings(previous); },
+            .onManageCustomSearches = [this] { m_customSearches.manageCustomSearches(); },
+            .onEditCustomSearch = [this](
+                                      std::optional<filemanager::CustomSearch> profile
+                                  ) { m_customSearches.editCustomSearch(std::move(profile)); },
+            .onInspectThumbnailCache = [this](auto onResult) { inspectThumbnailCache(false, std::move(onResult)); },
+            .onClearThumbnailCache = [this] { inspectThumbnailCache(true); },
+            .onExportTheme =
+                [this](const auto& path, std::string& error) {
+                  return nythera::theme::writePaletteFile(path, m_filesDarkPalette, m_filesLightPalette, &error);
+                },
+            .onPickColor = [this](
+                               std::string title, Color color, std::function<void(Color)> apply
+                           ) { showPreferenceColorPicker(std::move(title), color, std::move(apply)); },
+            .onClearRecentHistory =
+                [this] {
+                  if (!m_recentActivity.update([](auto& store) { return store.clearHistory(); }))
+                    return false;
+                  m_places.markDirty();
+                  if (activeSession().browsingRecent())
+                    enumerate(activeSession().path());
+                  return true;
+                },
+        }
+    );
+  }
+  if (!m_settingsWindow->open(m_surface.get()))
+    setStatus("Could not open Preferences window");
+}
+
 void FileManager::openProperties(const std::filesystem::path& path) {
   if (activeSession().browsingArchive()) {
     showArchiveMemberProperties(path);
@@ -1978,8 +2103,52 @@ void FileManager::applyFilesPreferences(const toml::table& previous) {
   }
   if (changed("readline_shortcuts"))
     Input::setReadlineShortcutsEnabled(m_settings.readlineShortcuts());
-  if (previous["theme"]["transparency_mode"] != current["theme"]["transparency_mode"])
+  if (previous["theme"] != current["theme"]
+      || changed("font_family")
+      || changed("icon_theme")
+      || changed("animations_enabled")
+      || changed("animation_speed")
+      || changed("haze_enabled")
+      || changed("branding_mode")) {
+    applyThemeAndAppearance();
+    m_places.markDirty();
+    m_tabBar.updateTheme();
+    updateAdminHeaderUi();
     m_modalDialog.updateTheme();
+    if (m_settingsWindow)
+      m_settingsWindow->updateTheme();
+    if (m_grid)
+      m_grid->notifyDataChanged();
+    if (m_surface)
+      m_surface->requestLayout();
+  }
+  if (changed("address_bar_mode") && !m_editingLocation && m_locationInput)
+    setLocationEditMode(false, true);
+  if (changed("recent_retention"))
+    m_recentActivity.setRetention(m_settings.recentRetention());
+  if (activeSession().browsingRecent() && (changed("recent_activity_enabled") || changed("recent_retention")))
+    enumerate(activeSession().path());
+  if (changed("show_places_personal")
+      || changed("show_places_devices")
+      || changed("show_places_network")
+      || changed("show_places_capacity")
+      || changed("recent_activity_enabled")
+      || changed("show_recent_sidebar")
+      || changed("show_frequent_locations")
+      || changed("recent_retention")) {
+    m_places.markDirty(true);
+    if (m_surface)
+      m_surface->requestLayout();
+  }
+  if (changed("admin_inactivity_timeout_seconds")) {
+    const int timeoutSeconds = m_settings.adminInactivityTimeoutSeconds();
+    for (const auto& tab : m_tabs.tabs()) {
+      if (!tab->adminSession.hasCustomTimeoutForTesting())
+        tab->adminSession.setInactivityTimeoutMs(static_cast<std::uint32_t>(timeoutSeconds) * 1000U);
+    }
+  }
+  if (m_settingsWindow)
+    m_settingsWindow->onPreferencesReloaded();
   if (changed("show_menu_bar")) {
     m_menus.loadInitialPreference();
     m_menus.syncResponsiveMenuBar(m_lastHeaderWidth);
@@ -2127,7 +2296,10 @@ void FileManager::launchNewWindow(const std::filesystem::path& path) {
   }
   const std::string executableText = executable.string();
   const std::string pathText = path.string();
-  gchar* argv[] = {const_cast<gchar*>(executableText.c_str()), const_cast<gchar*>(pathText.c_str()), nullptr};
+  gchar* argv[] = {
+      const_cast<gchar*>(executableText.c_str()), const_cast<gchar*>("--new-window"),
+      const_cast<gchar*>(pathText.c_str()), nullptr
+  };
   GError* error = nullptr;
   if (!g_spawn_async(nullptr, argv, nullptr, G_SPAWN_SEARCH_PATH, nullptr, nullptr, nullptr, &error)) {
     setStatus(error ? error->message : "Could not open a new window");
@@ -2214,7 +2386,13 @@ void FileManager::activatePath(const std::filesystem::path& path) {
   g_autoptr(GFile) file = session.browsingTrash()
       ? g_file_new_for_uri(session.trashUris().at(entry.absPath.string()).c_str())
       : g_file_new_for_path(entry.absPath.c_str());
-  m_launcher.launchFileUri(tab.id, file);
+  std::function<void()> onSuccess;
+  if (m_settings.recentActivityEnabled()
+      && !session.browsingTrash()
+      && !tab.hasActiveAdminSession()
+      && !tab.administratorBrowsing)
+    onSuccess = [this, path] { recordFileOpen(path); };
+  m_launcher.launchFileUri(tab.id, file, {}, std::move(onSuccess));
 }
 
 void FileManager::setStatus(std::string text) {
@@ -2409,12 +2587,14 @@ std::unique_ptr<Flex> FileManager::buildHeaderAppBar() {
   appName->setAlign(FlexAlign::Center);
   appName->setGap(9.0F); // The display font's space advance is 360/1000 em at 25 px.
   auto appNameNythera = std::make_unique<Label>();
+  m_appBrandNythera = appNameNythera.get();
   appNameNythera->setText("NYTHERA");
   appNameNythera->setFontSize(25.0F);
   appNameNythera->setDirectDisplayFont(true);
   appNameNythera->setColor(colorSpecFromRole(ColorRole::OnSurface));
   appName->addChild(std::move(appNameNythera));
   auto appNameFiles = std::make_unique<Label>();
+  m_appBrandFiles = appNameFiles.get();
   appNameFiles->setText("FILES");
   appNameFiles->setFontSize(25.0F);
   appNameFiles->setDirectDisplayFont(true);
@@ -2517,17 +2697,23 @@ void FileManager::updateAdminHeaderUi(int headerWidth) {
   // At narrow header widths, prioritise the administrator status and Finish control over branding.
   const bool compactNarrowAdmin = adminActive && m_lastHeaderWidth < 760;
 
-  if (m_appBrandContainer != nullptr) {
-    m_appBrandContainer->setVisible(!compactNarrowAdmin);
-    m_appBrandContainer->setParticipatesInLayout(!compactNarrowAdmin);
+  const auto branding = m_settings.brandingMode();
+  const bool showBrand = !compactNarrowAdmin && branding != filemanager::BrandingMode::Off;
+  const bool showWordmark = showBrand && branding == filemanager::BrandingMode::Full;
+  if (m_appBrandContainer) {
+    m_appBrandContainer->setVisible(showBrand);
+    m_appBrandContainer->setParticipatesInLayout(showBrand);
+    m_appBrandNythera->setText(showWordmark ? "NYTHERA" : "N");
+    m_appBrandFiles->setVisible(showWordmark);
+    m_appBrandFiles->setParticipatesInLayout(showWordmark);
   }
   if (m_adminHeaderContainer != nullptr) {
     m_adminHeaderContainer->setVisible(adminActive);
     m_adminHeaderContainer->setParticipatesInLayout(adminActive);
   }
   if (m_adminHeaderSeparator != nullptr) {
-    m_adminHeaderSeparator->setVisible(adminActive && !compactNarrowAdmin);
-    m_adminHeaderSeparator->setParticipatesInLayout(adminActive && !compactNarrowAdmin);
+    m_adminHeaderSeparator->setVisible(adminActive && showBrand);
+    m_adminHeaderSeparator->setParticipatesInLayout(adminActive && showBrand);
     m_adminHeaderSeparator->setFill(colorSpecFromRole(filemanager::kAdminWarningColorRole));
   }
   if (m_adminHeaderShield != nullptr)
@@ -2787,6 +2973,7 @@ void FileManager::updateNavigationControls() {
     m_upButton->setEnabled(
         session.path().has_parent_path()
         && session.path().parent_path() != session.path()
+        && !session.browsingRecent()
         && (!session.browsingTrash() || session.path() != std::filesystem::path("trash:/"))
     );
   m_places.updateActiveHighlight(session.path(), session.browsingTrash());
@@ -2906,17 +3093,20 @@ void FileManager::rebuildBreadcrumbs() {
 void FileManager::setLocationEditMode(bool editing, bool preserveOutsideClickFocus) {
   ++m_locationEditGeneration;
   m_editingLocation = editing;
+  if (!editing)
+    closeLocationAutocomplete();
+  const bool showPath = editing || m_settings.addressBarMode() == filemanager::AddressBarMode::FullPath;
   m_wayland.stopKeyRepeat();
   m_selection.clearTypeahead();
   if (m_locationInput != nullptr) {
-    m_locationInput->setVisible(editing);
-    m_locationInput->setParticipatesInLayout(editing);
+    m_locationInput->setVisible(showPath);
+    m_locationInput->setParticipatesInLayout(showPath);
     if (!editing)
       m_locationInput->setValue(activeSession().path().string());
   }
   if (m_breadcrumbBar != nullptr) {
-    m_breadcrumbBar->setVisible(!editing);
-    m_breadcrumbBar->setParticipatesInLayout(!editing);
+    m_breadcrumbBar->setVisible(!showPath);
+    m_breadcrumbBar->setParticipatesInLayout(!showPath);
   }
   if (editing && m_locationInput != nullptr) {
     m_locationInput->setValue(activeSession().path().string());
@@ -3043,6 +3233,7 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_root->setGap(kPaneGap);
     m_root->setPadding(kWindowPadding);
     m_root->setFill(colorSpecFromRole(ColorRole::SurfaceContainerLow, kFilesWindowOpacity));
+    m_root->setSurfaceBackground();
     m_root->setBorder(
         colorSpecFromRole(
             ColorRole::OutlineVariant, 0.72F /* palette-alpha-exception: This rim is part of the approved Files window
@@ -3134,10 +3325,12 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
     m_locationInput->setOnCopyText([this](std::string text) {
       writeDesktopClipboard(std::move(text), "text/plain;charset=utf-8");
     });
-    m_locationInput->setVisible(false);
-    m_locationInput->setParticipatesInLayout(false);
+    const bool fullPath = m_settings.addressBarMode() == filemanager::AddressBarMode::FullPath;
+    m_locationInput->setVisible(fullPath);
+    m_locationInput->setParticipatesInLayout(fullPath);
+    m_locationInput->setOnFocusGain([this] { m_editingLocation = true; });
     m_locationInput->setOnSubmit([this](const std::string& value) {
-      navigate(value);
+      navigate(filemanager::expandHomePath(value, g_get_home_dir()));
       setLocationEditMode(false);
     });
     m_locationInput->setOnFocusLoss([this] { deferCancelLocationEdit(); });
@@ -3339,7 +3532,7 @@ void FileManager::requestQuit(ToplevelSurface* parent) {
   if (!m_operations.active()) {
     m_quitting = true;
     if (m_surface && m_windowOpen)
-      ToplevelSurface::handleToplevelClose(m_surface.get(), nullptr);
+      performWindowClose();
     if (m_clipboard.pendingClipboardReads() == 0)
       m_running = false;
     return;
@@ -3361,7 +3554,7 @@ void FileManager::requestQuit(ToplevelSurface* parent) {
             m_operations.cancel(operation.id);
         m_quitting = true;
         if (m_surface && m_windowOpen)
-          ToplevelSurface::handleToplevelClose(m_surface.get(), nullptr);
+          performWindowClose();
         if (!m_operations.active() && m_clipboard.pendingClipboardReads() == 0)
           m_running = false;
       },
@@ -3490,6 +3683,26 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
     TooltipManager::instance().forceDestroy();
   if (m_menus.handlePointer(event))
     return;
+  if (m_surface
+      && event.surface == m_surface->wlSurface()
+      && event.type == PointerEvent::Type::Button
+      && event.button == BTN_RIGHT
+      && event.pressed
+      && !m_modalDialog.isOpen()) {
+    for (Button* button : {m_backButton, m_forwardButton}) {
+      if (!button)
+        continue;
+      float x = 0.0F, y = 0.0F;
+      Node::absolutePosition(button, x, y);
+      if (!filemanager::pointerOutsideRect(
+              static_cast<float>(event.sx), static_cast<float>(event.sy), x, y, button->width(), button->height()
+          )) {
+        m_lastInputSerial = event.serial;
+        openHistoryMenu(button == m_forwardButton, static_cast<float>(event.sx), static_cast<float>(event.sy));
+        return;
+      }
+    }
+  }
   if (event.type == PointerEvent::Type::Button && event.pressed)
     m_lastInputSerial = event.serial;
   if (m_modalDialog.isOpen()) {
@@ -3946,6 +4159,8 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
   }
 
   if (inLocationEdit) {
+    if (mods == 0U && KeySymbol::isTab(event.sym) && acceptLocationAutocompleteTab())
+      return;
     if ((mods == KeyMod::Ctrl && (event.sym == XKB_KEY_l || event.sym == XKB_KEY_L))
         || (mods == KeyMod::Alt && (event.sym == XKB_KEY_d || event.sym == XKB_KEY_D))) {
       if (!event.repeat)
@@ -4046,6 +4261,11 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
   if (mods == KeyMod::Ctrl && (event.sym == XKB_KEY_n || event.sym == XKB_KEY_N)) {
     if (!event.repeat)
       activateContextMenuEntry(ContextMenuControlEntry{.id = filemanager::menu_id::kFileNewWindow});
+    return;
+  }
+  if (!inInlineRename && mods == KeyMod::Ctrl && event.sym == XKB_KEY_comma) {
+    if (!event.repeat)
+      openPreferences();
     return;
   }
   if ((mods == KeyMod::Ctrl && (event.sym == XKB_KEY_l || event.sym == XKB_KEY_L))
@@ -4302,12 +4522,14 @@ std::filesystem::path FileManager::defaultTabPath() {
   }
 }
 
-filemanager::TabId FileManager::openNewTab() { return m_tabs.openTab(defaultTabPath(), activeTab().viewState, true); }
+filemanager::TabId FileManager::openNewTab() {
+  return openFolderInNewTab(resolveNewTabPath(), !m_openTabsInBackground);
+}
 
 filemanager::TabId FileManager::openFolderInNewTab(const std::filesystem::path& path, bool activate) {
   if (path.empty())
     return filemanager::kInvalidTabId;
-  return m_tabs.openTab(path, activeTab().viewState, activate);
+  return m_tabs.openTab(path, activeTab().viewState, activate, newTabInsertIndex());
 }
 
 filemanager::TabId FileManager::duplicateTab(filemanager::TabId tabId) { return m_tabs.duplicateTab(tabId); }
@@ -4357,9 +4579,8 @@ void FileManager::activatePointerMiddleItem(std::size_t index) {
   const auto& entry = entries[index];
   if (!entry.isDir || session.browsingTrash())
     return;
-  if (session.browsingArchive()) {
-    m_tabs.openTab({session.path(), entry.absPath.native()}, activeTab().viewState, false);
-    return;
-  }
-  openFolderInNewTab(entry.absPath, false);
+  openFolderWithMiddleClick(
+      session.browsingArchive() ? filemanager::BrowserLocation(session.path(), entry.absPath.native())
+                                : filemanager::BrowserLocation(entry.absPath)
+  );
 }

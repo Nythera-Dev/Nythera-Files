@@ -108,6 +108,7 @@ _nythera_files_sources = files(
   'src/filemanager/file_manager.cpp',
   'src/filemanager/file_manager_preview.cpp',
   'src/filemanager/file_manager_archive.cpp',
+  'src/filemanager/file_manager_preferences.cpp',
   'src/filemanager/file_manager_preview_pane.cpp',
   'src/filemanager/file_manager_quick_look.cpp',
   'src/filemanager/file_manager_settings.cpp',
@@ -140,6 +141,9 @@ _nythera_files_sources = files(
   'src/filemanager/file_selection_controller.cpp',
   'src/filemanager/file_transfer_controller.cpp',
   'src/filemanager/path_resolution_cache.cpp',
+  'src/filemanager/path_autocomplete.cpp',
+  'src/filemanager/instance_coordinator.cpp',
+  'src/filemanager/recent_activity_store.cpp',
   'src/filemanager/places_sidebar.cpp',
   'src/filemanager/protected_file_manager.cpp',
   'src/filemanager/dialogs/progress_window.cpp',
@@ -150,6 +154,15 @@ _nythera_files_sources = files(
   'src/filemanager/dialogs/help_dialog.cpp',
   'src/filemanager/file_transfer_payload.cpp',
   'src/filemanager/properties_window.cpp',
+  'src/filemanager/settings/settings_page_advanced.cpp',
+  'src/filemanager/settings/settings_page_appearance.cpp',
+  'src/filemanager/settings/settings_page_files_folders.cpp',
+  'src/filemanager/settings/settings_page_general.cpp',
+  'src/filemanager/settings/settings_page_integrations.cpp',
+  'src/filemanager/settings/settings_page_navigation.cpp',
+  'src/filemanager/settings/settings_page_search.cpp',
+  'src/filemanager/settings/settings_page_shortcuts.cpp',
+  'src/filemanager/settings/settings_window.cpp',
   'src/filemanager/polkit_helper_launch.cpp',
   'src/filemanager/admin_protocol.cpp',
   'src/filemanager/admin_helper_session.cpp',
@@ -481,6 +494,18 @@ if build_tests
     override_options: ['b_ndebug=false'],
   )
   test('file_manager_settings', file_manager_settings_test_exe, timeout: 10)
+
+  file_manager_settings_window_test_exe = executable('file_manager_settings_window_test',
+    sources: files('tests/file_manager_settings_window_test.cpp'), dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('file_manager_settings_window', file_manager_settings_window_test_exe, timeout: 15)
+
+  stage2_settings_behaviour_test_exe = executable('stage2_settings_behaviour_test',
+    sources: files('tests/stage2_settings_behaviour_test.cpp'), dependencies: nythera_files_test_dep,
+    override_options: ['b_ndebug=false'],
+  )
+  test('stage2_settings_behaviour', stage2_settings_behaviour_test_exe, timeout: 20)
 
   file_manager_sort_test_exe = executable('file_manager_sort_test',
     sources: files('tests/file_manager_sort_test.cpp'), dependencies: nythera_files_test_dep,

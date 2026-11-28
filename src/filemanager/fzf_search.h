@@ -17,6 +17,7 @@ namespace filemanager {
                                                                      "None"};
 
   [[nodiscard]] SearchMode searchModeFromConfig(std::string_view value);
+  [[nodiscard]] std::string_view searchModeToConfig(SearchMode mode) noexcept;
   [[nodiscard]] std::optional<SearchMode> manualSearchMode(std::string_view query);
   [[nodiscard]] std::string findFzf();
 

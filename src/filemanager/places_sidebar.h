@@ -3,6 +3,7 @@
 #include "filemanager/file_manager_settings.h"
 #include "filemanager/path_resolution_cache.h"
 #include "filemanager/places_model.h"
+#include "filemanager/recent_activity_store.h"
 #include "ui/controls/context_menu_popup.h"
 
 #include <chrono>
@@ -60,7 +61,14 @@ namespace filemanager {
       std::function<void(const PointerEvent&, float x, float y)> onPointerAxis;
       std::function<void()> onClearDropPlace;
       std::function<void(const std::filesystem::path& mountPath)> onMountRemoved;
-      std::function<void(const Place& place)> onOpenPlaceInBackgroundTab;
+      std::function<void(const Place& place)> onMiddleClickPlace;
+      std::function<bool()> isBrowsingRecent;
+      std::function<std::vector<LocationActivityRecord>()> frequentLocations;
+      std::function<void(const std::filesystem::path& path, bool pin)> onTogglePinFrequentLocation;
+      std::function<void(std::vector<ContextMenuControlEntry>, float, float, std::function<void(int)>)>
+          onShowFrequentMenu;
+      std::function<void(const std::filesystem::path& path)> onRemoveFrequentLocation;
+      std::function<void(const std::filesystem::path& path)> onExcludeFrequentLocation;
     };
 
     PlacesSidebarController(
@@ -115,6 +123,7 @@ namespace filemanager {
     [[nodiscard]] ScrollView* scrollView() const noexcept { return m_scroll; }
 
   private:
+    std::unique_ptr<Flex> buildRecentRow(const Place& place);
     friend class ::FileManagerTestAccess;
 
     struct PlaceCapacityView {

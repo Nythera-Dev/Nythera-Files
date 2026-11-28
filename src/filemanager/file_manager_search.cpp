@@ -129,6 +129,8 @@ void FileManager::selectSearchScope(filemanager::SearchSelection selection) {
 }
 
 void FileManager::refreshSearchSettings(const filemanager::SearchSettings& previous) {
+  if (m_settingsWindow)
+    m_settingsWindow->onPreferencesReloaded();
   const auto& settings = m_settings.searchSettings();
   const bool exclusionsChanged = previous.exclusions != settings.exclusions;
   const bool standardChanged = previous.standardOptions != settings.standardOptions;

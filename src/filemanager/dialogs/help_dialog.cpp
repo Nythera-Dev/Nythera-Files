@@ -39,6 +39,7 @@ namespace filemanager {
         HelpDialogController::ShortcutEntry{"Stop Active Search or Close Search", "Esc"},
         HelpDialogController::ShortcutEntry{"Move Selection Up", "Up"},
         HelpDialogController::ShortcutEntry{"Move Selection Down", "Down"},
+        HelpDialogController::ShortcutEntry{"Preferences", "Ctrl+,"},
         HelpDialogController::ShortcutEntry{"Quit", "Ctrl+Q"},
     };
 

@@ -276,6 +276,26 @@ int main() {
     filemanager::orderPlaces(entries, order);
     TEST_CHECK(entries[0].identity == "pinned" && entries[2].identity == "documents");
 
+    std::vector<filemanager::Place> personalWithRecent{
+        {.label = "Recent", .identity = "personal:recent", .path = "recent:/", .personal = true},
+        {.label = "Home", .identity = "home", .personal = true},
+        {.label = "Pinned", .identity = "saved:fixture", .personal = true},
+        {.label = "Device", .identity = "device"},
+    };
+    const auto recentOrder = filemanager::reorderedPlaces(personalWithRecent, {}, "personal:recent", "end:Personal");
+    filemanager::orderPlaces(personalWithRecent, recentOrder);
+    TEST_CHECK(personalWithRecent[2].identity == "personal:recent");
+    TEST_CHECK(
+        filemanager::reorderedPlaces(personalWithRecent, recentOrder, "personal:recent", "device") == recentOrder
+    );
+    auto recent = personalWithRecent[2];
+    personalWithRecent.erase(personalWithRecent.begin() + 2);
+    const auto whileHidden = filemanager::reorderedPlaces(personalWithRecent, recentOrder, "saved:fixture", "home");
+    personalWithRecent.insert(personalWithRecent.begin(), std::move(recent));
+    filemanager::orderPlaces(personalWithRecent, whileHidden);
+    TEST_CHECK(personalWithRecent[0].identity == "saved:fixture");
+    TEST_CHECK(personalWithRecent[2].identity == "personal:recent");
+
     // F-10: Scoped RAII operation guard does not block independent PlacesModel instances
     // and never gets stuck when a completion callback throws or re-enters.
     {

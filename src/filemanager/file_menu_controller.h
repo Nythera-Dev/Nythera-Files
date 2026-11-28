@@ -85,6 +85,7 @@ namespace filemanager {
       std::function<TabId()> contextMenuTabId;
       std::function<void(const std::filesystem::path&, bool activate)> openFolderInNewTab;
       std::function<void()> openQuickLook;
+      std::function<void()> openPreferences;
       std::function<void(PreviewMode)> setPreviewMode;
       std::function<void(ThumbnailPolicy)> setThumbnailPolicy;
       std::function<void(bool clear)> inspectThumbnailCache;
@@ -147,7 +148,10 @@ namespace filemanager {
     bool openApplicationMenuFromKeyboard(std::size_t menuIndex = 0);
     void openContextMenu(std::size_t index, float x, float y, bool highlightOnOpen = false);
     void openEmptyContextMenu(float x, float y, bool highlightOnOpen = false);
-    void showPlacesMenu(std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false);
+    void showPlacesMenu(
+        std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false,
+        std::function<void(int)> activate = {}
+    );
     [[nodiscard]] std::vector<ContextMenuControlEntry> columnVisibilityEntries() const;
     void
     openColumnHeaderMenu(std::vector<ContextMenuControlEntry> entries, float x, float y, bool highlightOnOpen = false);

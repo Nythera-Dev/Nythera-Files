@@ -188,6 +188,13 @@ namespace filemanager {
     return found == keys.end() ? SearchMode::Contiguous : static_cast<SearchMode>(found - keys.begin());
   }
 
+  std::string_view searchModeToConfig(SearchMode mode) noexcept {
+    constexpr std::array<std::string_view, 7> keys{"contiguous", "fuzzy", "starts_with", "ends_with",
+                                                   "exclude",    "exact", "none"};
+    const auto index = static_cast<std::size_t>(mode);
+    return index < keys.size() ? keys[index] : "contiguous";
+  }
+
   std::optional<SearchMode> manualSearchMode(std::string_view query) {
     std::optional<SearchMode> mode;
     std::size_t terms = 0;

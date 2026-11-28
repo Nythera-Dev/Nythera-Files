@@ -1,8 +1,11 @@
 #include "config/config_service.h"
+#include "config/files_config_validator.h"
 #include "core/deferred_call.h"
 #include "core/timer_manager.h"
 #include "filemanager/file_manager_settings.h"
+#include "filemanager/settings/settings_category.h"
 #include "net/http_client.h"
+#include "render/core/color.h"
 #include "test_isolation.h"
 #include "theme/builtin_palettes.h"
 #include "theme/custom_palettes.h"
@@ -172,14 +175,13 @@ namespace {
     TEST_CHECK(settings.saveFileView(next, previous));
     TEST_CHECK(read(external).contains("# shared include") && read(external).contains("# user's view"));
     TEST_CHECK(fs::is_symlink(included));
-    TEST_CHECK(toml::parse_file(external.string())["files"]["show_hidden"].value<bool>() == false);
+    TEST_CHECK(!settings.hasPreferenceKey({"files", "show_hidden"}));
+    TEST_CHECK(!toml::parse_file(external.string())["files"]["show_hidden"]);
+    TEST_CHECK(!toml::parse_file(secondary.string())["files"]["show_hidden"]);
     TEST_CHECK(settings.setAlwaysShowTabBar(true));
     TEST_CHECK(toml::parse_file(external.string())["files"]["always_show_tab_bar"].value<bool>() == true);
     drain(settings);
     TEST_CHECK(reloads == 0);
-    TEST_CHECK(settings.reset({"files", "show_hidden"}));
-    TEST_CHECK(!toml::parse_file(external.string())["files"]["show_hidden"]);
-    TEST_CHECK(!toml::parse_file(secondary.string())["files"]["show_hidden"]);
     TEST_CHECK(settings.saveSavedPlaces({}));
     TEST_CHECK(!toml::parse_file(external.string())["files"]["saved_places"]["my.folder"]);
     TEST_CHECK(!toml::parse_file(secondary.string())["files"]["saved_places"]["my.folder"]);
@@ -191,6 +193,7 @@ namespace {
     fs::rename(edited, external);
     TEST_CHECK(dispatch(settings));
     TEST_CHECK(reloads == 1 && settings.loadFileView().showHidden && !settings.alwaysShowTabBar());
+    TEST_CHECK(!settings.hasPreferenceKey({"files", "always_show_tab_bar"}));
 
     write(external, "[files]\nshow_hidden = [\n");
     TEST_CHECK(dispatch(settings));
@@ -252,6 +255,343 @@ namespace {
     TEST_CHECK(settings.reload());
     TEST_CHECK(!settings.setAlwaysShowTabBar(true));
     TEST_CHECK(!fs::exists(root / "config.toml"));
+  }
+
+  void stage2PreferenceRoundTrips() {
+    using namespace filemanager;
+    using nythera::config::ConfigKeyPath;
+    const nythera::test::ScopedTestEnv env({.prefix = "files-stage2-roundtrip"});
+    const auto root = env.config() / "nythera/files";
+    TEST_CHECK(fs::create_directories(root));
+    const auto config = root / "config.toml";
+    write(config, "# Files preferences\n");
+    ConfigService shell(ConfigService::SettingsAccess::InheritanceOnly);
+    FileManagerSettings settings(shell);
+    FileManagerSettings reopened(shell);
+
+    std::vector<ConfigKeyPath> tested;
+    const auto roundTrip = [&](const ConfigKeyPath& path, auto set, auto get, const auto& value) {
+      tested.push_back(path);
+      const auto defaults = (settings.*get)();
+      TEST_CHECK((settings.*set)(value));
+      TEST_CHECK(settings.hasPreferenceKey(path));
+      TEST_CHECK(reopened.reload());
+      TEST_CHECK((reopened.*get)() == value);
+      TEST_CHECK((settings.*set)(defaults));
+      TEST_CHECK(!settings.hasPreferenceKey(path));
+      TEST_CHECK(reopened.reload());
+      TEST_CHECK((reopened.*get)() == defaults);
+      TEST_CHECK(!reopened.hasPreferenceKey(path));
+      TEST_CHECK(!reopened.preferences()[path[0]][path[1]]);
+    };
+    const auto boolean = [&](std::string key, auto set, auto get) {
+      roundTrip({"files", std::move(key)}, set, get, !(settings.*get)());
+    };
+    boolean("restore_tabs", &FileManagerSettings::setRestoreTabs, &FileManagerSettings::restoreTabs);
+    boolean(
+        "remember_window_geometry", &FileManagerSettings::setRememberWindowGeometry,
+        &FileManagerSettings::rememberWindowGeometry
+    );
+    boolean(
+        "confirm_close_multiple_tabs", &FileManagerSettings::setConfirmCloseMultipleTabs,
+        &FileManagerSettings::confirmCloseMultipleTabs
+    );
+    boolean(
+        "confirm_close_active_operations", &FileManagerSettings::setConfirmCloseActiveOperations,
+        &FileManagerSettings::confirmCloseActiveOperations
+    );
+    boolean(
+        "show_places_personal", &FileManagerSettings::setShowPlacesPersonal, &FileManagerSettings::showPlacesPersonal
+    );
+    boolean("show_places_devices", &FileManagerSettings::setShowPlacesDevices, &FileManagerSettings::showPlacesDevices);
+    boolean("show_places_network", &FileManagerSettings::setShowPlacesNetwork, &FileManagerSettings::showPlacesNetwork);
+    boolean(
+        "show_places_capacity", &FileManagerSettings::setShowPlacesCapacity, &FileManagerSettings::showPlacesCapacity
+    );
+    boolean(
+        "recent_activity_enabled", &FileManagerSettings::setRecentActivityEnabled,
+        &FileManagerSettings::recentActivityEnabled
+    );
+    boolean("show_recent_sidebar", &FileManagerSettings::setShowRecentSidebar, &FileManagerSettings::showRecentSidebar);
+    boolean(
+        "show_frequent_locations", &FileManagerSettings::setShowFrequentLocations,
+        &FileManagerSettings::showFrequentLocations
+    );
+
+    roundTrip(
+        {"files", "startup_location"}, &FileManagerSettings::setStartupLocation, &FileManagerSettings::startupLocation,
+        StartupLocation::Custom
+    );
+    roundTrip(
+        {"files", "startup_custom_path"}, &FileManagerSettings::setStartupCustomPath,
+        &FileManagerSettings::startupCustomPath, env.work()
+    );
+    roundTrip(
+        {"files", "external_open_mode"}, &FileManagerSettings::setExternalOpenMode,
+        &FileManagerSettings::externalOpenMode, ExternalOpenMode::NewWindow
+    );
+    roundTrip(
+        {"files", "new_tab_location"}, &FileManagerSettings::setNewTabLocation, &FileManagerSettings::newTabLocation,
+        NewTabLocation::Custom
+    );
+    roundTrip(
+        {"files", "new_tab_custom_path"}, &FileManagerSettings::setNewTabCustomPath,
+        &FileManagerSettings::newTabCustomPath, env.work()
+    );
+    roundTrip(
+        {"files", "new_tab_position"}, &FileManagerSettings::setNewTabPosition, &FileManagerSettings::newTabPosition,
+        NewTabPosition::AfterCurrent
+    );
+    roundTrip(
+        {"files", "middle_click_folder"}, &FileManagerSettings::setMiddleClickFolder,
+        &FileManagerSettings::middleClickFolder, MiddleClickFolderAction::ForegroundTab
+    );
+    roundTrip(
+        {"files", "click_activation"}, &FileManagerSettings::setClickActivation, &FileManagerSettings::clickActivation,
+        ClickActivation::Single
+    );
+    roundTrip(
+        {"files", "address_bar_mode"}, &FileManagerSettings::setAddressBarMode, &FileManagerSettings::addressBarMode,
+        AddressBarMode::FullPath
+    );
+    roundTrip(
+        {"files", "frequent_locations_count"}, &FileManagerSettings::setFrequentLocationsCount,
+        &FileManagerSettings::frequentLocationsCount, 15
+    );
+    roundTrip(
+        {"files", "recent_retention"}, &FileManagerSettings::setRecentRetention, &FileManagerSettings::recentRetention,
+        RecentRetention::Days7
+    );
+    roundTrip(
+        {"files", "branding_mode"}, &FileManagerSettings::setBrandingMode, &FileManagerSettings::brandingMode,
+        BrandingMode::Compact
+    );
+    roundTrip(
+        {"theme", "inherit_shell"}, &FileManagerSettings::setInheritShellTheme, &FileManagerSettings::inheritShellTheme,
+        false
+    );
+    roundTrip(
+        {"theme", "theme_file"}, &FileManagerSettings::setThemeFile, &FileManagerSettings::themeFile,
+        env.work() / "palette.json"
+    );
+    roundTrip(
+        {"theme", "transparency_mode"}, &FileManagerSettings::setTransparencyMode,
+        &FileManagerSettings::transparencyModeOverride, std::optional{PanelTransparencyMode::Soft}
+    );
+    roundTrip(
+        {"files", "font_family"}, &FileManagerSettings::setFontFamilyOverride, &FileManagerSettings::fontFamilyOverride,
+        std::optional<std::string>{"Sans"}
+    );
+    roundTrip(
+        {"files", "icon_theme"}, &FileManagerSettings::setIconThemeOverride, &FileManagerSettings::iconThemeOverride,
+        std::optional<std::string>{"Example icons"}
+    );
+    roundTrip(
+        {"files", "readline_shortcuts"}, &FileManagerSettings::setReadlineShortcuts,
+        &FileManagerSettings::readlineShortcutsOverride, std::optional{settings.readlineShortcuts()}
+    );
+    roundTrip(
+        {"files", "animations_enabled"}, &FileManagerSettings::setAnimationsEnabledOverride,
+        &FileManagerSettings::animationsEnabledOverride, std::optional{settings.effectiveAnimationsEnabled()}
+    );
+    roundTrip(
+        {"files", "animation_speed"}, &FileManagerSettings::setAnimationSpeedOverride,
+        &FileManagerSettings::animationSpeedOverride, std::optional{1.25F}
+    );
+    roundTrip(
+        {"files", "haze_enabled"}, &FileManagerSettings::setHazeEnabledOverride,
+        &FileManagerSettings::hazeEnabledOverride, std::optional{settings.effectiveHazeEnabled()}
+    );
+
+    boolean(
+        "show_menu_bar", &FileManagerSettings::setShowApplicationMenuBar, &FileManagerSettings::showApplicationMenuBar
+    );
+    boolean("always_show_tab_bar", &FileManagerSettings::setAlwaysShowTabBar, &FileManagerSettings::alwaysShowTabBar);
+    boolean(
+        "open_tabs_in_background", &FileManagerSettings::setOpenTabsInBackground,
+        &FileManagerSettings::openTabsInBackground
+    );
+    boolean("fzf_search", &FileManagerSettings::setFzfSearchEnabled, &FileManagerSettings::fzfSearchEnabled);
+    boolean(
+        "avoid_redundant_extraction_folders", &FileManagerSettings::setAvoidRedundantExtractionFolders,
+        &FileManagerSettings::avoidRedundantExtractionFolders
+    );
+    roundTrip(
+        {"files", "preview_mode"}, &FileManagerSettings::setPreviewMode, &FileManagerSettings::previewMode,
+        PreviewMode::Information
+    );
+    roundTrip(
+        {"files", "thumbnail_policy"}, &FileManagerSettings::setThumbnailPolicy, &FileManagerSettings::thumbnailPolicy,
+        ThumbnailPolicy::Never
+    );
+    roundTrip(
+        {"files", "thumbnail_max_file_mib"}, &FileManagerSettings::setThumbnailMaxFileMiB,
+        &FileManagerSettings::thumbnailMaxFileMiB, 32
+    );
+    roundTrip(
+        {"files", "thumbnail_cache_mib"}, &FileManagerSettings::setThumbnailCacheMiB,
+        &FileManagerSettings::thumbnailCacheMiB, 512
+    );
+    roundTrip(
+        {"files", "admin_inactivity_timeout_seconds"}, &FileManagerSettings::setAdminInactivityTimeoutSeconds,
+        &FileManagerSettings::adminInactivityTimeoutSeconds, 1200
+    );
+    roundTrip(
+        {"files", "search_default_mode"}, &FileManagerSettings::setSearchDefaultMode,
+        &FileManagerSettings::searchDefaultMode, SearchMode::Fuzzy
+    );
+
+    const auto checkReset = [&](ConfigKeyPath path) {
+      tested.push_back(path);
+      TEST_CHECK(reopened.hasPreferenceKey(path));
+      TEST_CHECK(settings.reset(path));
+      TEST_CHECK(reopened.reload());
+      TEST_CHECK(!reopened.preferences()[path[0]][path[1]]);
+    };
+    const auto viewRoundTrip = [&](std::string key, bool search, auto member, auto value) {
+      const auto previous = settings.loadFileView(search);
+      auto next = previous;
+      next.*member = value;
+      TEST_CHECK(settings.saveFileView(next, previous, search));
+      TEST_CHECK(reopened.reload());
+      TEST_CHECK(reopened.loadFileView(search).*member == value);
+      checkReset({"files", std::move(key)});
+      TEST_CHECK(reopened.loadFileView(search).*member == previous.*member);
+    };
+    for (bool search : {false, true}) {
+      viewRoundTrip(search ? "search_grid_view" : "grid_view", search, &FileViewSettings::gridMode, true);
+      viewRoundTrip(
+          search ? "search_sort_field" : "sort_field", search, &FileViewSettings::sortField, FileDialogSortField::Size
+      );
+      viewRoundTrip(
+          search ? "search_sort_descending" : "sort_descending", search, &FileViewSettings::sortOrder,
+          FileDialogSortOrder::Descending
+      );
+      TEST_CHECK(settings.saveViewScale(1.2F, search));
+      TEST_CHECK(reopened.reload());
+      TEST_CHECK(reopened.loadViewScale(1.F, search) == 1.2F);
+      checkReset({"files", search ? "search_view_scale" : "view_scale"});
+      TEST_CHECK(reopened.loadViewScale(1.F, search) == 1.F);
+
+      auto layout = search ? kDefaultSearchColumnLayout : FileColumnLayout{};
+      layout.visible[columnIndex(FileColumn::Size)] = false;
+      TEST_CHECK(settings.saveListColumnLayout(layout, search));
+      TEST_CHECK(reopened.reload());
+      FileColumnLayout restored;
+      reopened.loadListColumnLayout(restored, search);
+      TEST_CHECK(restored.visible == layout.visible && restored.order == layout.order);
+      checkReset({"files", search ? "search_column_layout" : "list_column_layout"});
+
+      FileColumns widths;
+      widths[FileColumn::Size] = 120;
+      TEST_CHECK(settings.saveListColumnWidths(widths, search));
+      TEST_CHECK(reopened.reload());
+      FileColumns restoredWidths;
+      reopened.loadListColumnWidths(restoredWidths, search);
+      TEST_CHECK(restoredWidths.widths == widths.widths);
+      checkReset({"files", search ? "search_column_widths" : "list_column_widths"});
+    }
+    viewRoundTrip("show_hidden", false, &FileViewSettings::showHidden, true);
+    viewRoundTrip("folders_first", false, &FileViewSettings::foldersFirst, false);
+    viewRoundTrip("hidden_last", false, &FileViewSettings::hiddenLast, false);
+    const auto primary = rgba(0.25F, 0.F, 1.F, 1.F);
+    TEST_CHECK(settings.setThemeColorOverride(ColorRole::Primary, primary));
+    TEST_CHECK(reopened.reload());
+    TEST_CHECK(reopened.themeColorOverride(ColorRole::Primary).has_value());
+    TEST_CHECK(formatRgbaHex(*reopened.themeColorOverride(ColorRole::Primary)) == formatRgbaHex(primary));
+    checkReset({"theme", "colors"});
+
+    for (const auto& path : allResettablePreferenceKeys())
+      TEST_CHECK(std::ranges::contains(tested, path));
+
+    TEST_CHECK(settings.setConfirmCloseMultipleTabs(false));
+    const auto valid = read(config);
+    TEST_CHECK(valid.contains("# Files preferences"));
+    TEST_CHECK(!settings.setStartupCustomPath("relative/path"));
+    TEST_CHECK(!settings.setFrequentLocationsCount(21));
+    TEST_CHECK(read(config) == valid);
+    write(config, "[files]\nconfirm_close_multiple_tabs = 'false'\n");
+    TEST_CHECK(!settings.reload());
+    TEST_CHECK(!settings.confirmCloseMultipleTabs());
+  }
+
+  void shellObservesValidatedPreferenceWrites() {
+    using namespace nythera::config;
+    using filemanager::SettingsCategory;
+    const nythera::test::ScopedTestEnv env({.prefix = "files-observed-preferences"});
+    const auto dir = env.config() / "nythera/files";
+    TEST_CHECK(fs::create_directories(dir));
+    const auto primary = dir / "config.toml";
+    const auto target = env.work() / "shared.toml";
+    const auto link = dir / "included";
+    fs::create_symlink(target, link);
+    const std::string initial = "# Preserve this include\n[include]\nfiles = ['included']\n";
+    write(primary, initial);
+    write(target, "# Preserve shared preferences\n[files]\nplace_order = ['personal:recent']\n");
+
+    // The pre-Stage 2 Shell observer rejected these keys, including the saved
+    // search widths, even though Files validated the whole edit.
+    const auto legacyValidator = [](const SourcedMergeResult& loaded) -> std::optional<ConfigurationProblem> {
+      for (const auto key :
+           {"avoid_redundant_extraction_folders", "confirm_close_multiple_tabs", "restore_tabs",
+            "search_column_widths"}) {
+        if (loaded.config.merged["files"][key])
+          return ConfigurationProblem{{}, std::format("Invalid Files setting 'files.{}'", key)};
+      }
+      return validateFilesConfiguration(loaded);
+    };
+    ApplicationConfigMonitor stale({.appId = "files", .configDir = dir, .validator = legacyValidator});
+    int staleProblems = 0;
+    stale.setProblemCallback([&](const auto&, const auto&) { ++staleProblems; });
+    ApplicationConfigMonitor observer({
+        .appId = "files",
+        .configDir = dir,
+        .validator = [&](const SourcedMergeResult& loaded) {
+          auto result = legacyValidator(loaded);
+          if (result && matchesValidatedApplicationConfigWrite("files", dir, loaded))
+            result.reset();
+          return result;
+        },
+    });
+    int problems = 0;
+    observer.setProblemCallback([&](const auto&, const auto&) { ++problems; });
+
+    ConfigService shell(ConfigService::SettingsAccess::InheritanceOnly);
+    FileManagerSettings settings(shell);
+    FileManagerSettings reopened(shell);
+    TEST_CHECK(settings.setConfirmCloseMultipleTabs(false));
+    TEST_CHECK(settings.setAvoidRedundantExtractionFolders(false));
+    TEST_CHECK(!stale.reload(false) && staleProblems == 1);
+    TEST_CHECK(observer.reload(false) && problems == 0);
+    TEST_CHECK(settings.setAvoidRedundantExtractionFolders(true));
+    TEST_CHECK(settings.saveListColumnWidths(filemanager::FileColumns{}, true));
+    TEST_CHECK(settings.setRestoreTabs(true));
+    TEST_CHECK(reopened.reload());
+    TEST_CHECK(reopened.restoreTabs() && !reopened.confirmCloseMultipleTabs());
+    TEST_CHECK(reopened.avoidRedundantExtractionFolders());
+    TEST_CHECK(observer.reload(false) && problems == 0);
+    TEST_CHECK(reopened.preferences()["files"]["search_column_widths"].is_string());
+    TEST_CHECK(!reopened.preferences()["files"]["avoid_redundant_extraction_folders"]);
+
+    TEST_CHECK(settings.resetKeys(filemanager::categoryResettableKeys(SettingsCategory::General)));
+    TEST_CHECK(observer.reload(false) && problems == 0);
+    TEST_CHECK(reopened.reload());
+    TEST_CHECK(!reopened.restoreTabs() && reopened.confirmCloseMultipleTabs());
+    TEST_CHECK(reopened.preferences()["files"]["search_column_widths"]);
+    TEST_CHECK(settings.resetKeys(filemanager::allResettablePreferenceKeys()));
+    TEST_CHECK(observer.reload(false) && problems == 0);
+    TEST_CHECK(reopened.reload());
+    TEST_CHECK(!reopened.preferences()["files"]["search_column_widths"]);
+    TEST_CHECK(reopened.loadPlaceOrder() == std::vector<std::string>{"personal:recent"});
+    TEST_CHECK(read(primary) == initial && fs::is_symlink(link));
+    const auto valid = read(target);
+    TEST_CHECK(valid.contains("# Preserve shared preferences"));
+
+    // An unrelated edit, even immediately after a valid transaction, must
+    // invalidate the attestation for the merged configuration.
+    write(target, "[files]\nrestore_tabs = 'true'\n");
+    TEST_CHECK(!observer.reload(false) && problems == 1);
+    TEST_CHECK(!settings.reload() && !settings.restoreTabs());
   }
 
   void searchSettingsPersistence() {
@@ -409,6 +749,8 @@ int main() {
     separationAndInheritance();
     includesAndLiveUpdates();
     validatesWholeCandidate();
+    stage2PreferenceRoundTrips();
+    shellObservesValidatedPreferenceWrites();
     searchSettingsPersistence();
     sharedThemeInheritanceAndStandaloneFallback();
   });

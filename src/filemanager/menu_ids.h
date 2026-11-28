@@ -95,6 +95,7 @@ namespace filemanager::menu_id {
   inline constexpr int kFileProperties = 30006;
   inline constexpr int kQuit = 30007;
   inline constexpr int kShowMenuBar = 30008;
+  inline constexpr int kPreferences = 30009;
 
   inline constexpr int kNewTab = 30010;
   inline constexpr int kReopenClosedTab = 30011;

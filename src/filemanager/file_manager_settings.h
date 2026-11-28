@@ -7,20 +7,25 @@
 #include "core/files/directory_scanner.h"
 #include "filemanager/configuration_notice.h"
 #include "filemanager/file_columns.h"
+#include "filemanager/fzf_search.h"
 #include "filemanager/preview/preview_options.h"
 #include "filemanager/search_scope.h"
 
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 class ConfigService;
+enum class ColorRole : std::uint8_t;
 enum class PanelTransparencyMode : std::uint8_t;
+struct Color;
 
 namespace filemanager {
 
@@ -44,6 +49,27 @@ namespace filemanager {
     std::vector<CustomSearch> profiles;
     SearchOptions standardOptions;
     bool operator==(const SearchSettings&) const = default;
+  };
+
+  enum class StartupLocation : std::uint8_t { Home, Last, Custom };
+  enum class ExternalOpenMode : std::uint8_t { NewTab, NewWindow };
+  enum class BrandingMode : std::uint8_t { Full, Compact, Off };
+  enum class NewTabLocation : std::uint8_t { Current, Home, Custom, Startup };
+  enum class NewTabPosition : std::uint8_t { End, AfterCurrent };
+  enum class MiddleClickFolderAction : std::uint8_t { BackgroundTab, ForegroundTab, NewWindow, None };
+  enum class ClickActivation : std::uint8_t { Double, Single };
+  enum class AddressBarMode : std::uint8_t { Breadcrumbs, FullPath };
+  enum class RecentRetention : std::uint8_t { Days7, Days30, Days90, Indefinite };
+
+  struct WindowGeometryState {
+    std::uint32_t width = 1120;
+    std::uint32_t height = 760;
+    bool maximized = false;
+  };
+
+  struct SavedTabsState {
+    std::vector<std::filesystem::path> paths;
+    std::size_t activeIndex = 0;
   };
 
   class FileManagerSettings final : public PollSource {
@@ -70,8 +96,21 @@ namespace filemanager {
       m_onSearchReload = std::move(callback);
     }
     [[nodiscard]] bool readlineShortcuts() const;
+    [[nodiscard]] std::optional<bool> readlineShortcutsOverride() const;
+    [[nodiscard]] bool setReadlineShortcuts(std::optional<bool> enabled);
     [[nodiscard]] PanelTransparencyMode transparencyMode() const;
+    [[nodiscard]] std::optional<PanelTransparencyMode> transparencyModeOverride() const;
+    [[nodiscard]] bool setTransparencyMode(std::optional<PanelTransparencyMode> mode);
+    [[nodiscard]] bool hasPreferenceKey(const nythera::config::ConfigKeyPath& path) const;
     [[nodiscard]] bool reset(const nythera::config::ConfigKeyPath& path);
+    [[nodiscard]] bool resetKeys(std::span<const nythera::config::ConfigKeyPath> paths);
+    [[nodiscard]] const std::string& lastSaveError() const noexcept { return m_lastSaveError; }
+    [[nodiscard]] const ConfigService& shellConfig() const noexcept { return m_shellConfig; }
+
+    [[nodiscard]] bool fzfSearchEnabled() const;
+    [[nodiscard]] bool setFzfSearchEnabled(bool enabled);
+    [[nodiscard]] SearchMode searchDefaultMode() const;
+    [[nodiscard]] bool setSearchDefaultMode(SearchMode mode);
 
     [[nodiscard]] FileViewSettings loadFileView(bool search = false) const;
     [[nodiscard]] bool
@@ -105,7 +144,9 @@ namespace filemanager {
     [[nodiscard]] ThumbnailPolicy thumbnailPolicy() const;
     [[nodiscard]] bool setThumbnailPolicy(ThumbnailPolicy policy);
     [[nodiscard]] int thumbnailMaxFileMiB() const;
+    [[nodiscard]] bool setThumbnailMaxFileMiB(int mib);
     [[nodiscard]] int thumbnailCacheMiB() const;
+    [[nodiscard]] bool setThumbnailCacheMiB(int mib);
     [[nodiscard]] float loadPreviewWidth() const;
     [[nodiscard]] bool savePreviewWidth(float width);
 
@@ -135,6 +176,92 @@ namespace filemanager {
     [[nodiscard]] std::optional<std::pair<std::uint32_t, std::uint32_t>> loadPropertiesSize() const;
     [[nodiscard]] bool savePropertiesSize(std::uint32_t width, std::uint32_t height);
 
+    [[nodiscard]] std::optional<std::pair<std::uint32_t, std::uint32_t>> loadSettingsWindowSize() const;
+    [[nodiscard]] bool saveSettingsWindowSize(std::uint32_t width, std::uint32_t height);
+
+    // Stage 2: General preferences
+    [[nodiscard]] StartupLocation startupLocation() const;
+    [[nodiscard]] bool setStartupLocation(StartupLocation location);
+    [[nodiscard]] std::filesystem::path startupCustomPath() const;
+    [[nodiscard]] bool setStartupCustomPath(const std::filesystem::path& path);
+    [[nodiscard]] bool restoreTabs() const;
+    [[nodiscard]] bool setRestoreTabs(bool restore);
+    [[nodiscard]] bool rememberWindowGeometry() const;
+    [[nodiscard]] bool setRememberWindowGeometry(bool remember);
+    [[nodiscard]] ExternalOpenMode externalOpenMode() const;
+    [[nodiscard]] bool setExternalOpenMode(ExternalOpenMode mode);
+    [[nodiscard]] bool confirmCloseMultipleTabs() const;
+    [[nodiscard]] bool setConfirmCloseMultipleTabs(bool confirm);
+    [[nodiscard]] bool confirmCloseActiveOperations() const;
+    [[nodiscard]] bool setConfirmCloseActiveOperations(bool confirm);
+
+    // Stage 2: Appearance preferences
+    [[nodiscard]] bool inheritShellTheme() const;
+    [[nodiscard]] bool setInheritShellTheme(bool inherit);
+    [[nodiscard]] std::filesystem::path themeFile() const;
+    [[nodiscard]] bool setThemeFile(const std::filesystem::path& path);
+    [[nodiscard]] std::map<ColorRole, Color> themeColorOverrides() const;
+    [[nodiscard]] std::optional<Color> themeColorOverride(ColorRole role) const;
+    [[nodiscard]] bool setThemeColorOverride(ColorRole role, std::optional<Color> color);
+    [[nodiscard]] bool clearAllThemeColorOverrides();
+    [[nodiscard]] std::optional<std::string> fontFamilyOverride() const;
+    [[nodiscard]] std::string effectiveFontFamily() const;
+    [[nodiscard]] bool setFontFamilyOverride(std::optional<std::string> family);
+    [[nodiscard]] std::optional<std::string> iconThemeOverride() const;
+    [[nodiscard]] bool setIconThemeOverride(std::optional<std::string> theme);
+    [[nodiscard]] std::optional<bool> animationsEnabledOverride() const;
+    [[nodiscard]] bool effectiveAnimationsEnabled() const;
+    [[nodiscard]] bool setAnimationsEnabledOverride(std::optional<bool> enabled);
+    [[nodiscard]] std::optional<float> animationSpeedOverride() const;
+    [[nodiscard]] float effectiveAnimationSpeed() const;
+    [[nodiscard]] bool setAnimationSpeedOverride(std::optional<float> speed);
+    [[nodiscard]] std::optional<bool> hazeEnabledOverride() const;
+    [[nodiscard]] bool effectiveHazeEnabled() const;
+    [[nodiscard]] bool setHazeEnabledOverride(std::optional<bool> enabled);
+    [[nodiscard]] BrandingMode brandingMode() const;
+    [[nodiscard]] bool setBrandingMode(BrandingMode mode);
+
+    // Stage 2: Navigation preferences
+    [[nodiscard]] NewTabLocation newTabLocation() const;
+    [[nodiscard]] bool setNewTabLocation(NewTabLocation location);
+    [[nodiscard]] std::filesystem::path newTabCustomPath() const;
+    [[nodiscard]] bool setNewTabCustomPath(const std::filesystem::path& path);
+    [[nodiscard]] NewTabPosition newTabPosition() const;
+    [[nodiscard]] bool setNewTabPosition(NewTabPosition position);
+    [[nodiscard]] MiddleClickFolderAction middleClickFolder() const;
+    [[nodiscard]] bool setMiddleClickFolder(MiddleClickFolderAction action);
+    [[nodiscard]] ClickActivation clickActivation() const;
+    [[nodiscard]] bool setClickActivation(ClickActivation activation);
+    [[nodiscard]] AddressBarMode addressBarMode() const;
+    [[nodiscard]] bool setAddressBarMode(AddressBarMode mode);
+    [[nodiscard]] bool showPlacesPersonal() const;
+    [[nodiscard]] bool setShowPlacesPersonal(bool show);
+    [[nodiscard]] bool showPlacesDevices() const;
+    [[nodiscard]] bool setShowPlacesDevices(bool show);
+    [[nodiscard]] bool showPlacesNetwork() const;
+    [[nodiscard]] bool setShowPlacesNetwork(bool show);
+    [[nodiscard]] bool showPlacesCapacity() const;
+    [[nodiscard]] bool setShowPlacesCapacity(bool show);
+    [[nodiscard]] bool recentActivityEnabled() const;
+    [[nodiscard]] bool setRecentActivityEnabled(bool enabled);
+    [[nodiscard]] bool showRecentSidebar() const;
+    [[nodiscard]] bool setShowRecentSidebar(bool show);
+    [[nodiscard]] bool showFrequentLocations() const;
+    [[nodiscard]] bool setShowFrequentLocations(bool show);
+    [[nodiscard]] int frequentLocationsCount() const;
+    [[nodiscard]] bool setFrequentLocationsCount(int count);
+    [[nodiscard]] RecentRetention recentRetention() const;
+    [[nodiscard]] bool setRecentRetention(RecentRetention retention);
+
+    // Stage 2: Runtime state persistence (state.toml)
+    [[nodiscard]] std::filesystem::path stateDir() const;
+    [[nodiscard]] std::optional<WindowGeometryState> loadMainWindowGeometry() const;
+    [[nodiscard]] bool saveMainWindowGeometry(const WindowGeometryState& geometry);
+    [[nodiscard]] std::optional<std::filesystem::path> loadLastVisitedLocation() const;
+    [[nodiscard]] bool saveLastVisitedLocation(const std::filesystem::path& path);
+    [[nodiscard]] SavedTabsState loadLastWindowTabs() const;
+    [[nodiscard]] bool saveLastWindowTabs(const SavedTabsState& tabs);
+
   protected:
     void doAddPollFds(std::vector<pollfd>& fds) override;
 
@@ -143,6 +270,7 @@ namespace filemanager {
     bool save(std::vector<Change> changes);
     void recordSelfWrite(const std::filesystem::path& path, std::string content);
     bool reloadSearchSettings();
+    bool updateRuntimeState(const std::function<bool()>& update);
     [[nodiscard]] std::filesystem::path searchSettingsPath() const;
     void reportProblem(ConfigurationProblem problem);
     void accept(nythera::config::SourcedMergeResult loaded, bool notify);
@@ -159,6 +287,7 @@ namespace filemanager {
     std::function<void()> m_onManualReload;
     ProblemCallback m_onProblem;
     std::optional<ConfigurationProblem> m_problem;
+    std::string m_lastSaveError;
     std::optional<nythera::config::ApplicationConfigMonitor> m_monitor;
   };
 

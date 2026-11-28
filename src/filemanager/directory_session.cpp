@@ -1,5 +1,6 @@
 #include "filemanager/directory_session.h"
 
+#include "filemanager/file_breadcrumbs.h"
 #include "filemanager/file_columns.h"
 #include "filemanager/file_entry_info.h"
 #include "filemanager/file_sort.h"
@@ -81,9 +82,13 @@ namespace filemanager {
   } // namespace
 
   DirectorySession::DirectorySession(std::filesystem::path initialPath, Callbacks callbacks)
-      : m_callbacks(std::move(callbacks)),
-        m_path(initialPath == "trash:" ? std::filesystem::path("trash:/") : std::move(initialPath)),
-        m_browsingTrash(m_path == "trash:" || m_path.string().starts_with("trash:/")) {}
+      : m_callbacks(std::move(callbacks)), m_path(
+                                               initialPath == "trash:"        ? std::filesystem::path("trash:/")
+                                                   : initialPath == "recent:" ? std::filesystem::path("recent:/")
+                                                                              : std::move(initialPath)
+                                           ),
+        m_browsingTrash(m_path == "trash:" || m_path.string().starts_with("trash:/")),
+        m_browsingRecent(isRecentTabPath(m_path)) {}
 
   DirectorySession::~DirectorySession() { shutdown(); }
 
@@ -110,14 +115,17 @@ namespace filemanager {
     std::error_code ec;
     const bool trash =
         !target.archiveDirectory && (requestedPath == "trash:" || requestedPath.string().starts_with("trash:/"));
-    if ((trash || target.archiveDirectory) && isPrivilegedBackendActive())
+    const bool recent = !target.archiveDirectory && isRecentTabPath(requestedPath);
+    if ((trash || recent || target.archiveDirectory) && isPrivilegedBackendActive())
       return;
-    auto path =
-        trash ? requestedPath.lexically_normal() : std::filesystem::absolute(requestedPath, ec).lexically_normal();
+    auto path = (trash || recent) ? requestedPath.lexically_normal()
+                                  : std::filesystem::absolute(requestedPath, ec).lexically_normal();
     if (ec)
       path = requestedPath.lexically_normal();
     if (trash && !path.string().starts_with("trash:/"))
       path = "trash:/";
+    if (recent)
+      path = "recent:/";
     const bool pathChanged = path != m_path || m_archiveDirectory != target.archiveDirectory;
     if (m_callbacks.onBeforeNavigate)
       m_callbacks.onBeforeNavigate(path, pathChanged);
@@ -141,6 +149,7 @@ namespace filemanager {
     m_path = std::move(path);
     m_revealedHiddenName = revealName.starts_with('.') ? std::string(revealName) : std::string{};
     m_browsingTrash = trash;
+    m_browsingRecent = recent;
     m_trashUris.clear();
     m_trashOriginalPaths.clear();
     if (m_callbacks.onAfterNavigatePathSet)
@@ -267,6 +276,8 @@ namespace filemanager {
   }
 
   void DirectorySession::navigateTrash() { navigate(std::filesystem::path("trash:/")); }
+
+  void DirectorySession::navigateRecent() { navigate(std::filesystem::path("recent:/")); }
 
   void DirectorySession::setActive(bool active) {
     if (m_active == active)
@@ -628,7 +639,10 @@ namespace filemanager {
     m_path = path;
     const bool userInitiated = std::exchange(m_nextEnumerateUserInitiated, false);
     const bool privileged = isPrivilegedBackendActive() && static_cast<bool>(m_privilegedBackend.enumerateDirectory);
-    if (!browsingArchive() && !m_browsingTrash && (!privileged || static_cast<bool>(m_directoryWritableQueryHook))) {
+    if (!browsingArchive()
+        && !m_browsingTrash
+        && !m_browsingRecent
+        && (!privileged || static_cast<bool>(m_directoryWritableQueryHook))) {
       queryDirectoryWritableAsync(path);
     } else {
       cancelDirectoryWritableQuery();
@@ -642,6 +656,49 @@ namespace filemanager {
     m_pendingMonitorChanges.clear();
     if (m_callbacks.onEnumerateStarted)
       m_callbacks.onEnumerateStarted(m_path, m_browsingTrash);
+
+    if (m_browsingRecent) {
+      if (m_callbacks.recentItems) {
+        const auto items = m_callbacks.recentItems();
+        for (const auto& item : items) {
+          std::error_code statusEc;
+          const auto status = std::filesystem::symlink_status(item.path, statusEc);
+          if (statusEc || !std::filesystem::exists(status))
+            continue;
+          FileEntry entry;
+          entry.absPath = item.path;
+          entry.name = item.path.filename().string();
+          if (entry.name.empty())
+            entry.name = item.path.string();
+          entry.isSymlink = std::filesystem::is_symlink(status);
+          entry.isDir = item.isDirectory || std::filesystem::is_directory(item.path, statusEc);
+          if (!entry.isDir) {
+            entry.size = std::filesystem::file_size(item.path, statusEc);
+            if (statusEc)
+              entry.size = 0;
+            g_autofree gchar* type = g_content_type_guess(entry.name.c_str(), nullptr, 0, nullptr);
+            entry.type = type != nullptr ? type : "";
+          } else {
+            entry.type = "inode/directory";
+          }
+          entry.mtime = std::filesystem::file_time_type::clock::from_sys(
+              std::chrono::sys_seconds(std::chrono::seconds(item.timestampSec))
+          );
+          m_loadingEntries.push_back(std::move(entry));
+        }
+      }
+      m_loading = false;
+      m_entries = std::move(m_loadingEntries);
+      const bool chooseFirst = m_chooseFirstAfterLoad;
+      m_chooseFirstAfterLoad = false;
+      if (m_callbacks.onEnumerateCompletedStatus)
+        m_callbacks.onEnumerateCompletedStatus(m_entries.empty());
+      if (m_callbacks.onEntriesLoaded)
+        m_callbacks.onEntriesLoaded(chooseFirst);
+      if (m_callbacks.onAfterEntriesLoaded)
+        m_callbacks.onAfterEntriesLoaded();
+      return;
+    }
 
     if (browsingArchive()) {
       enumerateArchive();

@@ -4,6 +4,7 @@
 #include "config/config_poll_source.h"
 #include "config/config_service.h"
 #include "core/files/directory_scanner.h"
+#include "core/files/file_watcher.h"
 #include "core/timer_manager.h"
 #include "cursor-shape-v1-client-protocol.h"
 #include "filemanager/checksum.h"
@@ -24,6 +25,7 @@
 #include "filemanager/file_selection_controller.h"
 #include "filemanager/file_transfer_controller.h"
 #include "filemanager/gio_poll_source.h"
+#include "filemanager/instance_coordinator.h"
 #include "filemanager/path_resolution_cache.h"
 #include "filemanager/places_model.h"
 #include "filemanager/places_sidebar.h"
@@ -31,8 +33,10 @@
 #include "filemanager/preview/thumbnail_provider.h"
 #include "filemanager/properties_window.h"
 #include "filemanager/protected_file_manager.h"
+#include "filemanager/recent_activity_store.h"
 #include "filemanager/search_bar_controller.h"
 #include "filemanager/search_thumbnails.h"
+#include "filemanager/settings/settings_window.h"
 #include "filemanager/tab_bar_controller.h"
 #include "filemanager/tab_manager.h"
 #include "net/http_client.h"
@@ -83,7 +87,13 @@ class Image;
 
 class FileManager {
 public:
+  struct StartupOptions {
+    std::optional<std::filesystem::path> explicitPath;
+    bool forceNewWindow = false;
+  };
+
   explicit FileManager(std::string initialPath);
+  explicit FileManager(StartupOptions options);
   ~FileManager();
   int run();
 
@@ -111,6 +121,26 @@ private:
   void navigateBack();
   void navigateForward();
   void navigateUp();
+  void jumpBackHistory(std::size_t steps);
+  void jumpForwardHistory(std::size_t steps);
+  void openHistoryMenu(bool forward, float x, float y);
+  [[nodiscard]] std::filesystem::path initialWindowLocation() const;
+  [[nodiscard]] std::filesystem::path resolveStartupLocationPath() const;
+  [[nodiscard]] std::filesystem::path resolveNewTabPath() const;
+  [[nodiscard]] std::optional<std::size_t> newTabInsertIndex() const;
+  [[nodiscard]] bool handleWindowCloseRequest();
+  [[nodiscard]] bool confirmCloseWithOperations();
+  void performWindowClose();
+  void saveWindowSessionState();
+  void restoreWindowTabs();
+  void startInstanceCoordinator();
+  void recordLocationVisit(filemanager::BrowserTab& tab);
+  void recordFileOpen(const std::filesystem::path& path);
+  void applyThemeAndAppearance();
+  void watchThemeFile();
+  void applyFilesPalette(const nythera::theme::GeneratedPalette& inherited);
+  void closeLocationAutocomplete();
+  bool acceptLocationAutocompleteTab();
   void openArchiveMember(const std::filesystem::path& member, bool withApplication);
   void copyArchiveMembers();
   void extractArchiveMembersTo();
@@ -175,10 +205,13 @@ private:
   void changeSelection(SelectionChange change) { m_selection.changeSelection(change); }
   void activateSelected();
   void openProperties(const std::filesystem::path& path);
+  void openPreferences();
+  void showPreferenceColorPicker(std::string title, Color initial, std::function<void(Color)> apply);
   void goToLinkTarget(const std::filesystem::path& link);
   void activatePath(const std::filesystem::path& path);
   void activatePointerItem(std::size_t index) { m_selection.activatePointerItem(index); }
   void activatePointerMiddleItem(std::size_t index);
+  void openFolderWithMiddleClick(filemanager::BrowserLocation target);
   void setStatus(std::string text);
   void updateNavigationControls();
   void updateSelectionSummary();
@@ -257,7 +290,7 @@ private:
   void setPreviewMode(filemanager::PreviewMode mode);
   void togglePreviewPane();
   void applyThumbnailLimits();
-  void inspectThumbnailCache(bool clear);
+  void inspectThumbnailCache(bool clear, std::function<void(std::string)> onResult = {});
   void setThumbnailPolicy(filemanager::ThumbnailPolicy policy);
   [[nodiscard]] bool openQuickLook();
   void attachPreviewPane(Flex& host, float dividerWidth, const ColorSpec& fill);
@@ -327,8 +360,20 @@ private:
 
   ConfigService m_configService{ConfigService::SettingsAccess::InheritanceOnly};
   filemanager::FileManagerSettings m_settings{m_configService};
+  filemanager::RecentActivityStore m_recentActivity;
+  filemanager::InstanceCoordinator m_instanceCoordinator;
+  Timer m_instanceRetryTimer;
+  std::optional<std::pair<filemanager::TabId, std::filesystem::path>> m_lastRecordedLocation;
+  bool m_showingLocationSuggestions = false;
+  StartupOptions m_startupOptions;
   HttpClient m_httpClient;
   nythera::theme::ThemeService m_themeService{m_configService, m_httpClient};
+  FileWatcher m_settingsFileWatcher;
+  FileWatchPollSource m_settingsFileWatchSource{m_settingsFileWatcher};
+  std::filesystem::path m_watchedThemeFile;
+  FileWatcher::WatchId m_themeFileWatch = 0;
+  Palette m_filesDarkPalette{};
+  Palette m_filesLightPalette{};
   ConfigPollSource m_configPollSource{m_configService};
   NativeDataTransfer m_transfer;
   std::unique_ptr<NativeTextClipboard> m_textClipboard;
@@ -356,6 +401,7 @@ private:
   std::unique_ptr<FileDialogPopup> m_destinationPicker;
   std::unique_ptr<ToplevelSurface> m_surface;
   std::unique_ptr<PropertiesWindow> m_propertiesWindow;
+  std::unique_ptr<filemanager::SettingsWindow> m_settingsWindow;
   filemanager::ProgressWindow m_progressWindow{
       m_wayland, m_renderContext, m_operations, [this](ToplevelSurface* parent) { requestQuit(parent); }
   };
@@ -563,12 +609,35 @@ private:
           .onMountRemoved = [this](
                                 const std::filesystem::path& mountPath
                             ) { m_tabs.handleMountRemoved(mountPath, defaultTabPath()); },
-          .onOpenPlaceInBackgroundTab =
+          .onMiddleClickPlace =
               [this](const filemanager::Place& place) {
                 if (place.identity == "personal:trash")
                   openFolderInNewTab(std::filesystem::path("trash:/"), false);
                 else if (place.mounted && !place.path.empty())
-                  openFolderInNewTab(place.path, false);
+                  openFolderWithMiddleClick(place.path);
+              },
+          .isBrowsingRecent = [this] { return activeSession().browsingRecent(); },
+          .frequentLocations =
+              [this] {
+                (void)m_recentActivity.load();
+                return m_recentActivity.frequentLocations(
+                    static_cast<std::size_t>(m_settings.frequentLocationsCount())
+                );
+              },
+          .onTogglePinFrequentLocation =
+              [this](const std::filesystem::path& path, bool pin) {
+                (void)m_recentActivity.update([&](auto& store) { return store.setPinned(path, pin); });
+              },
+          .onShowFrequentMenu = [this](
+                                    auto entries, float x, float y, auto activate
+                                ) { m_menus.showPlacesMenu(std::move(entries), x, y, false, std::move(activate)); },
+          .onRemoveFrequentLocation =
+              [this](const std::filesystem::path& path) {
+                (void)m_recentActivity.update([&](auto& store) { return store.removeLocation(path); });
+              },
+          .onExcludeFrequentLocation =
+              [this](const std::filesystem::path& path) {
+                (void)m_recentActivity.update([&](auto& store) { return store.excludeLocation(path); });
               },
       },
   };
@@ -643,6 +712,8 @@ private:
           .keyboardModifiers = [this] { return m_keyboardModifiers; },
           .isRenaming = [this] { return m_renamePath.has_value(); },
           .hasActiveDeviceOperations = [this] { return m_places.hasActiveDeviceOperations(); },
+          .isSingleClickActivation =
+              [this] { return m_settings.clickActivation() == filemanager::ClickActivation::Single; },
           .onUpdateSelectionSummary = [this] { updateSelectionSummary(); },
           .onAdminActivity = [this](filemanager::BrowserTab& tab) { recordAdminTabUserActivity(tab); },
           .onActivatePath = [this](const std::filesystem::path& path) { activatePath(path); },
@@ -663,6 +734,7 @@ private:
           .selectedPaths = [this]() -> const std::unordered_set<std::string>& { return activeTab().selectedPaths(); },
           .selectedPathsOrdered = [this] { return selectedPaths(); },
           .onStatus = [this](std::string text) { setStatus(std::move(text)); },
+          .onFileOpened = [this](const auto& path) { recordFileOpen(path); },
       },
   };
   filemanager::FileClipboardController m_clipboard{
@@ -736,11 +808,17 @@ private:
   std::string m_windowTitle = "Nythera Files";
   bool m_alwaysShowTabBar = false;
   bool m_openTabsInBackground = false;
+  bool m_applyingTheme = false;
   bool m_deleteConfirmation = false;
   bool m_deletePermanentConfirmation = false;
   bool m_windowOpen = true;
   bool m_quitConfirmation = false;
   bool m_quitting = false;
+  bool m_closeConfirmedBypass = false;
+  std::unique_ptr<SelectDropdownPopup> m_locationAutocompletePopup;
+  std::vector<std::string> m_locationAutocompleteItems;
+  Label* m_appBrandNythera = nullptr;
+  Label* m_appBrandFiles = nullptr;
   using ConflictDialogKind = filemanager::ConflictDialogKind;
   using ConflictItemInfo = filemanager::ConflictItemInfo;
   using ConflictDialogData = filemanager::ConflictDialogData;

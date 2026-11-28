@@ -34,6 +34,7 @@ namespace filemanager {
       std::function<const std::unordered_set<std::string>&()> selectedPaths;
       std::function<std::vector<std::string>()> selectedPathsOrdered;
       std::function<void(std::string)> onStatus;
+      std::function<void(const std::filesystem::path&)> onFileOpened;
     };
 
     FileLaunchController(
@@ -57,7 +58,7 @@ namespace filemanager {
     [[nodiscard]] std::vector<ContextMenuControlEntry> externalToolMenuRows();
     bool launchExternalTool(std::size_t index);
 
-    void launchFileUri(TabId tabId, GFile* file, std::string success = {});
+    void launchFileUri(TabId tabId, GFile* file, std::string success = {}, std::function<void()> onSuccess = {});
     void openProtectedFileWithDefault(TabId tabId, const std::filesystem::path& path);
 
     [[nodiscard]] static bool
@@ -66,6 +67,7 @@ namespace filemanager {
     [[nodiscard]] static std::vector<std::string> applicationIconNames(GAppInfo* app);
 
   private:
+    void recordLocalOpen(const BrowserTab& tab, const std::filesystem::path& path);
     void showApplicationChooser(std::string mime, const std::filesystem::path& target);
     bool launchProtectedApplication(const BrowserTab& tab, GAppInfo* app, const std::filesystem::path& path);
     [[nodiscard]] std::vector<std::string> externalToolTargets(external_tools::Tool tool) const;

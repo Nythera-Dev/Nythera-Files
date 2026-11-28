@@ -75,28 +75,14 @@ void FileManager::navigateLocation(filemanager::BrowserLocation location, bool r
     activeSession().navigateLocation(std::move(location), recordHistory);
 }
 
-void FileManager::navigateBack() {
-  auto& session = activeSession();
-  if (session.backHistory().empty())
-    return;
-  auto path = session.backHistory().back();
-  session.backHistory().pop_back();
-  session.forwardHistory().push_back(session.location());
-  navigateLocation(std::move(path), false);
-}
+void FileManager::navigateBack() { jumpBackHistory(1); }
 
-void FileManager::navigateForward() {
-  auto& session = activeSession();
-  if (session.forwardHistory().empty())
-    return;
-  auto path = session.forwardHistory().back();
-  session.forwardHistory().pop_back();
-  session.backHistory().push_back(session.location());
-  navigateLocation(std::move(path), false);
-}
+void FileManager::navigateForward() { jumpForwardHistory(1); }
 
 void FileManager::navigateUp() {
   const auto& session = activeSession();
+  if (session.browsingRecent())
+    return;
   if (session.browsingArchive() && !session.archiveDirectory()->empty()) {
     navigateLocation({session.path(), std::filesystem::path(*session.archiveDirectory()).parent_path().native()});
   } else if (

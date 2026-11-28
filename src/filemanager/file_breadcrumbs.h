@@ -10,8 +10,15 @@ namespace filemanager {
     std::filesystem::path path;
   };
 
+  [[nodiscard]] inline bool isRecentTabPath(const std::filesystem::path& path) {
+    return path == "recent:" || path == "recent:/";
+  }
+
   inline std::vector<FileBreadcrumb> fileBreadcrumbs(const std::filesystem::path& path) {
     const bool trash = path == "trash:" || path.string().starts_with("trash:/");
+    const bool recent = isRecentTabPath(path);
+    if (recent)
+      return {{"Recent", std::filesystem::path("recent:/")}};
     auto normalized = path.lexically_normal();
     std::filesystem::path current = trash ? std::filesystem::path("trash:/") : normalized.root_path();
     std::vector<FileBreadcrumb> crumbs;

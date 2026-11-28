@@ -61,6 +61,7 @@ namespace filemanager {
       std::function<void(const std::filesystem::path& path)> onInvalidateMountCapacities;
       std::function<void(const std::filesystem::path& path)> onResolvePathAsync;
       std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)> archivePassword;
+      std::function<std::vector<RecentActivityItem>()> recentItems;
     };
 
     TabManager(std::filesystem::path initialPath, TabViewState initialViewState, Callbacks callbacks);

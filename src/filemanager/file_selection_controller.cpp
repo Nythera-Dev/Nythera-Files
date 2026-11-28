@@ -309,6 +309,12 @@ namespace filemanager {
       m_lastPointerIndex.reset();
       return;
     }
+    if (m_callbacks.isSingleClickActivation && m_callbacks.isSingleClickActivation()) {
+      m_lastPointerIndex.reset();
+      if (m_callbacks.onActivatePath)
+        m_callbacks.onActivatePath(entries[index].absPath);
+      return;
+    }
     const std::uint32_t elapsed = m_pointerClickTime - m_lastPointerClickTime;
     if (m_lastPointerIndex == index && elapsed <= 500U) {
       m_lastPointerIndex.reset();

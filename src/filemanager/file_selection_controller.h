@@ -32,6 +32,7 @@ namespace filemanager {
       std::function<std::uint32_t()> keyboardModifiers;
       std::function<bool()> isRenaming;
       std::function<bool()> hasActiveDeviceOperations;
+      std::function<bool()> isSingleClickActivation;
       std::function<void()> onUpdateSelectionSummary;
       std::function<void(BrowserTab&)> onAdminActivity;
       std::function<void(const std::filesystem::path&)> onActivatePath;
