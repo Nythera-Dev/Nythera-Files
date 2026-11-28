@@ -49,6 +49,14 @@ Repository-specific guidance supplementing global agent instructions. Follow glo
 - Preserve Polkit action IDs (`data/polkit/dev.nythera.Files.*.policy.in`), helper IPC contracts, and root-ownership security checks. Do not run privileged installs (`sudo just install`, `makepkg -si`), modify host Polkit files, or mix `/usr/local/libexec/` and `/usr/lib/` helper prefixes without explicit authorisation.
 - Launch or restart `nythera-file-manager` only after successful build/applicable tests, when necessary and explicitly authorised.
 
+### Architectural guardrails
+
+- Keep `FileManager` and other coordinators focused on orchestration. Extract cohesive behaviour and its state into encapsulated controllers. Splitting member definitions across translation units leaves ownership with `FileManager`.
+- Build specialised dialogs as controllers using `ModalDialogHost::CustomContent`. Centralise menu action IDs and reuse existing shared helpers for common behaviour.
+- Keep backend operation families in dedicated implementations and keep shared execution logic with its owning family. Pass narrow operation context values across backend boundaries so backends stay independent of UI objects.
+- Keep Files-specific serialization, namespaces and UI semantics in Files. Use NytheraLib for application-agnostic infrastructure and preserve its public ABI where possible.
+- Decompose cohesive implementations only when the change demonstrably improves maintainability, correctness, testability or reuse. File size alone does not justify extraction.
+
 ## Cross-repository dependencies (NytheraLib)
 
 - `nythera-files` dynamically links `nythera-lib` (`>=0.1.0, <0.2.0`) via `pkg-config`.
