@@ -48,6 +48,13 @@ The objective is reliable software for everyday use, not absolute guarantees at 
 - Use `dev` for ordinary development; create a temporary task branch or worktree only for substantial or risky changes.
 - When authorised to commit or push "your changes", identify and stage the complete relevant session change set across implementation, tests, assets, and docs (never blindly staging the entire working tree; ask if ownership is uncertain). Verify the remote branch after pushing and report what was committed, what was pushed, and any relevant uncommitted files.
 
+#### Publishing `dev`
+
+- GitHub (`origin`) is the canonical development remote. GitGud (`gitgud`) is the publishing mirror. Keep one push destination per remote.
+- When authorised to publish, confirm both remote `dev` tips and record the approved commit SHA. Push that exact SHA explicitly with `git push origin <sha>:refs/heads/dev` and then `git push gitgud <sha>:refs/heads/dev`. For coordinated changes, publish and verify NytheraLib on both remotes before publishing its consumers.
+- Verify each remote tip independently with `git ls-remote --exit-code origin refs/heads/dev` and `git ls-remote --exit-code gitgud refs/heads/dev`. Both must match the approved SHA. If a push fails or a tip has moved, report the actual state of each remote and investigate before retrying. Preserve history and use the same commit on both remotes.
+- Keep manual acceptance testing and release approval separate from `dev` publication. The maintainer manually promotes approved NytheraLib and Nythera Files snapshots to `testing` for the existing AUR workflow. Update `main` or `testing` only with separate release authorisation.
+
 ### Baseline test isolation and data safety
 
 - All tests involving filesystem mutations or user/system services must operate exclusively on isolated, disposable fixtures—never touching live user config, home directory contents, or the live session bus.
