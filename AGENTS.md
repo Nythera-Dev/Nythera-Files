@@ -62,7 +62,7 @@ The objective is reliable software for everyday use, not absolute guarantees at 
 - **Nythera Files** is a standalone C++23 native Wayland file manager (`nythera-file-manager`) with Polkit helpers (`nythera-properties-helper`, `nythera-admin-helper`) and its own application asset bundle (`files-assets/`), built with **Meson/Ninja** and orchestrated by `just`.
 - Development primarily targets **Umbriel**. Preserve dark sci-fi/fantasy aesthetics and configurable styling rendered through **NytheraLib**.
 - Maintain strict independence from **Nythera Shell**: do not introduce build-time or mandatory runtime dependencies on `nythera-shell` sources, IPC, or Shell-owned assets (`FileManager` reads shared Shell config read-only and falls back to built-in palettes).
-- **Asset ownership and GVfs:** `files-assets/` owns Files-specific templates, dialogue artwork, and icons; shared fonts, Tabler glyph metadata, and library translations come from **NytheraLib**. Keep GVfs optional with graceful local-filesystem fallback when GVfs or individual backends are unavailable.
+- **Asset ownership and GVfs:** `files-assets/` owns Files-specific templates, dialogue artwork, and icons; shared fonts, Tabler glyph metadata, and library translations come from **NytheraLib**. Require GVfs and its AFC, DNS-SD, GPhoto2, SMB, MTP and NFS backends, UDisks2, FFmpeg, Poppler, fzf, ripgrep and ripgrep-all in Arch packaging. Keep graceful runtime fallbacks when tools or services are unavailable. Keep 7zip and ffmpegthumbnailer optional. Require Polkit itself, but remain authentication-agent agnostic; do not prescribe a specific agent.
 - Preserve Polkit action IDs (`data/polkit/dev.nythera.Files.*.policy.in`), helper IPC contracts, and root-ownership security checks. Do not run privileged installs (`sudo just install`, `makepkg -si`), modify host Polkit files, or mix `/usr/local/libexec/` and `/usr/lib/` helper prefixes without explicit authorisation.
 - Launch or restart `nythera-file-manager` only after successful build/applicable tests, when necessary and explicitly authorised.
 
@@ -101,6 +101,6 @@ The objective is reliable software for everyday use, not absolute guarantees at 
 
 ## Working with project documentation
 
-- `README.md`: standalone architecture, build/test workflow, optional GVfs behaviour, and NytheraLib relationship.
+- `README.md`: standalone architecture, build/test workflow, runtime requirements and GVfs fallback behaviour, and NytheraLib relationship.
 - `docs/FILE-MANAGER-CONFLICTS.md`, `docs/FILE-MANAGER-PLACES.md`, `docs/FILE-PROPERTIES.md`: subsystem design and behavioural invariants.
 - `../nythera-lib/README.md`: user-local NytheraLib installation and coordinated `0.1.x` rebuild discipline.

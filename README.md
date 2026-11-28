@@ -63,7 +63,7 @@ Nythera Files is already a usable file manager, rather than just a visual experi
 - Personal Places and bookmarked directories.
 - Local devices, mounted volumes and network locations.
 - Mount management and filesystem capacity information.
-- Optional GIO/GVfs integration: `gvfs` provides `trash://` Wastebin browsing, GVfs volume/remote mounting, and FUSE mount paths, while protocol backends (such as `gvfs-smb`, `gvfs-mtp`, and `gvfs-nfs`) extend remote location support. When GVfs or individual backends are unavailable, local browsing, file operations, and UDisks2/systemd mount tracking continue working gracefully.
+- GIO/GVfs integration: `gvfs` provides `trash://` Wastebin browsing, GVfs volume/remote mounting, and FUSE mount paths, while protocol backends (such as `gvfs-smb`, `gvfs-mtp`, and `gvfs-nfs`) extend remote location support. When GVfs or individual backends are unavailable, local browsing, file operations, and UDisks2/systemd mount tracking continue working gracefully.
 
 On KDE Plasma, Wastebin browsing still needs the GVfs trash backend running on the user's D-Bus session. Dolphin uses KDE's KIO backend, so opening Wastebin there does not verify GVfs. Both can read the same Freedesktop home Wastebin when they run as the same user with the same XDG data directory. The Home Wastebin fallback moves files into that storage after a failed trash operation. Browsing and emptying still use GVfs.
 
@@ -91,9 +91,9 @@ exclusions = ["/home/me/private", "/mnt/storage/staging"]
 
 Global and profile exclusions are applied before traversal. Virtual and kernel-managed filesystems such as `/proc`, `/sys`, and `/dev` are always skipped.
 
-### Optional fzf search
+### fzf search
 
-Files uses an installed `fzf` from `PATH` when it is available. The search bar offers Contains, Fuzzy, Starts with, Ends with, Exclude, Exact match and None. Contains is the default. The mode adds matching operators internally, while the search field keeps the text you entered. Explicit fzf operators override the selected mode. Compound expressions use None, which also accepts raw fzf syntax. A multi-word query without operators is treated as one phrase by the named modes.
+Files uses `fzf` from `PATH` by default. The search bar offers Contains, Fuzzy, Starts with, Ends with, Exclude, Exact match and None. Contains is the default. The mode adds matching operators internally, while the search field keeps the text you entered. Explicit fzf operators override the selected mode. Compound expressions use None, which also accepts raw fzf syntax. A multi-word query without operators is treated as one phrase by the named modes.
 
 Set these preferences in the Files `config.toml` to disable fzf or change the default mode.
 
@@ -208,6 +208,12 @@ The default `debug` mode uses `build-debug/` configured with Meson's `debugoptim
 During coordinated `0.1.x` development, always build and install `nythera-lib` before building `nythera-files`. Rebuild `nythera-files` whenever `nythera-lib` public headers, inline/template implementations, or ABI-affecting build options change, and restart running `nythera-file-manager` processes to load reinstalled `.cpp`-only library updates (see NytheraLib's `README.md`).
 
 On Arch Linux and CachyOS, see the [AUR installation and update guide](https://github.com/Nythera-Dev/NytheraLib/blob/testing/packaging/aur/README.md) for `nythera-files-git` and `nythera-lib-git`.
+
+### Runtime requirements
+
+Arch packages require `gvfs`, `gvfs-afc`, `gvfs-dnssd`, `gvfs-gphoto2`, `gvfs-smb`, `gvfs-mtp`, `gvfs-nfs`, `udisks2`, `ffmpeg`, `poppler`, `fzf`, `ripgrep` and `ripgrep-all` in addition to the core application dependencies. For manual installations, install the equivalent runtime tools and services. `7zip` and `ffmpegthumbnailer` remain optional.
+
+Privileged operations require Polkit and an active authentication agent supplied by the desktop environment or configured by the user. No specific agent is required.
 
 ### Installation conventions (development, packaged, and unprivileged)
 
