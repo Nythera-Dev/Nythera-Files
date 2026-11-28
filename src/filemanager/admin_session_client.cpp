@@ -1,16 +1,14 @@
 #include "filemanager/admin_session_client.h"
 
-#include "filemanager/admin_helper_session.h"
-
-#include "filemanager/tab_presentation.h"
-
 #include "admin_helper_paths.h"
+#include "filemanager/admin_helper_session.h"
+#include "filemanager/tab_presentation.h"
 
 #include <algorithm>
 #include <array>
-#include <condition_variable>
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -20,8 +18,8 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <thread>
-#include <unordered_map>
 #include <unistd.h>
+#include <unordered_map>
 #include <utility>
 
 namespace filemanager {
@@ -46,8 +44,7 @@ namespace filemanager {
             (*callback)();
             return G_SOURCE_REMOVE;
           },
-          heapFn,
-          [](gpointer data) { delete static_cast<std::function<void()>*>(data); }
+          heapFn, [](gpointer data) { delete static_cast<std::function<void()>*>(data); }
       );
       g_source_attach(source, g_main_context_default());
       g_source_unref(source);
@@ -77,8 +74,8 @@ namespace filemanager {
       return out;
     }
     if (!verifyRegisteredPolkitAction(kAdminHelperTarget, cancellable, out.cancelled, out.error)) {
-      out.failureReason = out.cancelled ? AdminSessionFailureReason::AuthCancelled
-                                        : AdminSessionFailureReason::ActionNotRegistered;
+      out.failureReason =
+          out.cancelled ? AdminSessionFailureReason::AuthCancelled : AdminSessionFailureReason::ActionNotRegistered;
       return out;
     }
 
@@ -225,9 +222,18 @@ namespace filemanager {
     }
 
     void signalWakeup() const noexcept {
-      if (wakeupFd >= 0) {
-        const std::uint64_t one = 1;
-        (void)::write(wakeupFd, &one, sizeof(one));
+      if (wakeupFd < 0)
+        return;
+      const std::uint64_t one = 1;
+      while (true) {
+        const ssize_t n = ::write(wakeupFd, &one, sizeof(one));
+        if (n == static_cast<ssize_t>(sizeof(one)))
+          return;
+        if (n < 0 && errno == EINTR)
+          continue;
+        // EAGAIN/EWOULDBLOCK means the eventfd counter is already saturated (wakeup pending);
+        // any other failure is unrecoverable on this descriptor.
+        return;
       }
     }
 
@@ -255,9 +261,7 @@ namespace filemanager {
   AdminSessionClient::AdminSessionClient(
       TabId tabId, std::shared_ptr<bool> tabAlive, StateChangedCallback onStateChanged
   )
-      : m_tabId(tabId),
-        m_tabAlive(std::move(tabAlive)),
-        m_onStateChanged(std::move(onStateChanged)),
+      : m_tabId(tabId), m_tabAlive(std::move(tabAlive)), m_onStateChanged(std::move(onStateChanged)),
         m_launcher(launchPolkitAdminTransport) {}
 
   AdminSessionClient::~AdminSessionClient() {
@@ -364,7 +368,8 @@ namespace filemanager {
         AdminSessionState::Authenticating, AdminSessionFailureReason::None, "Authenticating Administrator session…"
     );
 
-    const AdminTransportLauncher launcher = m_launcher ? m_launcher : AdminTransportLauncher(launchPolkitAdminTransport);
+    const AdminTransportLauncher launcher =
+        m_launcher ? m_launcher : AdminTransportLauncher(launchPolkitAdminTransport);
     const TabId expectedTabId = m_tabId;
     std::weak_ptr<bool> weakTabAlive = m_tabAlive;
     std::weak_ptr<bool> weakClientAlive = m_clientAlive;
@@ -410,14 +415,13 @@ namespace filemanager {
           std::lock_guard lock(worker->mutex);
           wasCancelled = wasCancelled || worker->cancelledAuth || worker->stopRequested;
         }
-        const AdminSessionFailureReason reason = wasCancelled ? AdminSessionFailureReason::AuthCancelled
+        const AdminSessionFailureReason reason = wasCancelled           ? AdminSessionFailureReason::AuthCancelled
             : launched.failureReason != AdminSessionFailureReason::None ? launched.failureReason
                                                                         : AdminSessionFailureReason::TransportError;
         std::string err = launched.error;
         if (err.empty()) {
-          err = reason == AdminSessionFailureReason::AuthCancelled
-              ? "Administrator authentication was cancelled."
-              : "Could not start Administrator helper.";
+          err = reason == AdminSessionFailureReason::AuthCancelled ? "Administrator authentication was cancelled."
+                                                                   : "Could not start Administrator helper.";
         }
         finishStartFailure(reason, std::move(err));
         return;
@@ -483,9 +487,7 @@ namespace filemanager {
             channel->closeWrite();
           if (channel->waitForExit)
             (void)channel->waitForExit();
-          finishStartFailure(
-              AdminSessionFailureReason::AuthCancelled, "Administrator authentication was cancelled."
-          );
+          finishStartFailure(AdminSessionFailureReason::AuthCancelled, "Administrator authentication was cancelled.");
           return;
         }
 
@@ -523,8 +525,7 @@ namespace filemanager {
                 ? AdminSessionFailureReason::VersionMismatch
                 : AdminSessionFailureReason::ProtocolError;
             finishStartFailure(
-                reason,
-                frame.detail.empty() ? "Administrator helper rejected protocol handshake." : frame.detail
+                reason, frame.detail.empty() ? "Administrator helper rejected protocol handshake." : frame.detail
             );
             return;
           }
@@ -617,9 +618,7 @@ namespace filemanager {
         self.m_helperPid = helperPid;
         self.m_invokingUid = invokingUid;
         self.m_lastRenewSentAt = std::chrono::steady_clock::now();
-        self.transitionTo(
-            AdminSessionState::Active, AdminSessionFailureReason::None, "Administrator session active."
-        );
+        self.transitionTo(AdminSessionState::Active, AdminSessionFailureReason::None, "Administrator session active.");
         if (cb)
           cb(true, self.status());
       });
@@ -655,9 +654,7 @@ namespace filemanager {
                 {.kind = AdminServerFrameKind::OpResult,
                  .requestId = id,
                  .status = req.operationSubmitted ? AdminStatusCode::InternalError : code,
-                 .detail = req.operationSubmitted
-                     ? detail + " The final operation outcome is uncertain."
-                     : detail,
+                 .detail = req.operationSubmitted ? detail + " The final operation outcome is uncertain." : detail,
                  .mutated = req.operationCompleted != 0 || req.operationMoved != 0,
                  .outcomeUncertain = req.operationSubmitted}
             );
@@ -671,22 +668,19 @@ namespace filemanager {
             item.operation->push(
                 {.kind = AdminServerFrameKind::OpResult, .requestId = item.requestId, .status = code, .detail = detail}
             );
-          if (item.onPing
-              || item.onRequest
-              || item.onDirComplete
-              || item.onStat
-              || item.onStatVfs
-              || item.onCountDir) {
-            callbacks.push_back(PendingRequest{
-                .command = item.command,
-                .onPing = std::move(item.onPing),
-                .onRequest = std::move(item.onRequest),
-                .onDirBatch = std::move(item.onDirBatch),
-                .onDirComplete = std::move(item.onDirComplete),
-                .onStat = std::move(item.onStat),
-                .onStatVfs = std::move(item.onStatVfs),
-                .onCountDir = std::move(item.onCountDir),
-            });
+          if (item.onPing || item.onRequest || item.onDirComplete || item.onStat || item.onStatVfs || item.onCountDir) {
+            callbacks.push_back(
+                PendingRequest{
+                    .command = item.command,
+                    .onPing = std::move(item.onPing),
+                    .onRequest = std::move(item.onRequest),
+                    .onDirBatch = std::move(item.onDirBatch),
+                    .onDirComplete = std::move(item.onDirComplete),
+                    .onStat = std::move(item.onStat),
+                    .onStatVfs = std::move(item.onStatVfs),
+                    .onCountDir = std::move(item.onCountDir),
+                }
+            );
           }
         };
         if (outgoing) {
@@ -816,8 +810,12 @@ namespace filemanager {
             AdminClientRequest shutdownReq;
             shutdownReq.command = AdminClientCommand::Shutdown;
             shutdownReq.requestId = 999999999ULL;
-            if (const auto encoded = encodeAdminClientRequest(shutdownReq))
-              (void)::write(channel->writeFd, encoded->data(), encoded->size());
+            if (const auto encoded = encodeAdminClientRequest(shutdownReq)) {
+              // Best-effort SHUTDOWN frame: handles SIGPIPE/EINTR/partial writes; if it still fails
+              // (e.g. pipe full or helper already exited), closeWrite() below delivers clean ClientEof.
+              int shutdownWriteErrno = 0;
+              (void)writeAdminFrameFd(channel->writeFd, *encoded, shutdownWriteErrno);
+            }
           }
           if (channel->closeWrite)
             channel->closeWrite();
@@ -932,7 +930,8 @@ namespace filemanager {
             }
 
             if (frame.kind == AdminServerFrameKind::DirEnd
-                && (it->second.command != AdminClientCommand::ListDir || frame.totalEntries != it->second.receivedEntries)) {
+                && (it->second.command != AdminClientCommand::ListDir
+                    || frame.totalEntries != it->second.receivedEntries)) {
               unexpectedExit = frameError = true;
               exitFailureReason = AdminSessionFailureReason::ProtocolError;
               exitMessage = "Invalid Administrator directory batch total.";
@@ -943,22 +942,26 @@ namespace filemanager {
             postToClient([matched = std::move(matched), frame = std::move(frame)](AdminSessionClient&) mutable {
               if (matched.onPing) {
                 if (frame.kind == AdminServerFrameKind::Status) {
-                  matched.onPing(AdminHealthStatus{
-                      .ok = true,
-                      .statusCode = AdminStatusCode::Ok,
-                      .protocolVersion = frame.protocolVersion,
-                      .helperPid = frame.helperPid,
-                      .invokingUid = frame.invokingUid,
-                      .uptimeMs = frame.uptimeMs,
-                      .activeRequestId = frame.activeRequestId,
-                      .detail = {},
-                  });
+                  matched.onPing(
+                      AdminHealthStatus{
+                          .ok = true,
+                          .statusCode = AdminStatusCode::Ok,
+                          .protocolVersion = frame.protocolVersion,
+                          .helperPid = frame.helperPid,
+                          .invokingUid = frame.invokingUid,
+                          .uptimeMs = frame.uptimeMs,
+                          .activeRequestId = frame.activeRequestId,
+                          .detail = {},
+                      }
+                  );
                 } else {
-                  matched.onPing(AdminHealthStatus{
-                      .ok = false,
-                      .statusCode = frame.status,
-                      .detail = frame.detail,
-                  });
+                  matched.onPing(
+                      AdminHealthStatus{
+                          .ok = false,
+                          .statusCode = frame.status,
+                          .detail = frame.detail,
+                      }
+                  );
                 }
               }
               if (matched.onRequest) {
@@ -1069,8 +1072,8 @@ namespace filemanager {
           if (!requestedStop) {
             unexpectedExit = true;
             const bool truncated = lineBuffer.hasBufferedBytes();
-            exitFailureReason = truncated ? AdminSessionFailureReason::ProtocolError
-                                          : AdminSessionFailureReason::HelperTerminated;
+            exitFailureReason =
+                truncated ? AdminSessionFailureReason::ProtocolError : AdminSessionFailureReason::HelperTerminated;
             exitMessage = truncated ? "The Administrator helper sent a truncated frame."
                                     : "The Administrator helper process terminated.";
             failAllPending(AdminStatusCode::InternalError, exitMessage);
@@ -1135,12 +1138,14 @@ namespace filemanager {
       const auto encoded = encodeAdminClientRequest(pingReq);
       if (!encoded)
         return kInvalidAdminRequestId;
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = reqId,
-          .command = AdminClientCommand::Ping,
-          .encodedFrame = *encoded,
-          .onPing = std::move(onComplete),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = reqId,
+              .command = AdminClientCommand::Ping,
+              .encodedFrame = *encoded,
+              .onPing = std::move(onComplete),
+          }
+      );
     }
     worker->signalWakeup();
     return reqId;
@@ -1170,22 +1175,21 @@ namespace filemanager {
       const auto encoded = encodeAdminClientRequest(renewReq);
       if (!encoded)
         return kInvalidAdminRequestId;
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = reqId,
-          .command = AdminClientCommand::RenewActivity,
-          .encodedFrame = *encoded,
-          .onRequest = std::move(onComplete),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = reqId,
+              .command = AdminClientCommand::RenewActivity,
+              .encodedFrame = *encoded,
+              .onRequest = std::move(onComplete),
+          }
+      );
     }
     worker->signalWakeup();
     return reqId;
   }
 
   AdminRequestId AdminSessionClient::listDirectoryAsync(
-      const std::filesystem::path& path,
-      bool userInitiated,
-      std::uint32_t maxBatchEntries,
-      DirBatchCallback onBatch,
+      const std::filesystem::path& path, bool userInitiated, std::uint32_t maxBatchEntries, DirBatchCallback onBatch,
       DirCompleteCallback onComplete
   ) {
     if (m_shutDown || m_state != AdminSessionState::Active || !m_activeWorker) {
@@ -1221,20 +1225,21 @@ namespace filemanager {
         }
         return kInvalidAdminRequestId;
       }
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = reqId,
-          .command = AdminClientCommand::ListDir,
-          .encodedFrame = *encoded,
-          .onDirBatch = std::move(onBatch),
-          .onDirComplete = std::move(onComplete),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = reqId,
+              .command = AdminClientCommand::ListDir,
+              .encodedFrame = *encoded,
+              .onDirBatch = std::move(onBatch),
+              .onDirComplete = std::move(onComplete),
+          }
+      );
     }
     worker->signalWakeup();
     return reqId;
   }
 
-  AdminRequestId
-  AdminSessionClient::statInfoAsync(
+  AdminRequestId AdminSessionClient::statInfoAsync(
       const std::filesystem::path& path, bool userInitiated, StatCallback onComplete, AdminStatDetail detail
   ) {
     if (m_shutDown || m_state != AdminSessionState::Active || !m_activeWorker) {
@@ -1270,12 +1275,14 @@ namespace filemanager {
         }
         return kInvalidAdminRequestId;
       }
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = reqId,
-          .command = AdminClientCommand::StatInfo,
-          .encodedFrame = *encoded,
-          .onStat = std::move(onComplete),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = reqId,
+              .command = AdminClientCommand::StatInfo,
+              .encodedFrame = *encoded,
+              .onStat = std::move(onComplete),
+          }
+      );
     }
     worker->signalWakeup();
     return reqId;
@@ -1311,12 +1318,14 @@ namespace filemanager {
         }
         return kInvalidAdminRequestId;
       }
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = reqId,
-          .command = AdminClientCommand::StatVfs,
-          .encodedFrame = *encoded,
-          .onStatVfs = std::move(onComplete),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = reqId,
+              .command = AdminClientCommand::StatVfs,
+              .encodedFrame = *encoded,
+              .onStatVfs = std::move(onComplete),
+          }
+      );
     }
     worker->signalWakeup();
     return reqId;
@@ -1353,19 +1362,20 @@ namespace filemanager {
         }
         return kInvalidAdminRequestId;
       }
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = reqId,
-          .command = AdminClientCommand::CountDir,
-          .encodedFrame = *encoded,
-          .onCountDir = std::move(onComplete),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = reqId,
+              .command = AdminClientCommand::CountDir,
+              .encodedFrame = *encoded,
+              .onCountDir = std::move(onComplete),
+          }
+      );
     }
     worker->signalWakeup();
     return reqId;
   }
 
-  AdminSessionClient::OperationTransport
-  AdminSessionClient::runOperation(
+  AdminSessionClient::OperationTransport AdminSessionClient::runOperation(
       const file_operation_engine::Request& request, std::uint64_t expectedGeneration, GCancellable* conflictLifetime,
       OperationComplete onComplete
   ) {
@@ -1489,12 +1499,14 @@ namespace filemanager {
       const auto encoded = encodeAdminClientRequest(cancelReq);
       if (!encoded)
         return kInvalidAdminRequestId;
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = reqId,
-          .command = AdminClientCommand::Cancel,
-          .encodedFrame = *encoded,
-          .onRequest = std::move(onComplete),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = reqId,
+              .command = AdminClientCommand::Cancel,
+              .encodedFrame = *encoded,
+              .onRequest = std::move(onComplete),
+          }
+      );
     }
     worker->signalWakeup();
     return reqId;
@@ -1508,11 +1520,13 @@ namespace filemanager {
       std::lock_guard lock(worker->mutex);
       if (worker->stopRequested)
         return false;
-      worker->outgoingQueue.push_back(WorkerContext::OutgoingItem{
-          .requestId = kInvalidAdminRequestId,
-          .command = AdminClientCommand::Ping,
-          .encodedFrame = std::move(rawBytes),
-      });
+      worker->outgoingQueue.push_back(
+          WorkerContext::OutgoingItem{
+              .requestId = kInvalidAdminRequestId,
+              .command = AdminClientCommand::Ping,
+              .encodedFrame = std::move(rawBytes),
+          }
+      );
     }
     worker->signalWakeup();
     return true;
@@ -1521,8 +1535,7 @@ namespace filemanager {
   void AdminSessionClient::stopSession(bool graceful) {
     if (m_shutDown)
       return;
-    const bool wasActiveOrAuth =
-        m_state == AdminSessionState::Active || m_state == AdminSessionState::Authenticating;
+    const bool wasActiveOrAuth = m_state == AdminSessionState::Active || m_state == AdminSessionState::Authenticating;
     const bool wasAuth = m_state == AdminSessionState::Authenticating;
     ++m_sessionGeneration;
     if (m_activeWorker) {
