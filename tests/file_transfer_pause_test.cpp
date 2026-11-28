@@ -1,3 +1,4 @@
+#include "filemanager/archive/archive_backend.h"
 #include "filemanager/file_operation_manager.h"
 #include "test_isolation.h"
 
@@ -58,6 +59,45 @@ namespace {
     }
     return {};
   }
+
+#ifdef NYTHERA_FILES_ARCHIVES
+  void pauseArchive(const std::filesystem::path& root, const std::filesystem::path& source, bool cancel) {
+    using namespace filemanager::archive_backend;
+    const auto target = root / (cancel ? "cancelled.tar" : "resumed.tar");
+    std::atomic_bool reached = false;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool released = false;
+    FileOperationManager manager;
+    const auto release = [&] {
+      {
+        const std::lock_guard lock(mutex);
+        released = true;
+      }
+      changed.notify_all();
+    };
+    const auto guard = nythera::test::makeScopeExit(release);
+    FileOperationManagerTestAccess::boundary(manager, [&](std::uint64_t, std::uint64_t) {
+      if (reached.exchange(true))
+        return;
+      std::unique_lock lock(mutex);
+      changed.wait(lock, [&] { return released; });
+    });
+    const auto id = manager.compress({source.string()}, target.string(), Format::Tar, Level::Balanced);
+    TEST_CHECK(id != 0);
+    await([&] { return reached.load(); });
+    FileOperationManagerTestAccess::signal(manager, id, "suspendRequested");
+    release();
+    await([&] { return operation(manager, id).paused; });
+    TEST_CHECK(!operation(manager, id).finished && manager.usesMount(target));
+    TEST_CHECK(!std::filesystem::exists(target));
+    FileOperationManagerTestAccess::signal(manager, id, cancel ? "cancelRequested" : "resumeRequested");
+    await([&] { return operation(manager, id).finished; });
+    const auto& result = operation(manager, id);
+    TEST_CHECK(!result.paused && result.cancelled == cancel && result.succeeded == !cancel);
+    TEST_CHECK(std::filesystem::exists(target) == !cancel && !manager.usesMount(target));
+  }
+#endif
 } // namespace
 
 int main() {
@@ -77,6 +117,10 @@ int main() {
         file.write(chunk.data(), chunk.size());
       TEST_CHECK(file.good());
     }
+#ifdef NYTHERA_FILES_ARCHIVES
+    pauseArchive(root, source, false);
+    pauseArchive(root, source, true);
+#endif
     for (const bool cancel : {false, true}) {
       const auto destination = destinationRoot / (cancel ? "cancel" : "resume");
       std::filesystem::create_directory(destination);

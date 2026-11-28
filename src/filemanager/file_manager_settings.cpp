@@ -485,6 +485,14 @@ namespace filemanager {
     return save({{{"files", "preview_mode"}, literal(std::string(value))}});
   }
 
+  bool FileManagerSettings::avoidRedundantExtractionFolders() const {
+    return m_preferences["files"]["avoid_redundant_extraction_folders"].value_or(true);
+  }
+
+  bool FileManagerSettings::setAvoidRedundantExtractionFolders(bool enabled) {
+    return save({{{"files", "avoid_redundant_extraction_folders"}, literal(enabled)}});
+  }
+
   ThumbnailPolicy FileManagerSettings::thumbnailPolicy() const {
     const auto policy = m_preferences["files"]["thumbnail_policy"].value_or<std::string_view>("local");
     if (policy == "never")

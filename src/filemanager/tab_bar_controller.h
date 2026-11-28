@@ -65,6 +65,7 @@ namespace filemanager {
 
     [[nodiscard]] bool gestureActive() const noexcept { return m_dragArmed || m_dragging; }
     [[nodiscard]] bool visible() const noexcept;
+    [[nodiscard]] TabId fileDropTabAt(float x, float y) const;
     [[nodiscard]] TabId contextMenuTabId() const noexcept { return m_contextMenuTabId; }
     [[nodiscard]] std::vector<ContextMenuControlEntry> tabContextMenuEntries(TabId tabId) const;
 

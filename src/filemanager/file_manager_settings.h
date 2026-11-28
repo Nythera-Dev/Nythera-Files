@@ -102,6 +102,8 @@ namespace filemanager {
 
     [[nodiscard]] PreviewMode previewMode() const;
     [[nodiscard]] bool setPreviewMode(PreviewMode mode);
+    [[nodiscard]] bool avoidRedundantExtractionFolders() const;
+    bool setAvoidRedundantExtractionFolders(bool enabled);
     [[nodiscard]] ThumbnailPolicy thumbnailPolicy() const;
     [[nodiscard]] bool setThumbnailPolicy(ThumbnailPolicy policy);
     [[nodiscard]] int thumbnailMaxFileMiB() const;

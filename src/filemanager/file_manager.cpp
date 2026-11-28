@@ -182,8 +182,8 @@ public:
     const auto location = searchResult ? filemanager::searchLocationText(entry.absPath) : std::string{};
     // Search provides viewport thumbnails separately from the shared artwork lookup.
     const bool allowThumbnails = !searchResult && tab.capabilities().canGenerateThumbnails;
-    const auto useSearchArtwork = [&entry, searchResult](FileIcon* icon) {
-      if (!searchResult)
+    const auto useListingArtwork = [&entry, searchResult, archive = session.browsingArchive()](FileIcon* icon) {
+      if (!searchResult && !archive)
         return;
       const bool broken = entry.isSymlink && entry.type == "inode/symlink";
       std::vector<std::string> names;
@@ -216,7 +216,7 @@ public:
       );
       if (!location.empty())
         tileNode.setSearchLocation(location);
-      useSearchArtwork(tileNode.fileIcon());
+      useListingArtwork(tileNode.fileIcon());
     } else {
       auto& row = static_cast<FileEntryRow&>(tile);
       row.setAllowThumbnailsAndMetadata(allowThumbnails);
@@ -232,7 +232,7 @@ public:
       row.setColumnViewport(
           *m_renderer, std::max(tile.width(), m_owner.m_listHeader.contentWidth()), m_owner.m_listHeader.scrollOffset()
       );
-      useSearchArtwork(row.fileIcon());
+      useListingArtwork(row.fileIcon());
     }
   }
   void onActivate(std::size_t index) override {
@@ -614,6 +614,7 @@ filemanager::TabManager::Callbacks FileManager::makeTabManagerCallbacks() {
       .onInvalidateMountCapacities =
           [this](const std::filesystem::path& path) { m_places.invalidateMountCapacitiesForPath(path); },
       .onResolvePathAsync = [this](const std::filesystem::path& path) { m_places.resolvePathAsync(path, {}, false); },
+      .archivePassword = m_modalDialog.makeArchivePasswordResolver(),
   };
 }
 
@@ -973,6 +974,7 @@ FileManager::FileManager(std::string initialPath)
                         && m_transfers.pendingClipboardReads() == 0)
                       m_running = false;
                   },
+              .fileDropTabAt = [this](float x, float y) { return m_tabBar.fileDropTabAt(x, y); },
           }
       ) {
   m_menus.loadInitialPreference();
@@ -985,6 +987,7 @@ FileManager::FileManager(std::string initialPath)
     refreshSearchSettings(previous);
   });
   m_operations.setConflictResolver(m_modalDialog.makeConflictResolver());
+  m_operations.setArchivePasswordResolver(m_modalDialog.makeArchivePasswordResolver());
   m_operations.setAdminConflictResolver(
       m_modalDialog.makeConflictResolver(filemanager::ConflictPathAccess::ExecutorOnly)
   );
@@ -1813,7 +1816,7 @@ void FileManager::pinPlace(const std::filesystem::path& path) {
 }
 
 void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry) {
-  if (activateSearchScopeEntry(entry) || activateSearchFilterEntry(entry))
+  if (activateArchiveAction(entry.id) || activateSearchScopeEntry(entry) || activateSearchFilterEntry(entry))
     return;
   if (entry.id >= kFirstSearchMode
       && entry.id < kFirstSearchMode + static_cast<int>(filemanager::kSearchModeLabels.size())) {
@@ -1856,12 +1859,17 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     switch (entry.id) {
     case 30001:
       if (!session.browsingTrash())
-        launchNewWindow(session.path());
+        launchNewWindow(session.browsingArchive() ? session.path().parent_path() : session.path());
       break;
     case 30002:
       activateSelected();
       break;
     case 30003:
+      if (session.browsingArchive()) {
+        if (tab.selectedPath)
+          openArchiveMember(*tab.selectedPath, true);
+        break;
+      }
       if (!caps.canLaunchApps) {
         setStatus("Opening files with external applications is disabled in Administrator Mode");
         return;
@@ -1872,7 +1880,7 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
       }
       break;
     case 30004:
-      if (tab.selectedPath)
+      if (!session.browsingArchive() && tab.selectedPath)
         launchNewWindow(*tab.selectedPath);
       break;
     case 30005:
@@ -1950,14 +1958,20 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     }
     return;
   case kOpenFolderInNewTab:
+    if (session.browsingArchive())
+      return;
     if (m_menus.contextMenuTarget() && !session.browsingTrash())
       openFolderInNewTab(*m_menus.contextMenuTarget(), !m_openTabsInBackground);
     return;
   case kFileOpenInNewTab:
     if (!session.browsingTrash() && tab.selectedPath) {
       const auto found = std::ranges::find(session.entries(), *tab.selectedPath, &FileEntry::absPath);
-      if (found != session.entries().end() && found->isDir)
-        openFolderInNewTab(*tab.selectedPath, !m_openTabsInBackground);
+      if (found != session.entries().end() && found->isDir) {
+        if (session.browsingArchive())
+          m_tabs.openTab({session.path(), found->absPath.native()}, tab.viewState, !m_openTabsInBackground);
+        else
+          openFolderInNewTab(*tab.selectedPath, !m_openTabsInBackground);
+      }
     }
     return;
   case kAlwaysShowTabBar:
@@ -2001,6 +2015,8 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
     return;
   }
   if (entry.id == 81) {
+    if (session.browsingArchive())
+      return;
     if (!caps.canLaunchApps) {
       setStatus("Opening files with external applications is disabled in Administrator Mode");
       return;
@@ -2110,7 +2126,7 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
       pinPlace(*m_menus.contextMenuTarget());
     return;
   }
-  if (entry.id == 60 && m_menus.contextMenuTarget()) {
+  if (entry.id == 60 && !session.browsingArchive() && m_menus.contextMenuTarget()) {
     launchNewWindow(*m_menus.contextMenuTarget());
     return;
   }
@@ -2305,9 +2321,12 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
         id == 111 ? m_operations.createFolder(destination->string()) : m_operations.createFile(destination->string());
     if (opId != 0)
       m_createRequests[opId] = CreateRequest{tab.id, session.navigationGeneration(), *destination};
-  } else if (entry.id == 13)
-    enumerate(session.path());
-  else if (entry.id == 14 || entry.id == kListView || entry.id == kGridView) {
+  } else if (entry.id == 13) {
+    if (session.browsingArchive())
+      session.reloadArchive();
+    else
+      enumerate(session.path());
+  } else if (entry.id == 14 || entry.id == kListView || entry.id == kGridView) {
     recordAdminTabUserActivity(tab);
     setGridMode(entry.id == 14 ? !m_listHeader.gridMode() : entry.id == kGridView);
   } else if (entry.id >= kZoomIn && entry.id <= kResetZoom) {
@@ -2384,6 +2403,10 @@ void FileManager::activateContextMenuEntry(const ContextMenuControlEntry& entry)
 }
 
 void FileManager::openProperties(const std::filesystem::path& path) {
+  if (activeSession().browsingArchive()) {
+    showArchiveMemberProperties(path);
+    return;
+  }
   if (!activeTab().capabilities().canOpenProperties) {
     setStatus("Properties is unavailable in Administrator Mode");
     return;
@@ -2840,6 +2863,29 @@ void FileManager::activatePath(const std::filesystem::path& path) {
   if (found == session.entries().end())
     return;
   const auto entry = *found;
+  if (session.browsingArchive()) {
+    if (entry.isDir)
+      navigateLocation({session.path(), entry.absPath.native()});
+    else
+      openArchiveMember(entry.absPath, false);
+    return;
+  }
+#ifdef NYTHERA_FILES_ARCHIVES
+  if (!entry.isDir
+      && !entry.isSymlink
+      && !session.browsingTrash()
+      && !tab.administratorBrowsing
+      && !tab.hasActiveAdminSession()) {
+    const auto format = filemanager::archive_backend::formatFromName(entry.name);
+    const auto capabilities = filemanager::archive_backend::capabilities();
+    if (format && std::ranges::any_of(capabilities, [&](const auto& item) {
+          return item.extract && item.format == *format;
+        })) {
+      navigateLocation({entry.absPath, std::string{}});
+      return;
+    }
+  }
+#endif
   if (entry.isDir) {
     navigate(entry.absPath);
     return;
@@ -3253,6 +3299,10 @@ bool FileManager::enterAdministratorMode(
   auto* tab = m_tabs.findTab(tabId);
   if (tab == nullptr)
     return false;
+  if (tab->session.browsingArchive()) {
+    setStatus("Administrator Mode is unavailable inside archives");
+    return false;
+  }
   if (tab->session.browsingTrash() || (targetDirectory && filemanager::isTrashTabPath(*targetDirectory))) {
     if (tabId == m_tabs.activeTabId())
       setStatus("Administrator Mode is unavailable in Wastebin");
@@ -3541,7 +3591,7 @@ void FileManager::rebuildBreadcrumbs() {
     return;
   while (!m_breadcrumbBar->children().empty())
     m_breadcrumbBar->removeChild(m_breadcrumbBar->children().front().get());
-  auto addCrumb = [this](std::string label, std::filesystem::path path, bool last) {
+  auto addCrumb = [this](std::string label, filemanager::BrowserLocation path, bool last, bool archive = false) {
     if (!m_breadcrumbBar->children().empty()) {
       auto separator = std::make_unique<Label>();
       separator->setText("›");
@@ -3551,6 +3601,8 @@ void FileManager::rebuildBreadcrumbs() {
     }
     auto button = std::make_unique<Button>();
     button->setText(filemanager::sanitizeFilenameForDisplay(label));
+    if (archive)
+      button->setGlyph("file-zip");
     button->setVariant(ButtonVariant::Ghost);
     button->setFocusHighlightEnabled(false);
     useSubtleSelection(*button);
@@ -3559,12 +3611,27 @@ void FileManager::rebuildBreadcrumbs() {
       button->label()->setFontWeight(FontWeight::SemiBold);
     button->setControlHeight(kToolbarHeight);
     button->setPadding(5.0F);
-    button->setOnClick([this, path = std::move(path)] { navigate(path); });
+    button->setOnClick([this, path = std::move(path)] { navigateLocation(path); });
     m_breadcrumbBar->addChild(std::move(button));
   };
-  const auto crumbs = filemanager::fileBreadcrumbs(activeSession().path());
-  for (std::size_t i = 0; i < crumbs.size(); ++i)
-    addCrumb(crumbs[i].label, crumbs[i].path, i + 1 == crumbs.size());
+  const auto& session = activeSession();
+  const auto crumbs = filemanager::fileBreadcrumbs(session.path());
+  for (std::size_t i = 0; i < crumbs.size(); ++i) {
+    const bool last = i + 1 == crumbs.size();
+    if (last && session.browsingArchive())
+      addCrumb(crumbs[i].label, {session.path(), std::string{}}, session.archiveDirectory()->empty(), true);
+    else
+      addCrumb(crumbs[i].label, crumbs[i].path, last);
+  }
+  if (session.browsingArchive()) {
+    std::filesystem::path prefix;
+    for (const auto& part : std::filesystem::path(*session.archiveDirectory())) {
+      if (part.empty())
+        continue;
+      prefix /= part;
+      addCrumb(part.native(), {session.path(), prefix.native()}, prefix.native() == *session.archiveDirectory());
+    }
+  }
   auto emptyField = std::make_unique<Button>();
   emptyField->setVariant(ButtonVariant::Ghost);
   emptyField->setFocusHighlightEnabled(false);
@@ -3802,8 +3869,8 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
             return;
           auto path = session.backHistory().back();
           session.backHistory().pop_back();
-          session.forwardHistory().push_back(session.path());
-          navigate(path, false);
+          session.forwardHistory().push_back(session.location());
+          navigateLocation(std::move(path), false);
         },
         &m_backButton
     ));
@@ -3815,20 +3882,12 @@ void FileManager::prepareFrame(bool needsUpdate, bool needsLayout) {
             return;
           auto path = session.forwardHistory().back();
           session.forwardHistory().pop_back();
-          session.backHistory().push_back(session.path());
-          navigate(path, false);
+          session.backHistory().push_back(session.location());
+          navigateLocation(std::move(path), false);
         },
         &m_forwardButton
     ));
-    navigation->addChild(makeButton(
-        "↑",
-        [this] {
-          const auto& session = activeSession();
-          if (session.path().has_parent_path())
-            navigate(session.path().parent_path());
-        },
-        &m_upButton
-    ));
+    navigation->addChild(makeButton("↑", [this] { navigateUp(); }, &m_upButton));
 
     auto locationBar = std::make_unique<Flex>();
     locationBar->setAlign(FlexAlign::Center);
@@ -4354,6 +4413,8 @@ void FileManager::dispatchPointer(const PointerEvent& event) {
         cancelRename();
     }
   }
+  if (m_transfers.isDraggingFiles() && !m_transfer.dragging() && m_transfers.handleFileDragPointer(event, x, y))
+    return;
   if (m_tabBar.handlePointer(event, x, y))
     return;
   if (m_listHeader.handlePointer(event, x, y))
@@ -5336,13 +5397,8 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
     return;
   }
   if (mods == 0U && event.sym == XKB_KEY_BackSpace) {
-    if (!event.repeat) {
-      const auto& session = activeSession();
-      if (!(session.browsingTrash() && session.path() == std::filesystem::path("trash:/"))
-          && session.path().has_parent_path()
-          && session.path().parent_path() != session.path())
-        navigate(session.path().parent_path());
-    }
+    if (!event.repeat)
+      navigateUp();
     return;
   }
   if (mods == KeyMod::Alt && event.sym == XKB_KEY_Left) {
@@ -5351,8 +5407,8 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       if (!session.backHistory().empty()) {
         auto path = session.backHistory().back();
         session.backHistory().pop_back();
-        session.forwardHistory().push_back(session.path());
-        navigate(path, false);
+        session.forwardHistory().push_back(session.location());
+        navigateLocation(std::move(path), false);
       }
     }
     return;
@@ -5363,20 +5419,15 @@ void FileManager::handleWindowKeyEvent(const KeyboardEvent& event) {
       if (!session.forwardHistory().empty()) {
         auto path = session.forwardHistory().back();
         session.forwardHistory().pop_back();
-        session.backHistory().push_back(session.path());
-        navigate(path, false);
+        session.backHistory().push_back(session.location());
+        navigateLocation(std::move(path), false);
       }
     }
     return;
   }
   if (mods == KeyMod::Alt && event.sym == XKB_KEY_Up) {
-    if (!event.repeat) {
-      const auto& session = activeSession();
-      if (!(session.browsingTrash() && session.path() == std::filesystem::path("trash:/"))
-          && session.path().has_parent_path()
-          && session.path().parent_path() != session.path())
-        navigate(session.path().parent_path());
-    }
+    if (!event.repeat)
+      navigateUp();
     return;
   }
   if (mods == KeyMod::Alt && KeySymbol::isHome(event.sym)) {
@@ -5540,5 +5591,9 @@ void FileManager::activatePointerMiddleItem(std::size_t index) {
   const auto& entry = entries[index];
   if (!entry.isDir || session.browsingTrash())
     return;
+  if (session.browsingArchive()) {
+    m_tabs.openTab({session.path(), entry.absPath.native()}, activeTab().viewState, false);
+    return;
+  }
   openFolderInNewTab(entry.absPath, false);
 }

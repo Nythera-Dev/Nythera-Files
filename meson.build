@@ -107,6 +107,7 @@ endif
 _nythera_files_sources = files(
   'src/filemanager/file_manager.cpp',
   'src/filemanager/file_manager_preview.cpp',
+  'src/filemanager/file_manager_archive.cpp',
   'src/filemanager/file_manager_preview_pane.cpp',
   'src/filemanager/file_manager_quick_look.cpp',
   'src/filemanager/file_manager_settings.cpp',
@@ -248,6 +249,7 @@ if build_archives
       'src/filemanager/archive/archive_rar_input.cpp',
       'src/filemanager/archive/archive_reader.cpp',
       'src/filemanager/archive/archive_safety.cpp',
+      'src/filemanager/archive/archive_sevenzip.cpp',
       'src/filemanager/archive/archive_writer.cpp',
       'src/filemanager/archive/archive_xz_input.cpp',
     ),
@@ -256,7 +258,7 @@ if build_archives
     cpp_args: _nythera_cpp_args,
   )
   archive_files_deps += declare_dependency(
-    link_whole: archive_backend_lib,
+    link_with: archive_backend_lib,
     dependencies: archive_codec_deps + [file_operation_engine_dep],
   )
 endif
@@ -271,12 +273,12 @@ nythera_files_lib = static_library('nythera_files',
   sources: _nythera_files_sources,
   dependencies: _nythera_files_dependencies + [file_operation_engine_dep],
   include_directories: _nythera_inc,
-  cpp_args: _nythera_cpp_args,
+  cpp_args: _nythera_cpp_args + (build_archives ? ['-DNYTHERA_FILES_ARCHIVES'] : []),
 )
 
 nythera_files_test_dep = declare_dependency(
   link_with: [app_build_info, nythera_files_lib],
-  dependencies: _nythera_files_dependencies + [file_operation_engine_dep],
+  dependencies: _nythera_files_dependencies + [file_operation_engine_dep] + archive_files_deps,
   include_directories: _nythera_inc,
   compile_args: _nythera_compile_definitions,
 )
@@ -510,6 +512,7 @@ if build_tests
   file_operation_manager_test_exe = executable('file_operation_manager_test',
     sources: files('tests/file_operation_manager_test.cpp'),
     dependencies: nythera_files_test_dep,
+    cpp_args: build_archives ? ['-DNYTHERA_FILES_ARCHIVES'] : [],
     override_options: ['b_ndebug=false'],
   )
   if dbus_run_session.found()
@@ -537,6 +540,7 @@ if build_tests
   file_transfer_pause_test_exe = executable('file_transfer_pause_test',
     sources: files('tests/file_transfer_pause_test.cpp'),
     dependencies: nythera_files_test_dep,
+    cpp_args: build_archives ? ['-DNYTHERA_FILES_ARCHIVES'] : [],
     override_options: ['b_ndebug=false'],
   )
   if dbus_run_session.found()
@@ -646,6 +650,7 @@ if build_tests
 
   file_manager_help_menu_test_exe = executable('file_manager_help_menu_test',
     sources: files('tests/file_manager_help_menu_test.cpp'),
+    cpp_args: build_archives ? ['-DNYTHERA_FILES_ARCHIVES'] : [],
     dependencies: nythera_files_test_dep,
     link_depends: files_assets,
     override_options: ['b_ndebug=false'],
@@ -654,6 +659,7 @@ if build_tests
 
   file_manager_tabs_test_exe = executable('file_manager_tabs_test',
     sources: files('tests/file_manager_tabs_test.cpp'),
+    cpp_args: build_archives ? ['-DNYTHERA_FILES_ARCHIVES'] : [],
     dependencies: nythera_files_test_dep,
     override_options: ['b_ndebug=false'],
   )

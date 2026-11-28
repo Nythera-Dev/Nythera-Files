@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <set>
 #include <tuple>
 
 namespace filemanager::archive_backend {
@@ -198,6 +199,7 @@ namespace filemanager::archive_backend {
         } catch (const std::exception& error) {
           result.message = error.what();
         }
+        result.processedMeasure = {.bytes = work.bytes, .items = work.count};
         if (!stage.cleanup()) {
           result.ok = false;
           result.mutated = true;
@@ -215,13 +217,122 @@ namespace filemanager::archive_backend {
     }
   } // namespace
 
-  Result
-  extract(const fs::path& source, const fs::path& destination, GCancellable* cancellable, const Callbacks& callbacks) {
+  std::shared_ptr<const Catalogue>
+  inspect(const fs::path& source, GCancellable* cancellable, const Callbacks& callbacks) {
+    const ArchiveLocale locale;
+    const auto input = openSource(source);
+    Work work{.cancellable = cancellable, .callbacks = callbacks};
+    auto catalogue = std::make_shared<Catalogue>();
+    catalogue->source = source;
+    catalogue->revision = input.revision;
+    try {
+      catalogue->entries = inspectArchive(input, work);
+    } catch (const Error& error) {
+      if (error.kind != FileErrorKind::EncryptedSevenZip)
+        throw;
+      Stage temporary(fs::temp_directory_path());
+      catalogue->entries = inspectEncryptedSevenZip(input, temporary, work);
+      catalogue->encryptedSevenZip = true;
+    }
+    return catalogue;
+  }
+
+  Result extractSelected(
+      const Selection& selection, const fs::path& destination, GCancellable* cancellable, const Callbacks& callbacks
+  ) {
+    return run(destination, cancellable, callbacks, [&](Stage& stage, Work& work, Result& result) {
+      if (!selection.catalogue || selection.members.empty())
+        throwFileError(FileErrorKind::InvalidArgument, "No archive members were selected.");
+      const auto& catalog = *selection.catalogue;
+      const auto source = openSource(catalog.source);
+      if (!sameRevision(source.revision, catalog.revision))
+        throwFileError(FileErrorKind::Changed, "The archive changed. Reload its contents before extracting.");
+      const std::set<std::string, std::less<>> chosen(selection.members.begin(), selection.members.end());
+      Projection items;
+      std::set<std::string, std::less<>> outputs;
+      for (const auto& root : chosen) {
+        work.check();
+        auto entry = catalog.entries.find(root);
+        if (entry == catalog.entries.end())
+          throwFileError(FileErrorKind::Changed, "An archive selection no longer exists.");
+        bool covered = false;
+        for (auto parent = parentName(root); !parent.empty(); parent = parentName(parent))
+          covered |= chosen.contains(parent);
+        if (covered)
+          continue;
+        const auto output = leaf(root);
+        if (!outputs.insert(output).second)
+          throwFileError(FileErrorKind::InvalidArgument, "Selected archive members have conflicting names.");
+        items.emplace(root, output);
+        if (entry->second.kind == EntryKind::Directory) {
+          const auto prefix = root + "/";
+          for (auto child = catalog.entries.lower_bound(prefix);
+               child != catalog.entries.end() && child->first.starts_with(prefix); ++child) {
+            work.check();
+            items.emplace(child->first, output + child->first.substr(root.size()));
+          }
+        }
+      }
+      if (catalog.encryptedSevenZip)
+        readSelectedSevenZip(source, catalog, items, stage, work);
+      else
+        readSelected(source, catalog, items, stage, work);
+      result.totalMeasure = {.bytes = work.bytes, .items = work.count};
+      Publication publisher(work, result, std::span(&source.revision, 1));
+      publisher.directory(stage.path, destination);
+      if (result.skippedEntries.empty())
+        result.completedMeasure = result.totalMeasure;
+    });
+  }
+
+  Result extract(
+      const fs::path& source, const fs::path& destination, GCancellable* cancellable, const Callbacks& callbacks,
+      Extraction mode
+  ) {
     return run(destination, cancellable, callbacks, [&](Stage& stage, Work& work, Result& result) {
       const auto input = openSource(source);
-      readArchive(source, input, stage, work);
+      try {
+        readArchive(source, input, stage, work);
+      } catch (const Error& error) {
+        if (error.kind != FileErrorKind::EncryptedSevenZip)
+          throw;
+        for (const auto& item : fs::directory_iterator(stage.path))
+          fs::remove_all(item.path());
+        readEncryptedSevenZip(input, stage, work);
+      }
       result.totalMeasure = {.bytes = work.bytes, .items = work.count};
-      Publication(work, result, std::span(&input.revision, 1)).directory(stage.path, destination);
+      Publication publisher(work, result, std::span(&input.revision, 1));
+      if (mode == Extraction::Direct) {
+        publisher.directory(stage.path, destination);
+      } else {
+        const auto name = archiveStem(source.filename().native());
+        if (!filemanager::validFileName(name) || name.contains('\\'))
+          throwFileError(FileErrorKind::InvalidArgument, "Invalid extraction folder name.");
+        const fs::path target = destination / name;
+        const fs::directory_iterator it(stage.path), end;
+        const auto matching = stage.path / name;
+        const bool redundant = mode == Extraction::SmartFolder
+            && it != end
+            && it->path() == matching
+            && fs::is_directory(it->symlink_status())
+            && std::next(it) == end;
+        if (redundant) {
+          publisher.item(matching, target, name, false);
+        } else {
+          Stage wrapper(destination);
+          const auto folder = wrapper.path / name;
+          if (::mkdir(folder.c_str(), 0777) != 0)
+            systemError("Could not create the containing archive folder");
+          const auto mode = fs::status(folder).permissions();
+          fs::remove(folder);
+          fs::rename(stage.path, folder);
+          if (::chmod(folder.c_str(), static_cast<mode_t>(mode)) != 0)
+            systemError("Could not finish the containing archive folder");
+          publisher.item(folder, target, name, false);
+          if (!wrapper.cleanup())
+            throwFileError(FileErrorKind::Other, "Could not remove private extraction staging.");
+        }
+      }
       if (result.skippedEntries.empty())
         result.completedMeasure = result.totalMeasure;
     });
@@ -229,7 +340,7 @@ namespace filemanager::archive_backend {
 
   Result compress(
       std::span<const fs::path> sources, const fs::path& output, Format format, Level level, GCancellable* cancellable,
-      const Callbacks& callbacks
+      const Callbacks& callbacks, const EncryptionOptions& options
   ) {
     return run(output.parent_path(), cancellable, callbacks, [&](Stage& stage, Work& work, Result& result) {
       const auto all = capabilities();
@@ -251,7 +362,13 @@ namespace filemanager::archive_backend {
         const auto parent = openDirectory(source.parent_path());
         inputs.push_back(statAt(parent.get(), source.filename().native()));
       }
-      writeArchive(sources, stage, format, level, work);
+      if (options.password.contains('\0')
+          || (!options.password.empty() && format != Format::Zip && format != Format::SevenZip))
+        throwFileError(FileErrorKind::InvalidArgument, "Password protection is unavailable for this archive format.");
+      if (!options.password.empty() && format == Format::SevenZip)
+        writeEncryptedSevenZip(sources, stage, level, options, work);
+      else
+        writeArchive(sources, stage, format, level, work, options);
       result.totalMeasure = {.bytes = work.bytes, .items = 1};
       Publication(work, result, inputs).item(stage.path / "output", output, name, false);
       if (result.skippedEntries.empty())

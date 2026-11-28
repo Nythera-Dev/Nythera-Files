@@ -173,6 +173,29 @@ namespace filemanager {
 
   bool TabBarController::visible() const noexcept { return m_container != nullptr && m_container->visible(); }
 
+  TabId TabBarController::fileDropTabAt(float x, float y) const {
+    if (!visible() || !m_scroll)
+      return kInvalidTabId;
+    float left = 0, top = 0;
+    Node::absolutePosition(m_scroll, left, top);
+    if (x < left || y < top || x >= left + m_scroll->width() || y >= top + m_scroll->height())
+      return kInvalidTabId;
+    for (const auto& slot : m_slots) {
+      const auto* tab = m_tabs.findTab(slot.tabId);
+      if (!tab
+          || !slot.container
+          || !tab->capabilities().canAcceptDrop
+          || tab->administratorBrowsing
+          || tab->hasActiveAdminSession()
+          || tab->session.loading())
+        continue;
+      Node::absolutePosition(slot.container, left, top);
+      if (x >= left && y >= top && x < left + slot.container->width() && y < top + slot.container->height())
+        return tab->id;
+    }
+    return kInvalidTabId;
+  }
+
   void TabBarController::updateVisibility() {
     if (m_container == nullptr)
       return;

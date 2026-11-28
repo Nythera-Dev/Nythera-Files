@@ -99,6 +99,15 @@ private:
     tab.session.setNextEnumerateUserInitiated(tab.hasActiveAdminSession());
     tab.session.navigate(path, recordHistory, revealName);
   }
+  void navigateLocation(filemanager::BrowserLocation location, bool recordHistory = true);
+  void navigateUp();
+  void openArchiveMember(const std::filesystem::path& member, bool withApplication);
+  void copyArchiveMembers();
+  void extractArchiveMembersTo();
+  void showArchiveMemberProperties(const std::filesystem::path& member);
+  void materialiseArchiveSelection(
+      std::vector<std::string> members, std::function<void(const FileOperationManager::Operation&)> ready
+  );
   void enumerate(const std::filesystem::path& path) {
     auto& tab = activeTab();
     recordAdminTabUserActivity(tab);
@@ -165,7 +174,10 @@ private:
   void updateStatusBar();
   void updateSearchStatus();
   std::unique_ptr<Flex> buildStatusRow(float fontSize);
-  void cancelFileGesture() { m_transfers.cancelFileGesture(); }
+  void cancelFileGesture() {
+    if (!m_transfers.switchingDragTab())
+      m_transfers.cancelFileGesture();
+  }
   void textPrompt(
       std::string title, std::string message, bool password, std::function<void(std::optional<std::string>)> response
   );
@@ -266,6 +278,8 @@ private:
     return m_customSearchChild.isOpen() ? m_customSearchChild : m_modalDialog;
   }
   void manageCustomSearches();
+  bool activateArchiveAction(int id);
+  void showCompressDialog(std::vector<std::string> sources, const std::string& baseName, bool canGzip);
   void selectSearchMode(filemanager::SearchMode mode);
   void updateSearchThumbnails(Renderer& renderer);
   void updateSearchFolderCounts();
@@ -343,7 +357,14 @@ private:
   }
   void applyPendingPasteSelection() { m_transfers.applyPendingPasteSelection(); }
   void finishPendingTransferReveal(Renderer& renderer) { m_transfers.finishPendingTransferReveal(renderer); }
-  void copyToDesktopClipboard(bool cut) { m_transfers.copyToDesktopClipboard(cut); }
+  void copyToDesktopClipboard(bool cut) {
+    if (activeSession().browsingArchive()) {
+      if (!cut)
+        copyArchiveMembers();
+      return;
+    }
+    m_transfers.copyToDesktopClipboard(cut);
+  }
   void writeDesktopClipboard(std::string payload, const char* mime) {
     m_transfers.writeDesktopClipboard(std::move(payload), mime);
   }
@@ -614,6 +635,8 @@ private:
   Button* m_refreshButton = nullptr;
   std::unique_ptr<Adapter> m_adapter;
   filemanager::TabManager m_tabs;
+  std::vector<std::shared_ptr<const std::filesystem::path>> m_archiveTemporary;
+  std::uint64_t m_archiveCopyGeneration = 0;
   filemanager::FileMenuController m_menus;
   filemanager::TabBarController m_tabBar;
   filemanager::FileTransferController m_transfers;

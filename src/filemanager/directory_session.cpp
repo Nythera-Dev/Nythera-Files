@@ -9,10 +9,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <mutex>
 #include <ranges>
 #include <utility>
 
 namespace filemanager {
+  struct DirectorySession::ArchiveCredentials {
+    std::mutex mutex;
+    std::string value;
+    ~ArchiveCredentials() { explicit_bzero(value.data(), value.size()); }
+  };
 
   namespace {
 
@@ -93,11 +100,17 @@ namespace filemanager {
   void DirectorySession::navigate(
       const std::filesystem::path& requestedPath, bool recordHistory, std::string_view revealName
   ) {
+    navigateLocation(BrowserLocation{requestedPath}, recordHistory, revealName);
+  }
+
+  void DirectorySession::navigateLocation(BrowserLocation target, bool recordHistory, std::string_view revealName) {
     if (m_active && m_callbacks.onCancelFileGesture)
       m_callbacks.onCancelFileGesture();
+    const auto& requestedPath = target.path;
     std::error_code ec;
-    const bool trash = requestedPath == "trash:" || requestedPath.string().starts_with("trash:/");
-    if (trash && isPrivilegedBackendActive())
+    const bool trash =
+        !target.archiveDirectory && (requestedPath == "trash:" || requestedPath.string().starts_with("trash:/"));
+    if ((trash || target.archiveDirectory) && isPrivilegedBackendActive())
       return;
     auto path =
         trash ? requestedPath.lexically_normal() : std::filesystem::absolute(requestedPath, ec).lexically_normal();
@@ -105,12 +118,12 @@ namespace filemanager {
       path = requestedPath.lexically_normal();
     if (trash && !path.string().starts_with("trash:/"))
       path = "trash:/";
-    const bool pathChanged = path != m_path;
+    const bool pathChanged = path != m_path || m_archiveDirectory != target.archiveDirectory;
     if (m_callbacks.onBeforeNavigate)
       m_callbacks.onBeforeNavigate(path, pathChanged);
     closeSearch();
     if (recordHistory && pathChanged) {
-      m_backHistory.push_back(m_path);
+      m_backHistory.push_back(location());
       m_forwardHistory.clear();
     }
     if (pathChanged) {
@@ -120,6 +133,11 @@ namespace filemanager {
       if (m_callbacks.onBeforePathChange)
         m_callbacks.onBeforePathChange(path);
     }
+    if (path != m_path || !target.archiveDirectory || !m_archiveDirectory) {
+      m_archiveCatalogue.reset();
+      m_archiveCredentials.reset();
+    }
+    m_archiveDirectory = std::move(target.archiveDirectory);
     m_path = std::move(path);
     m_revealedHiddenName = revealName.starts_with('.') ? std::string(revealName) : std::string{};
     m_browsingTrash = trash;
@@ -128,6 +146,124 @@ namespace filemanager {
     if (m_callbacks.onAfterNavigatePathSet)
       m_callbacks.onAfterNavigatePathSet(m_path, m_browsingTrash);
     enumerate(m_path);
+  }
+
+  std::function<std::optional<std::string>(bool, GCancellable*)> DirectorySession::archivePassword() const {
+    if (!m_archiveCredentials || !m_callbacks.archivePassword)
+      return {};
+    return [credentials = m_archiveCredentials, prompt = m_callbacks.archivePassword,
+            source = m_path.native()](bool retry, GCancellable* cancellable) -> std::optional<std::string> {
+      {
+        std::lock_guard lock(credentials->mutex);
+        if (!retry && !credentials->value.empty())
+          return credentials->value;
+        explicit_bzero(credentials->value.data(), credentials->value.size());
+        credentials->value.clear();
+      }
+      auto answer = prompt(source, retry, cancellable);
+      if (answer) {
+        std::lock_guard lock(credentials->mutex);
+        explicit_bzero(credentials->value.data(), credentials->value.size());
+        credentials->value = *answer;
+      }
+      return answer;
+    };
+  }
+
+  void DirectorySession::showArchiveEntries() {
+    m_entries.clear();
+    const auto prefix = m_archiveDirectory->empty() ? std::string{} : *m_archiveDirectory + "/";
+    for (auto member = m_archiveCatalogue->entries.lower_bound(prefix);
+         member != m_archiveCatalogue->entries.end() && member->first.starts_with(prefix); ++member) {
+      const auto name = std::string_view(member->first).substr(prefix.size());
+      if (name.find('/') != std::string_view::npos || hideEntry(name))
+        continue;
+      const auto& meta = member->second;
+      FileEntry entry;
+      entry.name = name;
+      // Relative catalogue keys are used by the view; they are never filesystem operand paths.
+      entry.absPath = member->first;
+      entry.isDir = meta.kind == archive_backend::EntryKind::Directory;
+      entry.isSymlink = meta.kind == archive_backend::EntryKind::Symlink;
+      entry.size = meta.size.value_or(0);
+      if (meta.modified)
+        entry.mtime = std::filesystem::file_time_type::clock::from_sys(
+            std::chrono::sys_seconds(std::chrono::seconds(*meta.modified))
+        );
+      g_autofree gchar* type = entry.isDir ? nullptr : g_content_type_guess(entry.name.c_str(), nullptr, 0, nullptr);
+      entry.type = entry.isDir ? "inode/directory" : entry.isSymlink ? "inode/symlink" : type ? type : "";
+      m_entries.push_back(std::move(entry));
+    }
+    sortFileEntries(m_entries);
+    m_loading = false;
+    const bool chooseFirst = std::exchange(m_chooseFirstAfterLoad, false);
+    if (m_callbacks.onEnumerateCompletedStatus)
+      m_callbacks.onEnumerateCompletedStatus(m_entries.empty());
+    if (m_callbacks.onEntriesLoaded)
+      m_callbacks.onEntriesLoaded(chooseFirst);
+    if (m_callbacks.onAfterEntriesLoaded)
+      m_callbacks.onAfterEntriesLoaded();
+  }
+
+  void DirectorySession::enumerateArchive() {
+#ifdef NYTHERA_FILES_ARCHIVES
+    if (m_archiveCatalogue) {
+      showArchiveEntries();
+      return;
+    }
+    if (!m_archiveCredentials)
+      m_archiveCredentials = std::make_shared<ArchiveCredentials>();
+    struct Request {
+      DirectorySession* session;
+      std::weak_ptr<bool> alive;
+      std::uint64_t generation;
+      std::filesystem::path source;
+      std::function<std::optional<std::string>(bool, GCancellable*)> password;
+    };
+    auto* request = new Request{this, m_alive, m_enumerationGeneration, m_path, archivePassword()};
+    g_autoptr(GTask) task = g_task_new(
+        nullptr, m_enumerationCancellable,
+        [](GObject*, GAsyncResult* result, gpointer) {
+          const auto& job = *static_cast<const Request*>(g_task_get_task_data(G_TASK(result)));
+          g_autoptr(GError) error = nullptr;
+          auto catalogue = std::unique_ptr<std::shared_ptr<const archive_backend::Catalogue>>(
+              static_cast<std::shared_ptr<const archive_backend::Catalogue>*>(
+                  g_task_propagate_pointer(G_TASK(result), &error)
+              )
+          );
+          const auto alive = job.alive.lock();
+          if (!alive || !*alive || job.session->m_enumerationGeneration != job.generation)
+            return;
+          auto& session = *job.session;
+          session.m_loading = false;
+          if (!catalogue) {
+            if (session.m_callbacks.onEnumerateFailed)
+              session.m_callbacks.onEnumerateFailed(error ? error->message : "Could not read this archive.");
+            return;
+          }
+          session.m_archiveCatalogue = std::move(*catalogue);
+          session.showArchiveEntries();
+        },
+        nullptr
+    );
+    g_task_set_task_data(task, request, [](gpointer data) { delete static_cast<Request*>(data); });
+    g_task_run_in_thread(task, [](GTask* worker, gpointer, gpointer data, GCancellable* cancellable) {
+      const auto& job = *static_cast<const Request*>(data);
+      try {
+        archive_backend::Callbacks callbacks;
+        if (job.password)
+          callbacks.password = [&](bool retry) { return job.password(retry, cancellable); };
+        auto catalogue = archive_backend::inspect(job.source, cancellable, callbacks);
+        g_task_return_pointer(worker, new std::shared_ptr(std::move(catalogue)), [](gpointer result) {
+          delete static_cast<std::shared_ptr<const archive_backend::Catalogue>*>(result);
+        });
+      } catch (const std::exception& error) {
+        g_task_return_new_error(worker, G_IO_ERROR, G_IO_ERROR_FAILED, "%s", error.what());
+      }
+    });
+#else
+    m_loading = false;
+#endif
   }
 
   void DirectorySession::navigateTrash() { navigate(std::filesystem::path("trash:/")); }
@@ -154,14 +290,16 @@ namespace filemanager {
     }
   }
 
-  void
-  DirectorySession::setHistory(std::vector<std::filesystem::path> back, std::vector<std::filesystem::path> forward) {
+  void DirectorySession::setHistory(std::vector<BrowserLocation> back, std::vector<BrowserLocation> forward) {
     m_backHistory = std::move(back);
     m_forwardHistory = std::move(forward);
   }
 
   std::optional<std::uint64_t> DirectorySession::folderItemCount(const FileEntry& entry) {
-    if (!m_active || !entry.isDir || !(m_callbacks.isSizeColumnVisible && m_callbacks.isSizeColumnVisible()))
+    if (browsingArchive()
+        || !m_active
+        || !entry.isDir
+        || !(m_callbacks.isSizeColumnVisible && m_callbacks.isSizeColumnVisible()))
       return std::nullopt;
     const auto path = entry.absPath.string();
     if (const auto found = m_folderCounts.find(path); found != m_folderCounts.end())
@@ -465,6 +603,12 @@ namespace filemanager {
     enumerate(m_path, refreshSearch);
   }
 
+  void DirectorySession::reloadArchive() {
+    m_archiveCatalogue.reset();
+    m_archiveCredentials.reset();
+    refreshPreservingSelection();
+  }
+
   void DirectorySession::enumerate(const std::filesystem::path& path, bool refreshSearch) {
     if (m_active)
       FileIcon::invalidateDirectoryMetadata();
@@ -484,7 +628,7 @@ namespace filemanager {
     m_path = path;
     const bool userInitiated = std::exchange(m_nextEnumerateUserInitiated, false);
     const bool privileged = isPrivilegedBackendActive() && static_cast<bool>(m_privilegedBackend.enumerateDirectory);
-    if (!m_browsingTrash && (!privileged || static_cast<bool>(m_directoryWritableQueryHook))) {
+    if (!browsingArchive() && !m_browsingTrash && (!privileged || static_cast<bool>(m_directoryWritableQueryHook))) {
       queryDirectoryWritableAsync(path);
     } else {
       cancelDirectoryWritableQuery();
@@ -498,6 +642,11 @@ namespace filemanager {
     m_pendingMonitorChanges.clear();
     if (m_callbacks.onEnumerateStarted)
       m_callbacks.onEnumerateStarted(m_path, m_browsingTrash);
+
+    if (browsingArchive()) {
+      enumerateArchive();
+      return;
+    }
 
     if (privileged) {
       std::weak_ptr<bool> weakAlive = m_alive;
@@ -799,7 +948,7 @@ namespace filemanager {
   }
 
   bool DirectorySession::currentDirectoryWritable() const {
-    if (m_browsingTrash)
+    if (m_browsingTrash || browsingArchive())
       return false;
     return m_directoryWritable.has_value() && m_directoryWritablePath == m_path && *m_directoryWritable;
   }

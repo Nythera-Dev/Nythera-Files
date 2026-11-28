@@ -1,7 +1,9 @@
 #include "filemanager/file_menu_controller.h"
 
 #include "config/config_service.h"
+#include "core/files/display_text.h"
 #include "core/files/resource_paths.h"
+#include "filemanager/file_archive_actions.h"
 #include "filemanager/file_columns.h"
 #include "filemanager/file_interaction.h"
 #include "filemanager/file_sort.h"
@@ -503,7 +505,7 @@ namespace filemanager {
              && !selectedEntry->isDir},
         {.id = 30004,
          .label = "Open in New Window",
-         .enabled = !session.browsingTrash() && selectedDirectory,
+         .enabled = !session.browsingTrash() && !session.browsingArchive() && selectedDirectory,
          .actionIconNames = {"window-new-symbolic", "window-new"},
          .actionGlyph = "app-window"},
         {.separator = true},
@@ -691,6 +693,7 @@ namespace filemanager {
             {.separator = true},
             {.id = menu_id::kPreviewMode,
              .label = "Preview Pane",
+             .enabled = !session.browsingArchive(),
              .hasSubmenu = true,
              .shortcut = "F8",
              .submenuEntries =
@@ -791,6 +794,61 @@ namespace filemanager {
                                                                                : std::vector<std::string>{};
   }
 
+  std::vector<ContextMenuControlEntry> FileMenuController::archiveMenuEntries() const {
+    using namespace menu_id;
+    if (m_operations.replaying() || m_places.hasActiveDeviceOperations())
+      return {};
+    if (m_tabs.activeTab().session.browsingArchive()) {
+      return {
+          {.id = kExtractSelected,
+           .label = "Extract Selected…",
+           .enabled = m_tabs.activeTab().session.archiveCatalogue() && !m_callbacks.selectedPaths().empty(),
+           .actionGlyph = "file-zip"}
+      };
+    }
+    const auto selection = archiveSelection(
+        m_tabs.activeTab(),
+        m_callbacks.selectedPathsOrdered ? m_callbacks.selectedPathsOrdered() : std::vector<std::string>{}
+    );
+    std::vector<ContextMenuControlEntry> entries;
+    if (selection.canCompress) {
+      const auto quick = [&](int id, std::string_view suffix) {
+        return ContextMenuControlEntry{
+            .id = id,
+            .label = "Compress to \"" + sanitizeFilenameForDisplay(selection.baseName) + std::string(suffix) + "\"",
+            .enabled = selection.canWriteHere
+        };
+      };
+      std::vector<ContextMenuControlEntry> children;
+      if (selection.canTarGzip)
+        children.push_back(quick(kCompressTarGzip, ".tar.gz"));
+      if (selection.canZip)
+        children.push_back(quick(kCompressZip, ".zip"));
+      children.push_back({.id = kCompressTo, .label = "Compress To…"});
+      entries.push_back(
+          {.id = kArchiveCompress,
+           .label = "Compress",
+           .hasSubmenu = true,
+           .submenuEntries = std::move(children),
+           .actionGlyph = "file-zip",
+           .attachSubmenuContent = true}
+      );
+    }
+    if (selection.canExtract)
+      entries.push_back(
+          {.id = kArchiveExtract,
+           .label = "Extract",
+           .hasSubmenu = true,
+           .submenuEntries =
+               {{.id = kExtractHere, .label = "Extract Here", .enabled = selection.canWriteHere},
+                {.id = kExtractFolder, .label = "Extract to Folder", .enabled = selection.canWriteHere},
+                {.id = kExtractTo, .label = "Extract To…"}},
+           .actionGlyph = "folder-open",
+           .attachSubmenuContent = true}
+      );
+    return entries;
+  }
+
   std::vector<ContextMenuControlEntry> FileMenuController::toolsMenuEntries() {
     namespace tools = external_tools;
     const auto& tab = m_tabs.activeTab();
@@ -850,6 +908,18 @@ namespace filemanager {
       }
       rows.push_back(std::move(entry));
     }
+#ifdef NYTHERA_FILES_ARCHIVES
+    auto archiveEntries = archiveMenuEntries();
+    rows.push_back({.separator = true});
+    rows.insert(
+        rows.end(), std::make_move_iterator(archiveEntries.begin()), std::make_move_iterator(archiveEntries.end())
+    );
+    rows.push_back(
+        {.id = menu_id::kAvoidRedundantExtractionFolders,
+         .label = "Avoid redundant extraction folders",
+         .toggleState = m_settings.avoidRedundantExtractionFolders() ? 1 : 0}
+    );
+#endif
     const auto checksums = m_callbacks.checksumMenuEntries ? m_callbacks.checksumMenuEntries()
                                                            : ChecksumDialogController::menuEntries(false);
     rows.push_back({.separator = true});
@@ -858,7 +928,10 @@ namespace filemanager {
     rows.push_back({
         .id = menu_id::kActAsAdministrator,
         .label = "Act as Administrator",
-        .enabled = !tab.session.browsingTrash() && !tab.hasActiveAdminSession() && !tab.adminSession.isAuthenticating(),
+        .enabled = !tab.session.browsingArchive()
+            && !tab.session.browsingTrash()
+            && !tab.hasActiveAdminSession()
+            && !tab.adminSession.isAuthenticating(),
         .actionIconNames = {"security-high-symbolic", "dialog-password-symbolic"},
         .actionGlyph = "shield",
     });
@@ -1033,6 +1106,23 @@ namespace filemanager {
     if (!m_callbacks.selectedPaths().contains(path) && m_callbacks.onSelectSingleForContextMenu)
       m_callbacks.onSelectSingleForContextMenu(index);
 
+    if (session.browsingArchive()) {
+      const auto& selected = session.entries()[index];
+      std::vector<ContextMenuControlEntry> entries{
+          {.id = 10, .label = "Open", .enabled = !selected.isSymlink, .actionGlyph = "folder-open"},
+          {.id = menu_id::kOpenArchiveMemberWith,
+           .label = "Open With…",
+           .enabled = !selected.isDir && !selected.isSymlink},
+          {.id = 1, .label = "Copy", .shortcut = "Ctrl+C", .actionGlyph = "copy"},
+          {.id = menu_id::kExtractSelected, .label = "Extract Selected…", .actionGlyph = "archive"},
+          {.id = 22, .label = "Properties", .shortcut = "Alt+Enter", .actionGlyph = "file-info"},
+      };
+      openMainContextMenu(
+          {.entries = std::move(entries), .anchor = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 1, 1}},
+          highlightOnOpen, true
+      );
+      return;
+    }
     const bool targetIsDir = session.entries()[index].isDir;
     const bool canOpenTarget = targetIsDir
         || !tab.administratorBrowsing
@@ -1088,6 +1178,16 @@ namespace filemanager {
     else {
       if (!targetIsDir && caps.canLaunchApps && canOpenTarget) {
         appendOpenWithEntries(session.entries()[index], entries);
+#ifdef NYTHERA_FILES_ARCHIVES
+        if (!tab.administratorBrowsing && !session.entries()[index].isSymlink) {
+          const auto format = archive_backend::formatFromName(session.entries()[index].name);
+          if (format && std::ranges::any_of(archive_backend::capabilities(), [&](const auto& cap) {
+                return cap.format == *format && cap.extract;
+              })) {
+            entries.front() = {.id = 10, .label = "Open", .actionGlyph = "folder-open"};
+          }
+        }
+#endif
       } else if (!targetIsDir) {
         entries.insert(
             entries.begin() + 1,
@@ -1185,6 +1285,10 @@ namespace filemanager {
            .actionGlyph = "copy"}
       );
     }
+    auto archiveEntries = archiveMenuEntries();
+    entries.insert(
+        entries.end(), std::make_move_iterator(archiveEntries.begin()), std::make_move_iterator(archiveEntries.end())
+    );
     filemanager::groupFileMenuEntries(
         entries,
         session.browsingTrash()              ? filemanager::FileMenuContext::Trash

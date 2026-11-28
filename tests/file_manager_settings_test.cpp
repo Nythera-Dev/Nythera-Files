@@ -80,6 +80,14 @@ namespace {
     TEST_CHECK(config["files"]["show_hidden"].value<bool>() == true);
     TEST_CHECK(config["files"].as_table()->size() == 1);
     TEST_CHECK(!config["files"]["sidebar_width"]);
+    TEST_CHECK(settings.avoidRedundantExtractionFolders());
+    TEST_CHECK(settings.setAvoidRedundantExtractionFolders(false));
+    TEST_CHECK(!settings.avoidRedundantExtractionFolders());
+    TEST_CHECK(
+        toml::parse_file((filesDir / "config.toml").string())["files"]["avoid_redundant_extraction_folders"]
+            .value<bool>()
+        == false
+    );
     TEST_CHECK(settings.previewMode() == filemanager::PreviewMode::Full);
     TEST_CHECK(settings.thumbnailPolicy() == filemanager::ThumbnailPolicy::Local);
     TEST_CHECK(settings.thumbnailMaxFileMiB() == 64 && settings.thumbnailCacheMiB() == 1024);

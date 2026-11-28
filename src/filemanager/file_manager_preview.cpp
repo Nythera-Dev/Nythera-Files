@@ -24,6 +24,8 @@ const FileEntry* FileManager::selectedPreviewEntry() {
 }
 
 void FileManager::setPreviewMode(filemanager::PreviewMode mode) {
+  if (activeSession().browsingArchive())
+    return;
   if (mode != filemanager::PreviewMode::Hidden)
     m_lastVisiblePreviewMode = mode;
   if (!m_settings.setPreviewMode(mode))
@@ -33,6 +35,8 @@ void FileManager::setPreviewMode(filemanager::PreviewMode mode) {
 }
 
 void FileManager::togglePreviewPane() {
+  if (activeSession().browsingArchive())
+    return;
   const auto current = m_settings.previewMode();
   if (current == filemanager::PreviewMode::Hidden) {
     setPreviewMode(m_lastVisiblePreviewMode);

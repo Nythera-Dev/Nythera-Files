@@ -15,6 +15,7 @@
 #include "ui/controls/input.h"
 #include "ui/controls/label.h"
 #include "ui/controls/scroll_view.h"
+#include "ui/controls/select_dropdown_popup.h"
 #include "ui/controls/separator.h"
 #include "ui/dialogs/dialog_background_artwork.h"
 #include "ui/dialogs/file_icon.h"
@@ -72,6 +73,8 @@ namespace filemanager {
   }
 
   void ModalDialogHost::forceCloseImmediate() {
+    if (auto cancel = std::exchange(m_cancelArchivePassword, nullptr))
+      cancel();
     if (hoverTooltipsEnabled())
       TooltipManager::instance().forceDestroy();
     savePendingDialogSize();
@@ -80,6 +83,8 @@ namespace filemanager {
     m_configuredDialogSize.reset();
     m_wayland.stopKeyRepeat();
     m_dispatcher.setTextInputContext(nullptr, nullptr);
+    if (m_selectDropdown)
+      m_selectDropdown->closeSelectDropdown();
     if (m_customContent && m_customContent->onDismiss)
       m_customContent->onDismiss();
     if (auto dismiss = std::exchange(m_symlinkDismissCallback, nullptr))
@@ -95,6 +100,7 @@ namespace filemanager {
     m_conflict.reset();
     m_conflictRequest.reset();
     m_root.reset();
+    m_selectDropdown.reset();
     m_surface.reset();
     m_modalHint.reset();
     m_alternativeNameInput = nullptr;
@@ -160,6 +166,101 @@ namespace filemanager {
         },
         nullptr, false, true
     );
+  }
+
+  std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)>
+  ModalDialogHost::makeArchivePasswordResolver() {
+    return [this, alive = std::weak_ptr<bool>(m_alive), mutex = m_conflictMutex](
+               const std::string& source, bool retry, GCancellable* cancellable
+           ) -> std::optional<std::string> {
+      const auto active = [&] {
+        const auto life = alive.lock();
+        return life && *life && !g_cancellable_is_cancelled(cancellable);
+      };
+      std::unique_lock lock(*mutex, std::defer_lock);
+      while (active() && !lock.try_lock_for(std::chrono::milliseconds(20))) {
+      }
+      if (!active())
+        return std::nullopt;
+      struct Prompt {
+        ModalDialogHost* host;
+        std::weak_ptr<bool> alive;
+        std::shared_ptr<GCancellable> cancellable;
+        std::promise<std::optional<std::string>> reply;
+        std::string name;
+        bool retry;
+        bool shown = false;
+        bool finished = false;
+      };
+      auto pending = std::make_shared<Prompt>(Prompt{
+          this,
+          alive,
+          {G_CANCELLABLE(g_object_ref(cancellable)), g_object_unref},
+          {},
+          sanitizeFilenameForDisplay(std::filesystem::path(source).filename().native()),
+          retry
+      });
+      auto result = pending->reply.get_future();
+      g_timeout_add_full(
+          G_PRIORITY_DEFAULT, 20,
+          [](gpointer data) -> gboolean {
+            const auto request = *static_cast<std::shared_ptr<Prompt>*>(data);
+            auto* self = request->host;
+            const auto life = request->alive.lock();
+            if (!life || !*life || request->finished)
+              return G_SOURCE_REMOVE;
+            if (g_cancellable_is_cancelled(request->cancellable.get())) {
+              if (request->shown && self->m_textPrompt && self->isOpen())
+                self->closeDialog(0);
+              return G_SOURCE_REMOVE;
+            }
+            if (request->shown || self->isOpen())
+              return G_SOURCE_CONTINUE;
+            request->shown = true;
+            if (self->m_callbacks.isMainWindowOpen && !self->m_callbacks.isMainWindowOpen()) {
+              self->m_backgroundConflictPending = true;
+              if (self->m_callbacks.syncProgressWindow)
+                self->m_callbacks.syncProgressWindow();
+            }
+            self->m_cancelArchivePassword = [request] {
+              request->finished = true;
+              request->host->m_textPrompt = false;
+              request->host->m_passwordPrompt = false;
+              request->host->m_backgroundConflictPending = false;
+              request->reply.set_value(std::nullopt);
+            };
+            self->textPrompt(
+                "Archive password for " + request->name,
+                request->retry ? "The password was rejected or the encrypted data is damaged. Try again."
+                               : "Enter the password for this archive.",
+                true, [request](std::optional<std::string> password) {
+                  if (request->finished)
+                    return;
+                  request->finished = true;
+                  auto* host = request->host;
+                  host->m_cancelArchivePassword = {};
+                  host->m_backgroundConflictPending = false;
+                  if (host->m_callbacks.syncProgressWindow)
+                    host->m_callbacks.syncProgressWindow();
+                  request->reply.set_value(std::move(password));
+                }
+            );
+            return G_SOURCE_CONTINUE;
+          },
+          new std::shared_ptr<Prompt>(pending),
+          [](gpointer data) { delete static_cast<std::shared_ptr<Prompt>*>(data); }
+      );
+      while (active()) {
+        if (result.wait_for(std::chrono::milliseconds(20)) == std::future_status::ready) {
+          auto password = result.get();
+          if (!password || !password->empty())
+            return password;
+          // An empty confirmation is treated as dismissal by the archive backend.
+          return std::nullopt;
+        }
+      }
+      return std::nullopt;
+    };
   }
 
   void ModalDialogHost::showSymlinkDialog(
@@ -561,7 +662,7 @@ namespace filemanager {
     m_sizeStateKey = m_customContent && !m_customContent->sizeStateKey.empty()
         ? m_customContent->sizeStateKey
         : FileManagerSettings::dialogSizeStateKey(m_title, alternativeName && !m_textPrompt);
-    if (m_resizable) {
+    if (m_resizable && (!m_customContent || m_customContent->rememberSize)) {
       if (const auto saved = m_settings.loadDialogSize(m_sizeStateKey)) {
         m_preferredWidth = saved->first;
         m_preferredHeight = saved->second;
@@ -752,6 +853,11 @@ namespace filemanager {
       m_wayland.stopKeyRepeat();
       m_surface = std::move(surface);
       m_surface->setSceneRoot(m_root.get());
+      if (m_customContent && m_customContent->selectDropdowns) {
+        m_selectDropdown = std::make_unique<SelectDropdownPopup>(m_wayland, m_renderContext);
+        m_selectDropdown->setParent(m_surface->xdgSurface(), m_surface->wlSurface(), output);
+        m_root->setPopupContext(m_selectDropdown.get());
+      }
       m_dispatcher.setTextInputContext(m_surface->wlSurface(), m_wayland.textInputService());
     } else {
       auto failed = std::move(m_response);
@@ -803,6 +909,8 @@ namespace filemanager {
     if (hoverTooltipsEnabled())
       TooltipManager::instance().forceDestroy();
     m_closeQueued = true;
+    if (m_selectDropdown)
+      m_selectDropdown->closeSelectDropdown();
     m_wayland.stopKeyRepeat();
     m_dispatcher.setTextInputContext(nullptr, nullptr);
     struct DialogCloseRequest {
@@ -829,7 +937,8 @@ namespace filemanager {
           self->savePendingDialogSize();
           self->m_dialogHeightAnimation.cancelAll();
           if (self->m_resizable
-              && (!self->m_customContent || self->m_customContent->sizeStateKey.empty())
+              && (!self->m_customContent
+                  || (self->m_customContent->rememberSize && self->m_customContent->sizeStateKey.empty()))
               && self->m_surface
               && self->m_surface->width() >= 360
               && self->m_surface->height() >= 180) {
@@ -854,6 +963,7 @@ namespace filemanager {
           self->m_cornerAccent = nullptr;
           self->m_conflict.reset();
           self->m_root.reset();
+          self->m_selectDropdown.reset();
           self->m_surface.reset();
           self->m_modalHint.reset();
           self->m_alternativeNameInput = nullptr;
@@ -875,8 +985,22 @@ namespace filemanager {
     m_resultPending = response;
   }
 
+  bool ModalDialogHost::ownsSurface(wl_surface* surface) const noexcept {
+    return surface && (surface == wlSurface() || (m_selectDropdown && surface == m_selectDropdown->wlSurface()));
+  }
+
   void ModalDialogHost::handlePointer(const PointerEvent& event) {
-    if (!m_surface || m_closeQueued || event.surface != m_surface->wlSurface())
+    if (!m_surface || m_closeQueued)
+      return;
+    if (m_selectDropdown && m_selectDropdown->isSelectDropdownOpen()) {
+      if (m_selectDropdown->onPointerEvent(event))
+        return;
+      if (event.type == PointerEvent::Type::Button && event.pressed) {
+        m_selectDropdown->closeSelectDropdown();
+        return;
+      }
+    }
+    if (event.surface != m_surface->wlSurface())
       return;
     const float x = static_cast<float>(event.sx), y = static_cast<float>(event.sy);
     auto& tooltip = TooltipManager::instance();
@@ -928,6 +1052,10 @@ namespace filemanager {
     }
     if (!m_surface)
       return;
+    if (m_selectDropdown && m_selectDropdown->isSelectDropdownOpen()) {
+      m_selectDropdown->onKeyboardEvent(event);
+      return;
+    }
     if (!event.pressed) {
       m_dispatcher.keyEvent(event.sym, event.utf32, event.modifiers, false, event.preedit, false);
       return;
@@ -1110,7 +1238,7 @@ namespace filemanager {
         itemRow->setAlign(FlexAlign::Center);
         itemRow->setGap(10.0F);
         auto icon = std::make_unique<FileIcon>();
-        icon->setAllowFilesystemQueries(m_conflict->pathAccess == ConflictPathAccess::Local);
+        icon->setAllowFilesystemQueries(m_conflict->pathAccess == ConflictPathAccess::Local && item.path.is_absolute());
         // Pass the exact unmodified filesystem path and directory flag to FileIcon.
         icon->setFile(item.path, item.isDirectory);
         icon->setGlyphSize(28.0F);

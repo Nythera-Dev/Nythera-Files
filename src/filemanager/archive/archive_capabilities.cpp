@@ -65,6 +65,42 @@ namespace filemanager::archive_backend {
     return std::nullopt;
   }
 
+  std::string_view extension(Format format) {
+    const auto it = std::ranges::find(formats, format, &decltype(formats)::value_type::first);
+    return it == formats.end() ? std::string_view{} : it->second;
+  }
+
+  std::string archiveStem(std::string_view name) {
+    if (const auto format = formatFromName(name)) {
+      const auto suffix =
+          *format == Format::TarGzip && name.size() > 4 && name[name.size() - 4] == '.' ? 4 : extension(*format).size();
+      return std::string(name.substr(0, name.size() - suffix));
+    }
+    return std::filesystem::path(name).stem().native();
+  }
+
+  bool canWriteMethod(Format format, Method method) {
+    auto* writer = archive_write_new();
+    if (!writer)
+      return false;
+    const bool available = detail::setFormat(writer, format, Level::Balanced, method) == ARCHIVE_OK;
+    archive_write_free(writer);
+    return available;
+  }
+
+  bool canEncryptZip() {
+    static const bool available = [] {
+      auto* writer = archive_write_new();
+      if (!writer)
+        return false;
+      const bool usable = archive_write_set_format_zip(writer) == ARCHIVE_OK
+          && archive_write_set_format_option(writer, "zip", "encryption", "aes256") == ARCHIVE_OK;
+      archive_write_free(writer);
+      return usable;
+    }();
+    return available;
+  }
+
   std::span<const Capability> capabilities() {
     static const auto available = [] {
       std::array<Capability, formats.size()> result{};
@@ -158,25 +194,47 @@ namespace filemanager::archive_backend::detail {
         : status;
   }
 
-  int setFormat(struct archive* writer, Format format, Level level) {
+  int setFormat(struct archive* writer, Format format, Level level, Method method) {
     if (format == Format::Rar)
       return ARCHIVE_FATAL;
     if (format == Format::Gzip)
-      return archive_write_set_format_raw(writer);
+      return method == Method::Default ? archive_write_set_format_raw(writer) : ARCHIVE_FATAL;
     if (format == Format::Zip) {
-      const auto status = archive_write_set_format_zip(writer);
+      if (method != Method::Default && method != Method::Deflate && method != Method::Store)
+        return ARCHIVE_FATAL;
+      auto status = archive_write_set_format_zip(writer);
+      if (status == ARCHIVE_OK && method == Method::Store)
+        return archive_write_set_format_option(writer, "zip", "compression", "store");
       return status == ARCHIVE_OK
           ? archive_write_set_format_option(writer, "zip", "compression-level", compressionLevel(level))
           : status;
     }
     if (format != Format::SevenZip)
-      return archive_write_set_format_pax_restricted(writer);
+      return method == Method::Default ? archive_write_set_format_pax_restricted(writer) : ARCHIVE_FATAL;
+    const char* codec = nullptr;
+    switch (method) {
+    case Method::Default:
+    case Method::Lzma2:
+      codec = "lzma2";
+      break;
+    case Method::Lzma:
+      codec = "lzma1";
+      break;
+    case Method::Deflate:
+      codec = "deflate";
+      break;
+    case Method::Copy:
+      codec = "copy";
+      break;
+    default:
+      return ARCHIVE_FATAL;
+    }
     if (!archive_liblzma_version())
       return ARCHIVE_FATAL;
     auto status = archive_write_set_format_7zip(writer);
     if (status == ARCHIVE_OK)
-      status = archive_write_set_format_option(writer, "7zip", "compression", "lzma2");
-    if (status == ARCHIVE_OK)
+      status = archive_write_set_format_option(writer, "7zip", "compression", codec);
+    if (status == ARCHIVE_OK && method != Method::Copy)
       status = archive_write_set_format_option(writer, "7zip", "compression-level", compressionLevel(level));
     // Older libarchive 7z encoders only support a single thread.
     if (status == ARCHIVE_OK && archive_version_number() >= 3008000)

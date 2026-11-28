@@ -15,7 +15,16 @@
 struct archive;
 
 namespace filemanager::archive_backend::detail {
-  enum class FileErrorKind { Other, Cancelled, Unsupported, InvalidArgument, NameTooLong, NoSpace, Changed };
+  enum class FileErrorKind {
+    Other,
+    Cancelled,
+    Unsupported,
+    InvalidArgument,
+    NameTooLong,
+    NoSpace,
+    Changed,
+    EncryptedSevenZip
+  };
   struct Error : std::runtime_error {
     FileErrorKind kind;
     Error(FileErrorKind reason, std::string message) : std::runtime_error(std::move(message)), kind(reason) {}
@@ -72,13 +81,8 @@ namespace filemanager::archive_backend::detail {
     bool cleanup() noexcept;
   };
 
-  enum class EntryKind { File, Directory, Symlink, Hardlink };
-  struct Entry {
-    EntryKind kind;
-    std::string link;
-    unsigned mode = 0600;
-  };
   using Entries = std::map<std::string, Entry, std::less<>>;
+  using Projection = std::map<std::string, std::string, std::less<>>;
   struct Source {
     Fd parent, file;
     std::string name;
@@ -104,10 +108,24 @@ namespace filemanager::archive_backend::detail {
   [[noreturn]] void archiveError(struct archive* value, Work& work);
   void requireArchive(int status, struct archive* value, Work& work);
 
-  int setFormat(struct archive* writer, Format format, Level level);
+  int setFormat(struct archive* writer, Format format, Level level, Method method = Method::Default);
   int addFilter(struct archive* writer, Format format, Level level);
   bool nativeFilter(Format format);
+  void writeArchive(
+      std::span<const std::filesystem::path> sources, Stage& stage, Format format, Level level, Work& work,
+      const EncryptionOptions& options
+  );
+  void writeEncryptedSevenZip(
+      std::span<const std::filesystem::path> sources, Stage& stage, Level level, const EncryptionOptions& options,
+      Work& work
+  );
+  void readEncryptedSevenZip(const Source& source, Stage& stage, Work& work);
+  Entries inspectEncryptedSevenZip(const Source& source, Stage& stage, Work& work);
+  void readSelectedSevenZip(
+      const Source& source, const Catalogue& catalogue, const Projection& items, Stage& stage, Work& work
+  );
+  Entries inspectArchive(const Source& source, Work& work);
   void
-  writeArchive(std::span<const std::filesystem::path> sources, Stage& stage, Format format, Level level, Work& work);
+  readSelected(const Source& source, const Catalogue& catalogue, const Projection& items, Stage& stage, Work& work);
   void readArchive(const std::filesystem::path& path, const Source& source, Stage& stage, Work& work);
 } // namespace filemanager::archive_backend::detail

@@ -1,10 +1,11 @@
 #pragma once
 
 #include "filemanager/admin_session_client.h"
+#include "filemanager/archive/archive_backend.h"
 #include "filemanager/file_operation_engine.h"
 #include "filemanager/property_operations.h"
-#include "filemanager/transfer_rates.h"
 #include "filemanager/tab_presentation.h"
+#include "filemanager/transfer_rates.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -41,7 +42,9 @@ public:
     EmptyWastebin,
     Properties,
     Undo,
-    Redo
+    Redo,
+    Compress,
+    Extract
   };
   using ConflictAction = filemanager::file_operation_engine::ConflictAction;
   using ConflictDecision = filemanager::file_operation_engine::ConflictDecision;
@@ -71,6 +74,7 @@ public:
     std::optional<TrashFallbackOffer> trashFallback;
     std::optional<AdminOperationOrigin> adminOrigin;
     std::size_t requestedItemCount = 0;
+    std::size_t skippedEntries = 0;
     double fraction = 0.0;
     std::uint64_t processedBytes = 0;
     std::uint64_t totalBytes = 0;
@@ -106,6 +110,24 @@ public:
   std::uint64_t copy(std::vector<std::string> sources, std::string destinationDirectory, filemanager::BrowserTab* adminTab = nullptr);
   std::uint64_t duplicate(std::vector<std::string> sources, std::string destinationDirectory, filemanager::BrowserTab* adminTab = nullptr);
   std::uint64_t move(std::vector<std::string> sources, std::string destinationDirectory, filemanager::BrowserTab* adminTab = nullptr);
+  std::uint64_t compress(
+      std::vector<std::string> sources, std::string output, filemanager::archive_backend::Format format,
+      filemanager::archive_backend::Level level, filemanager::archive_backend::EncryptionOptions options = {}
+  );
+  std::uint64_t extract(
+      std::string source, std::string destinationDirectory,
+      filemanager::archive_backend::Extraction mode = filemanager::archive_backend::Extraction::Direct
+  );
+  using ArchivePassword = std::function<std::optional<std::string>(bool, GCancellable*)>;
+  std::uint64_t extractSelected(
+      filemanager::archive_backend::Selection selection, std::string destination, ArchivePassword password,
+      std::function<void(const Operation&)> completion = {}
+  );
+  void setArchivePasswordResolver(
+      std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)> resolver
+  ) {
+    m_archivePasswordResolver = std::move(resolver);
+  }
   std::uint64_t rename(std::string source, std::string destination);
   std::uint64_t renameChecked(
       std::string source, std::string destination, std::uint64_t device, std::uint64_t inode,
@@ -156,6 +178,15 @@ private:
   struct WorkerDrain;
   struct Task;
   struct Result;
+  struct ArchiveOptions {
+    filemanager::archive_backend::Format format = filemanager::archive_backend::Format::TarGzip;
+    filemanager::archive_backend::Level level = filemanager::archive_backend::Level::Balanced;
+    filemanager::archive_backend::EncryptionOptions encryption;
+    filemanager::archive_backend::Extraction extraction = filemanager::archive_backend::Extraction::Direct;
+    std::optional<filemanager::archive_backend::Selection> selection;
+    ArchivePassword password;
+    std::function<void(const Operation&)> completion;
+  };
   using Revision = filemanager::file_operation_engine::Revision;
   struct HistoryEntry {
     Kind kind;
@@ -176,7 +207,7 @@ private:
       std::function<void(const filemanager::PropertyResult&)> completed = {},
       std::optional<std::pair<std::uint64_t, std::uint64_t>> renameIdentity = {},
       std::function<void(bool, const std::string&)> renameCompleted = {}, bool keepBoth = false,
-      filemanager::BrowserTab* adminTab = nullptr
+      filemanager::BrowserTab* adminTab = nullptr, std::optional<ArchiveOptions> archiveOptions = {}
   );
   static void worker(GTask* task, gpointer source, gpointer taskData, GCancellable* cancellable);
   static void completed(GObject* source, GAsyncResult* result, gpointer userData);
@@ -198,6 +229,7 @@ private:
   Changed m_changed;
   ConflictResolver m_conflictResolver;
   ConflictResolver m_adminConflictResolver;
+  std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)> m_archivePasswordResolver;
   WastebinBackend m_wastebinBackend;
   std::vector<Operation> m_operations;
   std::vector<HistoryEntry> m_undo;

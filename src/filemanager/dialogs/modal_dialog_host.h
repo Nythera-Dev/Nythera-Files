@@ -30,6 +30,7 @@ class Label;
 class Node;
 class RenderContext;
 class Renderer;
+class SelectDropdownPopup;
 class WaylandConnection;
 
 namespace filemanager {
@@ -83,6 +84,8 @@ namespace filemanager {
       bool headerCloseButton = false;
       bool compositorBorder = false;
       bool compactHeightMode = false;
+      bool selectDropdowns = false;
+      bool rememberSize = true;
       std::uint32_t preferredWidth = 0;
       std::uint32_t preferredHeight = 0;
       std::uint32_t minWidth = 0;
@@ -137,6 +140,8 @@ namespace filemanager {
 
     [[nodiscard]] FileOperationManager::ConflictResolver
     makeConflictResolver(ConflictPathAccess pathAccess = ConflictPathAccess::Local);
+    [[nodiscard]] std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)>
+    makeArchivePasswordResolver();
     [[nodiscard]] static std::string sanitizeConflictDisplayText(std::string_view text);
 
     [[nodiscard]] bool isOpen() const noexcept { return m_surface != nullptr || m_pendingPresentation.has_value(); }
@@ -148,9 +153,7 @@ namespace filemanager {
     [[nodiscard]] bool backgroundConflictPending() const noexcept { return m_backgroundConflictPending; }
     [[nodiscard]] ToplevelSurface* surface() const noexcept { return m_surface.get(); }
     [[nodiscard]] wl_surface* wlSurface() const noexcept { return m_surface ? m_surface->wlSurface() : nullptr; }
-    [[nodiscard]] bool ownsSurface(wl_surface* surface) const noexcept {
-      return m_surface && surface == m_surface->wlSurface();
-    }
+    [[nodiscard]] bool ownsSurface(wl_surface* surface) const noexcept;
 
   private:
     friend class ::FileManagerTestAccess;
@@ -184,6 +187,7 @@ namespace filemanager {
     ToplevelSurface::ModalHint m_modalHint;
     InputDispatcher m_dispatcher;
     std::unique_ptr<Flex> m_root;
+    std::unique_ptr<SelectDropdownPopup> m_selectDropdown;
     std::vector<Flex*> m_cards;
     std::function<void(int)> m_response;
     std::string m_title;
@@ -230,6 +234,7 @@ namespace filemanager {
     Label* m_alternativeNameError = nullptr;
     bool m_textPrompt = false;
     bool m_passwordPrompt = false;
+    std::function<void()> m_cancelArchivePassword;
     bool m_backgroundConflictPending = false;
     bool m_symlinkDialogActive = false;
     std::function<std::optional<SymlinkError>(const std::string&, const std::string&)> m_symlinkSubmitCallback;

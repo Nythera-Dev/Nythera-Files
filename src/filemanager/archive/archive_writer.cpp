@@ -46,13 +46,17 @@ namespace {
     std::array<char, 65536> buffer{};
     bool finished = false;
     std::unique_ptr<struct archive, decltype(&archive_write_free)> value{archive_write_new(), &archive_write_free};
-    Writer(int directory, Format format, Level level, Work& request)
+    Writer(int directory, Format format, Level level, Work& request, const EncryptionOptions& options)
         : work(request),
           output(opened(::openat(directory, "output", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600))),
           stageIdentity(statFd(directory)) {
       if (!value)
         throwFileError(FileErrorKind::Other, "Could not allocate an archive writer.");
-      requireArchive(setFormat(value.get(), format, level), value.get(), work);
+      requireArchive(setFormat(value.get(), format, level, options.method), value.get(), work);
+      if (!options.password.empty()) {
+        requireArchive(archive_write_set_format_option(value.get(), "zip", "encryption", "aes256"), value.get(), work);
+        requireArchive(archive_write_set_passphrase(value.get(), options.password.c_str()), value.get(), work);
+      }
       requireArchive(addFilter(value.get(), format, level), value.get(), work);
       requireArchive(archive_write_set_bytes_per_block(value.get(), 0), value.get(), work);
       requireArchive(
@@ -186,11 +190,13 @@ namespace {
 } // namespace
 
 namespace filemanager::archive_backend::detail {
-  void
-  writeArchive(std::span<const std::filesystem::path> sources, Stage& stage, Format format, Level level, Work& work) {
+  void writeArchive(
+      std::span<const std::filesystem::path> sources, Stage& stage, Format format, Level level, Work& work,
+      const EncryptionOptions& options
+  ) {
     if (sources.empty() || (format == Format::Gzip && sources.size() != 1))
       throwFileError(FileErrorKind::InvalidArgument, "Single-file gzip requires exactly one regular file.");
-    Writer writer(stage.directory.get(), format, level, work);
+    Writer writer(stage.directory.get(), format, level, work, options);
     std::set<std::string> names;
     for (const auto& path : sources) {
       const auto directory = openDirectory(path.parent_path());

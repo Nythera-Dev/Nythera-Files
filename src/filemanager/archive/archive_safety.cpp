@@ -290,6 +290,7 @@ namespace filemanager::archive_backend::detail {
   void Work::item() {
     check();
     ++count;
+    report(0);
   }
 
   void Work::report(std::uint64_t amount) {

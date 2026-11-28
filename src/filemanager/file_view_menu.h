@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/files/directory_scanner.h"
+#include "filemanager/file_archive_actions.h"
 #include "ui/controls/context_menu.h"
 
 #include <algorithm>
@@ -32,6 +33,7 @@ namespace filemanager {
           {2, 1, 3, 59},
           {110},
           {119, 4, 5, 6},
+          {menu_id::kArchiveCompress, menu_id::kArchiveExtract},
           {20, 31, 100},
           {30152},
           {30104, 30105},
