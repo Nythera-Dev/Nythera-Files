@@ -1,6 +1,7 @@
 #include "filemanager/fzf_search.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <map>
 #include <memory>
@@ -99,12 +100,18 @@ namespace {
       if (!literal[i] || !kOperators.contains(query[i]) || literalOperators.contains(query[i]))
         continue;
       std::string marker;
-      do {
-        char encoded[6];
-        const auto length = g_unichar_to_utf8(nextMarker++, encoded);
-        marker.assign(encoded, length);
-      } while (query.contains(marker) || std::ranges::any_of(names, [&](auto name) { return name.contains(marker); }));
-      literalOperators.emplace(query[i], std::move(marker));
+      while (nextMarker <= 0x10FFFFU) {
+        std::array<char, 6> encoded{};
+        const int length = g_unichar_to_utf8(nextMarker++, encoded.data());
+        if (length <= 0 || static_cast<std::size_t>(length) > encoded.size())
+          break;
+        marker.assign(encoded.data(), static_cast<std::size_t>(length));
+        if (!query.contains(marker) && std::ranges::none_of(names, [&](auto name) { return name.contains(marker); }))
+          break;
+        marker.clear();
+      }
+      if (!marker.empty())
+        literalOperators.emplace(query[i], std::move(marker));
     }
 
     if (raw && !literalOperators.empty())
