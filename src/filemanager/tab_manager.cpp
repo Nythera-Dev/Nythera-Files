@@ -28,12 +28,11 @@ namespace filemanager {
   TabManager::~TabManager() { shutdownAll(); }
 
   TabId TabManager::openTab(
-      const std::filesystem::path& path, const TabViewState& viewState, bool activate,
-      std::optional<std::size_t> insertIndex, bool startNavigation, std::vector<std::filesystem::path> backHistory,
-      std::vector<std::filesystem::path> forwardHistory
+      BrowserLocation location, const TabViewState& viewState, bool activate, std::optional<std::size_t> insertIndex,
+      bool startNavigation, std::vector<BrowserLocation> backHistory, std::vector<BrowserLocation> forwardHistory
   ) {
     const TabId id = m_nextTabId++;
-    std::filesystem::path targetPath = path;
+    auto& targetPath = location.path;
     if (isTrashTabPath(targetPath))
       targetPath = "trash:/";
     else if (!targetPath.empty())
@@ -73,9 +72,9 @@ namespace filemanager {
       if (m_callbacks.onActiveTabChanged)
         m_callbacks.onActiveTabChanged(*tabPtr, previousViewState);
       if (startNavigation)
-        tabPtr->session.navigate(tabPtr->session.path(), false);
+        tabPtr->session.navigateLocation(location, false);
     } else if (startNavigation) {
-      tabPtr->session.navigate(tabPtr->session.path(), false);
+      tabPtr->session.navigateLocation(location, false);
     }
 
     if (m_callbacks.onTabsChanged)
@@ -89,7 +88,7 @@ namespace filemanager {
     if (source == nullptr || !sourceIndex)
       return kInvalidTabId;
     return openTab(
-        source->session.path(), source->viewState, true, *sourceIndex + 1, true, source->session.backHistory(),
+        source->session.location(), source->viewState, true, *sourceIndex + 1, true, source->session.backHistory(),
         source->session.forwardHistory()
     );
   }
@@ -370,7 +369,7 @@ namespace filemanager {
       m_closedTabs.erase(m_closedTabs.begin());
     m_closedTabs.push_back(
         ClosedTabSnapshot{
-            .path = tab.session.path(),
+            .path = tab.session.location(),
             .backHistory = tab.session.backHistory(),
             .forwardHistory = tab.session.forwardHistory(),
             .viewState = tab.viewState,
@@ -608,6 +607,7 @@ namespace filemanager {
               if (tabId == m_activeTabId && m_callbacks.onActiveStatus)
                 m_callbacks.onActiveStatus(*tab, std::move(msg));
             },
+        .archivePassword = m_callbacks.archivePassword,
     };
   }
 

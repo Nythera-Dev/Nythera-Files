@@ -417,7 +417,7 @@ public:
     const auto backTarget = manager.activeSession().backHistory().back();
     manager.activeSession().backHistory().pop_back();
     manager.activeSession().forwardHistory().push_back(manager.activeSession().path());
-    manager.navigate(backTarget, false);
+    manager.navigateLocation(backTarget, false);
     pumpUntil([&] { return !manager.activeSession().m_loading; });
     TEST_CHECK(manager.activeSession().path() == midDir);
     TEST_CHECK(manager.activeSession().backHistory().size() == 1);
@@ -697,6 +697,24 @@ public:
     TEST_CHECK(manager.m_tabs.findTab(tabAId)->needsRefresh);
     TEST_CHECK(!harness.grid.rubberBandActive());
 
+    TEST_CHECK(manager.activateTab(tabAId));
+    manager.m_transfers.m_callbacks.fileDropTabAt = [tabBId](float x, float) {
+      return x < 20.0F ? tabBId : filemanager::kInvalidTabId;
+    };
+    manager.m_transfers.m_draggingFiles = true;
+    manager.m_transfers.m_dragOriginTab = tabAId;
+    manager.m_transfers.m_dragSources = {(dirA / "rename_me.txt").native()};
+    manager.m_transfers.updateLocalDragTarget(10.0F, 10.0F);
+    TEST_CHECK(manager.m_transfers.m_hoverDropTabTimer.active() && manager.activeTab().id == tabAId);
+    manager.m_transfers.updateLocalDragTarget(30.0F, 10.0F);
+    TEST_CHECK(!manager.m_transfers.m_hoverDropTabTimer.active());
+    manager.m_transfers.updateLocalDragTarget(10.0F, 10.0F);
+    pumpMs(500);
+    TimerManager::instance().tick();
+    TEST_CHECK(manager.activeTab().id == tabBId && manager.m_transfers.isDraggingFiles());
+    TEST_CHECK(manager.m_transfers.m_dragSources == std::vector<std::string>{(dirA / "rename_me.txt").native()});
+    manager.cancelFileGesture();
+
     manager.m_locationInput = nullptr;
     manager.m_tabs.shutdownAll();
   }
@@ -766,6 +784,99 @@ public:
 
     manager.m_tabs.shutdownAll();
   }
+
+#ifdef NYTHERA_FILES_ARCHIVES
+  static void testArchiveNavigationAndExport(const std::filesystem::path& root) {
+    namespace archive = filemanager::archive_backend;
+    const auto here = root / "browse-archive";
+    const auto source = here / "project";
+    const auto archiveFile = here / "project.tar";
+    std::filesystem::create_directories(source);
+    writeFile(source / "sample.txt", "archive member");
+    TEST_CHECK(archive::compress(std::array{source}, archiveFile, archive::Format::Tar, archive::Level::Balanced).ok);
+    std::filesystem::remove_all(source);
+
+    Flex previewHost;
+    Flex breadcrumbs;
+    FileManager manager(here.native());
+    manager.navigate(here, false);
+    pumpUntil([&] { return !manager.activeSession().loading(); });
+    TEST_CHECK(manager.m_settings.setPreviewMode(filemanager::PreviewMode::Full));
+    manager.attachPreviewPane(previewHost, 4.0F, colorSpecFromRole(ColorRole::Surface));
+    manager.layoutPreviewPane(1000.0F, 4.0F);
+    TEST_CHECK(manager.m_previewPane->visible());
+    manager.m_breadcrumbBar = &breadcrumbs;
+    manager.activatePath(archiveFile);
+    pumpUntil([&] { return !manager.activeSession().loading(); });
+    const auto& session = manager.activeSession();
+    TEST_CHECK(session.archiveDirectory() == std::optional<std::string>{""});
+    TEST_CHECK(session.entries().size() == 1 && session.entries().front().isDir);
+    TEST_CHECK(session.entries().front().absPath == "project");
+    TEST_CHECK(std::ranges::any_of(breadcrumbs.children(), [](const auto& child) {
+      const auto* button = dynamic_cast<const Button*>(child.get());
+      return button && button->label() && button->label()->text() == "project.tar" && button->glyph();
+    }));
+    manager.layoutPreviewPane(1000.0F, 4.0F);
+    TEST_CHECK(!manager.m_previewPane->visible() && !manager.m_previewDivider->visible());
+    TEST_CHECK(!manager.openQuickLook());
+    manager.togglePreviewPane();
+    TEST_CHECK(manager.m_settings.previewMode() == filemanager::PreviewMode::Full);
+    auto caps = manager.activeTab().capabilities();
+    TEST_CHECK(caps.canCopyItems && caps.canOpenProperties && caps.canDragSource);
+    TEST_CHECK(!caps.canMutate && !caps.canAcceptDrop && !caps.canGenerateThumbnails);
+    TEST_CHECK(!manager.enterAdministratorMode(manager.activeTab().id));
+    manager.activatePath("project");
+    TEST_CHECK(session.archiveDirectory() == std::optional<std::string>{"project"});
+    TEST_CHECK(session.entries().size() == 1 && session.entries().front().name == "sample.txt");
+    TEST_CHECK(session.backHistory().back() == (filemanager::BrowserLocation{archiveFile, std::string{}}));
+
+    std::filesystem::path temporary;
+    manager.materialiseArchiveSelection({"project/sample.txt"}, [&](const auto& operation) {
+      temporary = operation.completedEntries.front().path;
+    });
+    pumpUntil([&] { return !manager.m_operations.active(); });
+    TEST_CHECK(temporary.filename() == "sample.txt" && std::filesystem::exists(temporary));
+    const auto uris = filemanager::encodeFileTransfer({temporary.native()}, false);
+    TEST_CHECK(
+        filemanager::decodeFileTransfer(uris.at("text/uri-list"), false).paths
+        == std::vector<std::string>{temporary.native()}
+    );
+    const auto drop = here / "drop";
+    std::filesystem::create_directory(drop);
+    const auto archiveTab = manager.activeTab().id;
+    const auto dropTab = manager.openFolderInNewTab(drop, false);
+    pumpUntil([&] { return !manager.m_tabs.findTab(dropTab)->session.loading(); });
+    manager.m_transfers.m_callbacks.fileDropTabAt = [dropTab](float, float) { return dropTab; };
+    manager.activeTab().selectedPaths = {"project/sample.txt"};
+    manager.m_keyboardModifiers = KeyMod::Shift;
+    manager.m_transfers.beginFileDragPress(0, 0.0F, 0.0F, 1);
+    TEST_CHECK(
+        manager.m_transfers.handleFileDragPointer(PointerEvent{.type = PointerEvent::Type::Motion}, 10.0F, 10.0F)
+    );
+    TEST_CHECK(manager.m_statusMessage.starts_with("Copy "));
+    TEST_CHECK(manager.activeTab().id == archiveTab);
+    pumpMs(500);
+    TimerManager::instance().tick();
+    TEST_CHECK(manager.activeTab().id == dropTab && manager.m_transfers.isDraggingFiles());
+    TEST_CHECK(manager.m_transfers.handleFileDragPointer(
+        PointerEvent{.type = PointerEvent::Type::Button, .button = BTN_LEFT, .pressed = false}, 10.0F, 10.0F
+    ));
+    pumpUntil([&] { return !manager.m_operations.active(); });
+    TEST_CHECK(std::filesystem::exists(drop / "sample.txt") && !std::filesystem::exists(drop / "project"));
+    TEST_CHECK(session.archiveCatalogue()->entries.contains("project/sample.txt"));
+    TEST_CHECK(manager.activateTab(archiveTab));
+    manager.navigateUp();
+    TEST_CHECK(session.archiveDirectory() == std::optional<std::string>{""});
+    manager.navigateUp();
+    pumpUntil([&] { return !session.loading(); });
+    TEST_CHECK(!session.browsingArchive() && session.path() == here);
+    manager.layoutPreviewPane(1000.0F, 4.0F);
+    TEST_CHECK(manager.m_previewPane->visible() && manager.m_settings.previewMode() == filemanager::PreviewMode::Full);
+    TEST_CHECK(std::filesystem::exists(temporary));
+    manager.m_archiveTemporary.clear();
+    TEST_CHECK(!std::filesystem::exists(temporary));
+  }
+#endif
 
   static void testSameDirectoryTabsMonitorDirtyAndCreateIsolation(const std::filesystem::path& root) {
     const auto sharedDir = root / "same_dir";
@@ -1606,6 +1717,9 @@ int main() {
     FileManagerTestAccess::testCloseDuringEnumAndActiveOperationCutConsumption(work);
     FileManagerTestAccess::testSwitchCancelsTransientGestures(work);
     FileManagerTestAccess::testCrossTabCopyPasteAndReveal(work);
+#ifdef NYTHERA_FILES_ARCHIVES
+    FileManagerTestAccess::testArchiveNavigationAndExport(work);
+#endif
     FileManagerTestAccess::testSameDirectoryTabsMonitorDirtyAndCreateIsolation(work);
     FileManagerTestAccess::testWastebinDirtyCoherence(env);
     FileManagerTestAccess::testInactiveMountRemovalRedirectsMatchingTabs(work);

@@ -1,7 +1,8 @@
 #include "filemanager/file_operation_manager.h"
 
+#include "core/files/display_text.h"
+#include "filemanager/archive/archive_backend.h"
 #include "filemanager/browser_tab.h"
-
 #include "filemanager/file_interaction.h"
 #include "filemanager/fs_compat.h"
 #include "filemanager/wastebin_fallback.h"
@@ -11,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <format>
@@ -31,9 +33,15 @@ namespace {
   bool isCopy(Kind kind) { return kind == Kind::Copy || kind == Kind::Duplicate; }
   bool isTransfer(Kind kind) { return isCopy(kind) || kind == Kind::Move; }
   bool usesTransferControls(Kind kind) { return isTransfer(kind) || kind == Kind::TrashToHome; }
+  bool isArchive(Kind kind) { return kind == Kind::Compress || kind == Kind::Extract; }
+  bool canSuspend(Kind kind) { return usesTransferControls(kind) || isArchive(kind); }
+  bool archivePath(const std::string& path) {
+    return !path.contains('\0') && std::filesystem::path(path).is_absolute();
+  }
   bool isReplay(Kind kind) { return kind == Kind::Undo || kind == Kind::Redo; }
   bool reportsProgress(Kind kind) {
     return isTransfer(kind)
+        || isArchive(kind)
         || isReplay(kind)
         || kind == Kind::Trash
         || kind == Kind::TrashToHome
@@ -137,6 +145,10 @@ namespace {
       return "Undo";
     case Kind::Redo:
       return "Redo";
+    case Kind::Compress:
+      return "Compression";
+    case Kind::Extract:
+      return "Extraction";
     }
     return "File operation";
   }
@@ -203,6 +215,9 @@ namespace {
       return operation.status;
     case FileOperationManager::Kind::Delete:
       return count == 1 ? "Permanently deleted " + quotedBasename(operation.source) : "Permanently deleted " + quantity;
+    case Kind::Compress:
+    case Kind::Extract:
+      break;
     }
     return "File operation completed";
   }
@@ -521,6 +536,7 @@ struct FileOperationManager::Result : engine::Result {
   std::string customTitle;
   bool outcomeUncertain = false;
   std::optional<std::size_t> requestedCount;
+  std::size_t skippedEntries = 0;
   filemanager::PropertyResult metadata;
   std::optional<TrashFallbackOffer> trashFallback;
   std::vector<HistoryEntry> history;
@@ -550,6 +566,9 @@ struct FileOperationManager::Task {
   std::function<std::vector<filemanager::AdminServerFrame>()> waitForAdminFrames;
   std::function<bool(std::uint64_t, const ConflictDecision&)> replyToAdminConflict;
   std::optional<HistoryEntry> replayEntry;
+  std::optional<ArchiveOptions> archiveOptions;
+  std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)> archivePassword;
+  TransferMeasure archiveProgress;
 };
 
 
@@ -909,7 +928,10 @@ void FileOperationManager::updateProgress(
       op->fraction = std::clamp(static_cast<double>(bytes) / static_cast<double>(totalBytes), 0.0, 1.0);
     else if (totalFiles > 0)
       op->fraction = std::clamp(static_cast<double>(files) / static_cast<double>(totalFiles), 0.0, 1.0);
-    if (totalBytes > 0) {
+    if (isArchive(op->kind)) {
+      g_autofree gchar* processed = g_format_size(bytes);
+      op->status = std::to_string(files) + (files == 1 ? " entry · " : " entries · ") + processed + " processed";
+    } else if (totalBytes > 0) {
       updateTransferMetrics(*op);
     } else
       op->status = std::to_string(files) + " / " + std::to_string(totalFiles) + " items";
@@ -969,6 +991,43 @@ std::uint64_t FileOperationManager::move(
     std::vector<std::string> sources, std::string destination, filemanager::BrowserTab* adminTab
 ) {
   return start(Kind::Move, std::move(sources), std::move(destination), {}, 0, {}, {}, {}, false, adminTab);
+}
+std::uint64_t FileOperationManager::compress(
+    std::vector<std::string> sources, std::string output, filemanager::archive_backend::Format format,
+    filemanager::archive_backend::Level level, filemanager::archive_backend::EncryptionOptions options
+) {
+  if (sources.empty() || !std::ranges::all_of(sources, archivePath) || !archivePath(output))
+    return 0;
+  return start(
+      Kind::Compress, std::move(sources), std::move(output), {}, 0, {}, {}, {}, false, nullptr,
+      ArchiveOptions{format, level, std::move(options)}
+  );
+}
+std::uint64_t FileOperationManager::extract(
+    std::string source, std::string destination, filemanager::archive_backend::Extraction mode
+) {
+  if (!archivePath(source) || !archivePath(destination))
+    return 0;
+  return start(
+      Kind::Extract, {std::move(source)}, std::move(destination), {}, 0, {}, {}, {}, false, nullptr,
+      ArchiveOptions{.extraction = mode}
+  );
+}
+std::uint64_t FileOperationManager::extractSelected(
+    filemanager::archive_backend::Selection selection, std::string destination, ArchivePassword password,
+    std::function<void(const Operation&)> completion
+) {
+  if (!selection.catalogue || selection.members.empty() || !archivePath(destination))
+    return 0;
+  auto source = selection.catalogue->source.native();
+  if (!archivePath(source))
+    return 0;
+  return start(
+      Kind::Extract, {std::move(source)}, std::move(destination), {}, 0, {}, {}, {}, false, nullptr,
+      ArchiveOptions{
+          .selection = std::move(selection), .password = std::move(password), .completion = std::move(completion)
+      }
+  );
 }
 std::uint64_t FileOperationManager::rename(std::string source, std::string destination) {
   return start(Kind::Rename, {std::move(source)}, std::move(destination));
@@ -1076,8 +1135,13 @@ std::uint64_t FileOperationManager::start(
     std::optional<filemanager::PropertyRequest> metadata, std::uint32_t uid,
     std::function<void(const filemanager::PropertyResult&)> completedCallback,
     std::optional<std::pair<std::uint64_t, std::uint64_t>> renameIdentity,
-    std::function<void(bool, const std::string&)> renameCompleted, bool keepBoth, filemanager::BrowserTab* adminTab
+    std::function<void(bool, const std::string&)> renameCompleted, bool keepBoth, filemanager::BrowserTab* adminTab,
+    std::optional<ArchiveOptions> archiveOptions
 ) {
+#ifndef NYTHERA_FILES_ARCHIVES
+  if (isArchive(kind))
+    return 0;
+#endif
   if (m_replaying || !m_alive || !*m_alive)
     return 0;
   const bool propertyEdit = kind == Kind::Properties && metadata.has_value();
@@ -1166,6 +1230,9 @@ std::uint64_t FileOperationManager::start(
   if (!alive || !*alive)
     return 0;
   auto* taskData = new Task{this, id, kind, std::move(sources), std::move(destination)};
+  taskData->archiveOptions = std::move(archiveOptions);
+  if (isArchive(kind))
+    taskData->archivePassword = m_archivePasswordResolver;
   taskData->keepBoth = keepBoth;
   taskData->replayEntry = std::move(replayEntry);
   taskData->alive = m_alive;
@@ -1173,12 +1240,12 @@ std::uint64_t FileOperationManager::start(
   taskData->conflictResolver = adminTab ? m_adminConflictResolver : m_conflictResolver;
   taskData->wastebinBackend = m_wastebinBackend;
   GCancellable* cancellable = g_cancellable_new();
+  if (canSuspend(kind) && !adminTab) {
+    taskData->pause = std::make_shared<FileTransferPauseState>();
+    taskData->boundary = m_transferBoundary;
+    m_pauseStates.emplace(id, taskData->pause);
+  }
   if (usesTransferControls(kind)) {
-    if (!adminTab) {
-      taskData->pause = std::make_shared<FileTransferPauseState>();
-      taskData->boundary = m_transferBoundary;
-      m_pauseStates.emplace(id, taskData->pause);
-    }
     m_transferRates.emplace(id, filemanager::TransferRates{});
     struct RateTimerData {
       FileOperationManager* self;
@@ -1306,8 +1373,7 @@ void FileOperationManager::registerJob(const Operation& operation) {
   GVariant* response = g_dbus_connection_call_sync(
       m_bus, "org.kde.JobViewServer", "/JobViewServer", "org.kde.JobViewServerV2", "requestView",
       g_variant_new(
-          "(si@a{sv})", "org.nythera.FileManager", usesTransferControls(operation.kind) ? 3 : 1,
-          g_variant_builder_end(&hints)
+          "(si@a{sv})", "org.nythera.FileManager", canSuspend(operation.kind) ? 3 : 1, g_variant_builder_end(&hints)
       ),
       G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 1200, nullptr, &error
   );
@@ -1356,15 +1422,29 @@ void FileOperationManager::publishJob(const Operation& operation, bool metricsOn
         : operation.kind == Kind::Properties    ? "Changing properties"
         : operation.kind == Kind::Undo          ? "Undoing file operation"
         : operation.kind == Kind::Redo          ? "Redoing file operation"
+        : operation.kind == Kind::Compress      ? "Compressing archive"
+        : operation.kind == Kind::Extract       ? "Extracting archive"
                                                 : "Creating item";
-    g_variant_builder_add(&properties, "{sv}", "title", g_variant_new_string(title));
+    const auto namedTitle = isArchive(operation.kind) && !operation.finished
+        ? std::string(title)
+            + " "
+            + filemanager::sanitizeFilenameForDisplay(
+                quotedBasename(operation.kind == Kind::Compress ? operation.destination : operation.source)
+            )
+        : std::string(title);
+    g_variant_builder_add(&properties, "{sv}", "title", g_variant_new_string(namedTitle.c_str()));
     g_variant_builder_add(
         &properties, "{sv}", "infoMessage",
         g_variant_new_string(operation.finished ? operation.resultDescription.c_str() : operation.status.c_str())
     );
-    g_variant_builder_add(
-        &properties, "{sv}", "percent", g_variant_new_uint32(static_cast<guint32>(operation.fraction * 100.0))
-    );
+    if (!isArchive(operation.kind))
+      g_variant_builder_add(
+          &properties, "{sv}", "percent", g_variant_new_uint32(static_cast<guint32>(operation.fraction * 100.0))
+      );
+    if (isArchive(operation.kind)) {
+      g_variant_builder_add(&properties, "{sv}", "processedBytes", g_variant_new_uint64(operation.processedBytes));
+      g_variant_builder_add(&properties, "{sv}", "processedItems", g_variant_new_uint64(operation.processedFiles));
+    }
     if (operation.totalBytes > 0) {
       g_variant_builder_add(&properties, "{sv}", "processedBytes", g_variant_new_uint64(operation.processedBytes));
       g_variant_builder_add(&properties, "{sv}", "totalBytes", g_variant_new_uint64(operation.totalBytes));
@@ -1627,6 +1707,67 @@ void FileOperationManager::worker(GTask* task, gpointer, gpointer taskData, GCan
     }
   }
 
+#ifdef NYTHERA_FILES_ARCHIVES
+  if (isArchive(data->kind)) {
+    namespace archives = filemanager::archive_backend;
+    const auto checkpoint = [&](const std::function<void(bool)>& helper) {
+      if (!data->pause->checkpoint(cancellable, [&](bool paused) {
+            if (helper)
+              helper(paused);
+            transferCallbacks.acknowledgePause(paused);
+          }))
+        g_cancellable_cancel(cancellable);
+    };
+    const archives::Callbacks callbacks{
+        .resolveConflict = std::move(data->conflictResolver),
+        .checkpoint =
+            [&] {
+              if (transferCallbacks.boundary)
+                transferCallbacks.boundary(data->archiveProgress.bytes);
+              checkpoint({});
+            },
+        .progress =
+            [&](std::uint64_t bytes, std::uint64_t items) {
+              data->archiveProgress = {.bytes = bytes, .items = items};
+              transferCallbacks.report(bytes, 0, items, 0, 0);
+            },
+        .password = [&]() -> std::function<std::optional<std::string>(bool)> {
+          if (data->archiveOptions->password)
+            return [&](bool retry) { return data->archiveOptions->password(retry, cancellable); };
+          if (data->archivePassword)
+            return [&](bool retry) { return data->archivePassword(data->sources.front(), retry, cancellable); };
+          return {};
+        }(),
+        .helperCheckpoint = checkpoint,
+    };
+    archives::Result archiveResult;
+    if (data->kind == Kind::Compress) {
+      std::vector<std::filesystem::path> sources(data->sources.begin(), data->sources.end());
+      const auto& options = *data->archiveOptions;
+      archiveResult = archives::compress(
+          sources, data->destination, options.format, options.level, cancellable, callbacks, options.encryption
+      );
+      explicit_bzero(
+          data->archiveOptions->encryption.password.data(), data->archiveOptions->encryption.password.size()
+      );
+      data->archiveOptions->encryption.password.clear();
+      if (!archiveResult.completedEntries.empty())
+        data->destination = archiveResult.completedEntries.front().path;
+    } else if (data->archiveOptions->selection) {
+      archiveResult =
+          archives::extractSelected(*data->archiveOptions->selection, data->destination, cancellable, callbacks);
+    } else {
+      archiveResult = archives::extract(
+          data->sources.front(), data->destination, cancellable, callbacks, data->archiveOptions->extraction
+      );
+    }
+    result->skippedEntries = archiveResult.skippedEntries.size();
+    data->archiveProgress = archiveResult.processedMeasure;
+    static_cast<engine::Result&>(*result) = std::move(archiveResult);
+    g_task_return_pointer(task, result, [](gpointer value) { delete static_cast<Result*>(value); });
+    return;
+  }
+#endif
   if (const auto kind = localKind(data->kind)) {
     engine::Request request{
         *kind, std::move(data->sources), std::move(data->destination), data->renameIdentity, data->keepBoth
@@ -2181,6 +2322,7 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
   if (data != nullptr && alive && *alive) {
     auto* operation = self->find(data->id);
     if (operation != nullptr) {
+      const bool clearArchiveSuspension = isArchive(data->kind) && operation->paused;
       operation->finished = true;
       operation->paused = false;
       self->m_pauseStates.erase(data->id);
@@ -2235,13 +2377,13 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
           self->m_undo.push_back(std::move(entry));
         }
       }
-      if (data->kind == Kind::CreateSymlink || operation->adminOrigin)
+      if (data->kind == Kind::CreateSymlink || data->kind == Kind::Compress || operation->adminOrigin)
         operation->destination = data->destination;
       if (result) {
         operation->movedSources = std::move(result->movedSources);
         operation->trashFallback = std::move(result->trashFallback);
       }
-      if (result && (isTransfer(data->kind) || data->kind == Kind::CreateSymlink))
+      if (result && (isTransfer(data->kind) || isArchive(data->kind) || data->kind == Kind::CreateSymlink))
         operation->completedEntries = std::move(result->completedEntries);
       if (usesTransferControls(data->kind) || (operation->adminOrigin && data->kind == Kind::Delete)) {
         operation->processedBytes = data->completedMeasure.bytes;
@@ -2283,6 +2425,28 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
                         : "Operation failed"
         );
       }
+      if (isArchive(data->kind)) {
+        operation->processedBytes = data->archiveProgress.bytes;
+        operation->processedFiles = data->archiveProgress.items;
+        operation->skippedEntries = result ? result->skippedEntries : 0;
+        const auto committed = operation->completedEntries.size();
+        if (operation->succeeded) {
+          if (operation->skippedEntries > 0)
+            operation->resultTitle = verb + " completed with skips";
+          operation->resultDescription = data->kind == Kind::Compress && committed > 0
+              ? "Created archive " + quotedBasename(operation->destination)
+              : std::to_string(committed) + (committed == 1 ? " entry published" : " entries published");
+        } else {
+          if (committed > 0) {
+            operation->resultTitle += " after partial publication";
+            operation->resultDescription +=
+                " · " + std::to_string(committed) + (committed == 1 ? " entry published" : " entries published");
+          }
+        }
+        if (operation->skippedEntries > 0)
+          operation->resultDescription += " · " + std::to_string(operation->skippedEntries) + " skipped";
+        operation->resultDescription = filemanager::sanitizeFilenameForDisplay(operation->resultDescription);
+      }
       if (data->kind == Kind::Properties) {
         self->m_metadataTargets.erase(data->id);
         operation->resultDescription = result ? result->message : "Properties operation failed.";
@@ -2292,7 +2456,7 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
         operation->status += " · Undo unavailable for this operation";
       if (!operation->succeeded && !operation->cancelled && !self->m_jobPaths.contains(operation->id))
         self->registerJob(*operation);
-      self->publishJob(*operation);
+      self->publishJob(*operation, false, clearArchiveSuspension);
       self->finishJob(*operation);
       auto it = std::ranges::find(self->m_cancellables, data->id, &std::pair<std::uint64_t, GCancellable*>::first);
       if (it != self->m_cancellables.end()) {
@@ -2312,6 +2476,13 @@ void FileOperationManager::completed(GObject*, GAsyncResult* asyncResult, gpoint
       }
       if (renameCompleted) {
         renameCompleted(renameSucceeded, renameDescription);
+        if (!*alive) {
+          g_clear_error(&error);
+          return;
+        }
+      }
+      if (data->archiveOptions && data->archiveOptions->completion) {
+        data->archiveOptions->completion(*operation);
         if (!*alive) {
           g_clear_error(&error);
           return;

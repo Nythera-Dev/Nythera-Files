@@ -186,6 +186,7 @@ namespace filemanager {
     [[nodiscard]] std::vector<ContextMenuControlEntry> editMenuEntries() const;
     [[nodiscard]] std::vector<ContextMenuControlEntry> viewMenuEntries() const;
     [[nodiscard]] std::vector<ContextMenuControlEntry> toolsMenuEntries();
+    [[nodiscard]] std::vector<ContextMenuControlEntry> archiveMenuEntries() const;
     [[nodiscard]] std::vector<ContextMenuControlEntry> helpMenuEntries() const;
     [[nodiscard]] std::optional<std::vector<ContextMenuControlEntry>> applicationMenuEntries(std::size_t menuIndex);
 

@@ -109,6 +109,7 @@ namespace filemanager {
           return updateProtocolDrag(surface, x, y, actions);
         },
         [this] {
+          stopHoverDropTab();
           m_protocolDragInside = false;
           m_protocolDropDestination.reset();
           m_protocolDropSources.clear();
@@ -141,6 +142,7 @@ namespace filemanager {
   void FileTransferController::shutdown() {
     if (m_alive)
       *m_alive = false;
+    stopHoverDropTab();
     stopDragScroll();
     cancelDropValidation();
     m_transfer.cancelDrag();
@@ -148,6 +150,7 @@ namespace filemanager {
   }
 
   void FileTransferController::detachUi() {
+    stopHoverDropTab();
     stopDragScroll();
     m_dragPreview = nullptr;
     m_dragPreviewIcon = nullptr;
@@ -847,7 +850,20 @@ namespace filemanager {
     const auto& tab = m_tabs.activeTab();
     const auto& session = tab.session;
     auto* grid = m_callbacks.grid ? m_callbacks.grid() : nullptr;
-    if (!grid || session.browsingTrash() || !tab.capabilities().canAcceptDrop)
+    const bool archiveDrag = !incoming && m_archiveDrag.catalogue != nullptr;
+    if (m_callbacks.fileDropTabAt) {
+      const auto id = m_callbacks.fileDropTabAt(x, y);
+      if (archiveDrag || id == tab.id) {
+        if (const auto* target = m_tabs.findTab(id))
+          return target->session.path();
+      }
+    }
+    if (archiveDrag && session.browsingArchive())
+      return m_places.dropDestinationAt(x, y);
+    if (!grid
+        || session.browsingTrash()
+        || !tab.capabilities().canAcceptDrop
+        || (archiveDrag && (tab.administratorBrowsing || tab.hasActiveAdminSession())))
       return std::nullopt;
     if (auto placeDest = m_places.dropDestinationAt(x, y))
       return placeDest;
@@ -865,7 +881,8 @@ namespace filemanager {
   }
 
   bool FileTransferController::dragSourcesAreFolders() const {
-    const auto& session = m_tabs.activeTab().session;
+    const auto* origin = m_tabs.findTab(m_dragOriginTab);
+    const auto& session = origin ? origin->session : m_tabs.activeTab().session;
     if (m_dragSources.empty())
       return false;
     return std::ranges::all_of(m_dragSources, [&session](const auto& source) {
@@ -1136,6 +1153,39 @@ namespace filemanager {
     );
   }
 
+  void FileTransferController::stopHoverDropTab() {
+    m_hoverDropTabTimer.stop();
+    m_hoverDropTab = kInvalidTabId;
+  }
+
+  void FileTransferController::updateHoverDropTab() {
+    const auto target =
+        m_callbacks.fileDropTabAt ? m_callbacks.fileDropTabAt(m_dragPointerX, m_dragPointerY) : kInvalidTabId;
+    const auto* origin = m_tabs.findTab(m_dragOriginTab);
+    if (target == kInvalidTabId
+        || target == m_tabs.activeTabId()
+        || (origin && (origin->administratorBrowsing || origin->hasActiveAdminSession()))) {
+      stopHoverDropTab();
+      return;
+    }
+    if (target == m_hoverDropTab)
+      return;
+    m_hoverDropTab = target;
+    m_hoverDropTabTimer.start(std::chrono::milliseconds(450), [this, target] {
+      m_hoverDropTab = kInvalidTabId;
+      if ((!m_protocolDragInside && !m_draggingFiles)
+          || !m_callbacks.fileDropTabAt
+          || m_callbacks.fileDropTabAt(m_dragPointerX, m_dragPointerY) != target)
+        return;
+      cancelDropValidation();
+      m_switchingDragTab = true;
+      const bool switched = m_tabs.activateTab(target);
+      m_switchingDragTab = false;
+      if (switched)
+        m_refreshDropAfterLayout = true;
+    });
+  }
+
   std::uint32_t
   FileTransferController::updateProtocolDrag(wl_surface* surface, float x, float y, std::uint32_t actions) {
     constexpr auto copy = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
@@ -1152,6 +1202,18 @@ namespace filemanager {
     m_protocolDropSources.clear();
     const bool wasProtocolDragInside = m_protocolDragInside;
     m_protocolDragInside = mainSurface && surface == mainSurface->wlSurface();
+    const bool pointerMoved = !wasProtocolDragInside || x != m_dragPointerX || y != m_dragPointerY;
+    m_dragPointerX = x;
+    m_dragPointerY = y;
+    if (windowOpen
+        && m_protocolDragInside
+        && (actions & (copy | move))
+        && !m_places.hasActiveDeviceOperations()
+        && !m_operations.replaying()
+        && !renaming)
+      updateHoverDropTab();
+    else
+      stopHoverDropTab();
     const auto& activeTab = m_tabs.activeTab();
     const auto& activeSession = activeTab.session;
     if (!windowOpen
@@ -1169,9 +1231,6 @@ namespace filemanager {
         mainSurface->requestUpdate();
       return 0;
     }
-    const bool pointerMoved = !wasProtocolDragInside || x != m_dragPointerX || y != m_dragPointerY;
-    m_dragPointerX = x;
-    m_dragPointerY = y;
     if (pointerMoved)
       m_dispatcher.cancelPointerCapture();
     recordDragScrollOffsets();
@@ -1249,6 +1308,7 @@ namespace filemanager {
   }
 
   NativeDataTransfer::DropReceiver FileTransferController::receiveProtocolDrop(std::uint32_t action) {
+    stopHoverDropTab();
     m_protocolDragInside = false;
     stopDragScroll();
     if (auto* surface = m_callbacks.mainSurface ? m_callbacks.mainSurface() : nullptr)
@@ -1431,6 +1491,10 @@ namespace filemanager {
   }
 
   void FileTransferController::cancelFileGesture() {
+    stopHoverDropTab();
+    m_dragOriginTab = kInvalidTabId;
+    m_archiveDrag = {};
+    m_archiveDragPassword = {};
     ++m_dragSessionGeneration;
     cancelDropValidation();
     if (!m_transfer.dragDropped())
@@ -1570,11 +1634,12 @@ namespace filemanager {
       preview->addChild(std::move(text));
       m_dragPreview = static_cast<Flex*>(root->addChild(std::move(preview)));
     }
-    const auto& activeSession = m_tabs.activeTab().session;
+    const auto* origin = m_tabs.findTab(m_dragOriginTab);
+    const auto& sourceSession = origin ? origin->session : m_tabs.activeTab().session;
     const std::filesystem::path path(m_dragSources.front());
-    const auto previewEntry = std::ranges::find(activeSession.entries(), path, &FileEntry::absPath);
-    m_dragPreviewIcon->setAllowFilesystemQueries(!activeSession.search().active());
-    m_dragPreviewIcon->setFile(path, previewEntry != activeSession.entries().end() && previewEntry->isDir);
+    const auto previewEntry = std::ranges::find(sourceSession.entries(), path, &FileEntry::absPath);
+    m_dragPreviewIcon->setAllowFilesystemQueries(!m_archiveDrag.catalogue && !sourceSession.search().active());
+    m_dragPreviewIcon->setFile(path, previewEntry != sourceSession.entries().end() && previewEntry->isDir);
     m_dragPreviewLabel->setText(
         m_dragSources.size() == 1 ? filemanager::sanitizeFilenameForDisplay(path.filename().string())
                                   : std::to_string(m_dragSources.size()) + " selected items"
@@ -1589,9 +1654,10 @@ namespace filemanager {
         ? m_dropValidation->copyByDefault
         : true;
     const auto modifiers = m_callbacks.keyboardModifiers ? m_callbacks.keyboardModifiers() : 0U;
-    const bool copy = externalTarget
-        ? m_transfer.dragAction() == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY
-        : (modifiers & KeyMod::Ctrl) || (destination && !(modifiers & KeyMod::Shift) && cachedCopyDefault);
+    const bool copy = m_archiveDrag.catalogue
+        || (externalTarget
+                ? m_transfer.dragAction() == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY
+                : (modifiers & KeyMod::Ctrl) || (destination && !(modifiers & KeyMod::Shift) && cachedCopyDefault));
     m_dragPreviewAction->setText(
         m_pinBefore        ? "Pin in Places"
             : !targetValid ? "Cannot drop here"
@@ -1663,7 +1729,11 @@ namespace filemanager {
   }
 
   void FileTransferController::cancelLocalDragState() {
+    stopHoverDropTab();
     stopDragScroll();
+    m_dragOriginTab = kInvalidTabId;
+    m_archiveDrag = {};
+    m_archiveDragPassword = {};
     m_dragPending = false;
     m_draggingFiles = false;
     m_dragIndex.reset();
@@ -1838,14 +1908,18 @@ namespace filemanager {
     m_dragPointerY = y;
     if (pointerMoved)
       m_dispatcher.cancelPointerCapture();
-    const bool folders = dragSourcesAreFolders();
+    updateHoverDropTab();
+    const bool archiveDrag = m_archiveDrag.catalogue != nullptr;
+    const bool folders = !archiveDrag && dragSourcesAreFolders();
     m_pinBefore = folders ? m_places.placeInsertionAt(x, y, "Personal", true) : std::nullopt;
     m_places.showPlaceInsertion(m_pinBefore);
     const auto rawDestination = m_pinBefore ? std::nullopt : dropDestination(x, y);
     std::optional<std::filesystem::path> destination;
     bool checking = false;
     bool copyDefault = true;
-    if (rawDestination) {
+    if (archiveDrag) {
+      destination = rawDestination;
+    } else if (rawDestination) {
       if (!(m_dropValidation
             && m_dropValidation->sources == m_dragSources
             && m_dropValidation->rawDestination == *rawDestination)) {
@@ -1875,14 +1949,15 @@ namespace filemanager {
     const auto modifiers = m_callbacks.keyboardModifiers ? m_callbacks.keyboardModifiers() : 0U;
     if (m_callbacks.onStatus)
       m_callbacks.onStatus(
-          m_pinBefore ? "Pin folders in Places · Escape cancels"
-              : checking
-              ? "Checking drop target… · Escape cancels"
-              : std::string(
-                    ((modifiers & KeyMod::Ctrl) || (destination && !(modifiers & KeyMod::Shift) && copyDefault))
-                        ? "Copy "
-                        : "Move "
-                )
+          m_pinBefore    ? "Pin folders in Places · Escape cancels"
+              : checking ? "Checking drop target… · Escape cancels"
+                         : std::string(
+                               (archiveDrag
+                                || (modifiers & KeyMod::Ctrl)
+                                || (destination && !(modifiers & KeyMod::Shift) && copyDefault))
+                                   ? "Copy "
+                                   : "Move "
+                           )
                   + std::to_string(m_dragSources.size())
                   + " items"
                   + (destination ? " to " + destination->string() : " — no drop target")
@@ -1940,6 +2015,14 @@ namespace filemanager {
           m_callbacks.onClearLastPointerIndex();
         m_dispatcher.pointerLeave();
         TooltipManager::instance().forceDestroy();
+        const auto& origin = m_tabs.activeTab();
+        m_dragOriginTab = origin.id;
+        if (origin.session.browsingArchive()) {
+          m_archiveDrag = {origin.session.archiveCatalogue(), m_dragSources};
+          m_archiveDragPassword = origin.session.archivePassword();
+          updateLocalDragTarget(x, y);
+          return true;
+        }
         try {
           auto payload = filemanager::encodeFileTransfer(m_dragSources, false);
           // Clipboard cut metadata is not drag action negotiation.
@@ -1970,6 +2053,18 @@ namespace filemanager {
       return true;
     }
     if (event.type == PointerEvent::Type::Button && event.button == BTN_LEFT && !event.pressed) {
+      stopHoverDropTab();
+      if (m_draggingFiles && m_archiveDrag.catalogue) {
+        if (const auto destination = dropDestination(x, y); destination && !m_places.hasActiveDeviceOperations()) {
+          const auto id = m_operations.extractSelected(
+              std::move(m_archiveDrag), destination->native(), std::move(m_archiveDragPassword)
+          );
+          if (!id && m_callbacks.onStatus)
+            m_callbacks.onStatus("Could not start extracting the archive selection.");
+        }
+        cancelFileGesture();
+        return true;
+      }
       if (m_draggingFiles) {
         const bool folders = dragSourcesAreFolders();
         const auto pin = folders ? m_places.placeInsertionAt(x, y, "Personal", true) : std::nullopt;
@@ -2022,6 +2117,7 @@ namespace filemanager {
         if (m_callbacks.onClickUnmovedDragItem)
           m_callbacks.onClickUnmovedDragItem(*m_dragIndex, event.time);
       }
+      m_dragOriginTab = kInvalidTabId;
       m_dragPending = false;
       m_draggingFiles = false;
       m_dragIndex.reset();

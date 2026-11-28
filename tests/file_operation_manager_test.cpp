@@ -1,3 +1,4 @@
+#include "filemanager/archive/archive_backend.h"
 #include "filemanager/file_operation_manager.h"
 #include "test_isolation.h"
 
@@ -81,6 +82,158 @@ namespace {
     TEST_CHECK(lstat(expectedPath.c_str(), &state) == 0);
     TEST_CHECK(entry.device == static_cast<std::uint64_t>(state.st_dev));
     TEST_CHECK(entry.inode == static_cast<std::uint64_t>(state.st_ino));
+  }
+
+  void runArchiveTests(const std::filesystem::path& root) {
+    using namespace filemanager::archive_backend;
+    const auto sourceDir = root / "archive-sources";
+    const auto destination = root / "archive-result";
+    const auto requested = root / "requested.zip";
+    const auto renamed = root / "renamed.zip";
+    const auto first = sourceDir / "first.txt";
+    const auto second = sourceDir / "second.txt";
+    std::filesystem::create_directory(sourceDir);
+    std::filesystem::create_directory(destination);
+    for (const auto& file : {first, second})
+      std::ofstream(file) << "archive payload";
+    std::ofstream(requested) << "keep original";
+
+    bool sawArchiveProgress = false;
+    bool fabricatedTotals = false;
+    FileOperationManager manager([&](const auto& operation) {
+      if (!operation.finished && operation.processedFiles > 0) {
+        sawArchiveProgress = true;
+        fabricatedTotals |= operation.totalBytes != 0
+            || operation.totalFiles != 0
+            || operation.fraction != 0
+            || operation.speedBytesPerSecond != 0;
+      }
+    });
+    TEST_CHECK(manager.extract("sftp://example.test/archive.zip", destination.string()) == 0);
+#ifdef NYTHERA_FILES_ARCHIVES
+    using Action = FileOperationManager::ConflictAction;
+    manager.setConflictResolver([&](const std::string& source, const std::string& dest, bool, const auto& metadata,
+                                    auto*) {
+      TEST_CHECK(source == requested.filename() && dest == requested && metadata.existing.inspected);
+      return FileOperationManager::ConflictDecision{.action = Action::Rename, .alternativeName = renamed.filename()};
+    });
+    TEST_CHECK(waitFor(
+        manager, manager.compress({first.string(), second.string()}, requested.string(), Format::Zip, Level::Balanced)
+    ));
+    const auto& compressed = manager.operations().back();
+    TEST_CHECK(compressed.mutated && compressed.destination == renamed && compressed.processedFiles == 2);
+    TEST_CHECK(compressed.processedBytes == 2 * std::filesystem::file_size(first));
+    assertCompletedEntry(compressed, 0, renamed);
+
+    std::ofstream(destination / second.filename()) << "existing";
+    manager.setConflictResolver([&](const std::string& member, const std::string& path, bool, const auto&, auto*) {
+      TEST_CHECK(member == second.filename() && path == destination / second.filename());
+      return FileOperationManager::ConflictDecision{.action = Action::Skip};
+    });
+    TEST_CHECK(waitFor(manager, manager.extract(renamed.string(), destination.string())));
+    const auto& skipped = manager.operations().back();
+    TEST_CHECK(skipped.skippedEntries == 1 && skipped.mutated && skipped.resultTitle.contains("with skips"));
+    TEST_CHECK(skipped.completedEntries.size() == 1);
+    assertCompletedEntry(skipped, 0, destination / first.filename());
+    std::filesystem::remove(destination / first.filename());
+
+    std::atomic_bool conflictWaiting = false;
+    manager.setConflictResolver([&](const std::string&, const std::string&, bool, const auto&,
+                                    GCancellable* cancellable) {
+      conflictWaiting = true;
+      while (!g_cancellable_is_cancelled(cancellable))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      return FileOperationManager::ConflictDecision{};
+    });
+    const auto partialId = manager.extract(renamed.string(), destination.string());
+    bool mountsProtected = false;
+    std::function<bool()> cancel = [&] {
+      if (!conflictWaiting || manager.operations().back().processedFiles == 0)
+        return false;
+      const bool protectedMounts = manager.usesMount(destination) && manager.usesMount(renamed);
+      manager.cancel(partialId);
+      mountsProtected = protectedMounts && manager.usesMount(destination);
+      return true;
+    };
+    const auto cancelTimer = g_timeout_add(
+        5,
+        [](gpointer data) -> gboolean {
+          return (*static_cast<std::function<bool()>*>(data))() ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
+        },
+        &cancel
+    );
+    const auto removeTimer = nythera::test::makeScopeExit([&] {
+      if (auto* source = g_main_context_find_source_by_id(nullptr, cancelTimer))
+        g_source_destroy(source);
+    });
+    TEST_CHECK(!waitFor(manager, partialId));
+    const auto& partial = manager.operations().back();
+    TEST_CHECK(partial.cancelled && partial.mutated && partial.completedEntries.size() == 1);
+    TEST_CHECK(partial.resultTitle.contains("partial publication"));
+    TEST_CHECK(mountsProtected);
+    assertCompletedEntry(partial, 0, destination / first.filename());
+    TEST_CHECK(!manager.usesMount(destination) && !manager.usesMount(renamed));
+    TEST_CHECK(
+        std::distance(std::filesystem::directory_iterator(destination), std::filesystem::directory_iterator{}) == 2
+    );
+
+    TEST_CHECK(!waitFor(manager, manager.extract(requested.string(), destination.string())));
+    const auto& failed = manager.operations().back();
+    TEST_CHECK(!failed.mutated && !failed.cancelled && failed.completedEntries.empty());
+    TEST_CHECK(sawArchiveProgress && !fabricatedTotals);
+
+    // Multiple submissions get separate output and password state.
+    const auto multiOut = root / "archive-multi-destination";
+    const auto firstArchive = root / "multi-first.zip";
+    const auto secondArchive = root / "multi-second.zip";
+    std::filesystem::create_directory(multiOut);
+    const bool encryption = canEncryptZip();
+    std::atomic_int attempts = 0;
+    if (encryption)
+      manager.setArchivePasswordResolver(
+          [&](const std::string& source, bool retry, auto*) -> std::optional<std::string> {
+            TEST_CHECK(!retry);
+            ++attempts;
+            return source == firstArchive ? "first fixture credential" : "second fixture credential";
+          }
+      );
+    TEST_CHECK(waitFor(
+        manager,
+        manager.compress(
+            {first.string()}, firstArchive.string(), Format::Zip, Level::Balanced,
+            {.password = encryption ? "first fixture credential" : ""}
+        )
+    ));
+    TEST_CHECK(waitFor(
+        manager,
+        manager.compress(
+            {second.string()}, secondArchive.string(), Format::Zip, Level::Balanced,
+            {.password = encryption ? "second fixture credential" : ""}
+        )
+    ));
+    const auto a = manager.extract(firstArchive.string(), multiOut.string(), Extraction::SmartFolder);
+    const auto b = manager.extract(secondArchive.string(), multiOut.string(), Extraction::SmartFolder);
+    TEST_CHECK(a != b && waitFor(manager, a) && waitFor(manager, b));
+    TEST_CHECK(attempts == (encryption ? 2 : 0));
+    TEST_CHECK(std::filesystem::is_regular_file(multiOut / "multi-first" / first.filename()));
+    TEST_CHECK(std::filesystem::is_regular_file(multiOut / "multi-second" / second.filename()));
+
+    conflictWaiting = false;
+    TEST_CHECK(manager.extract(renamed.string(), destination.string()) != 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!conflictWaiting && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    TEST_CHECK(conflictWaiting && manager.usesMount(destination));
+    manager.shutdown();
+    TEST_CHECK(!manager.usesMount(destination));
+    TEST_CHECK(
+        std::distance(std::filesystem::directory_iterator(destination), std::filesystem::directory_iterator{}) == 2
+    );
+#else
+    TEST_CHECK(manager.compress({first.string()}, requested.string(), Format::Zip, Level::Balanced) == 0);
+    TEST_CHECK(manager.extract(requested.string(), destination.string()) == 0);
+    TEST_CHECK(manager.operations().empty());
+#endif
   }
 
   std::optional<gid_t> supplementaryGroupOtherThan(gid_t excluded) {
@@ -2750,5 +2903,6 @@ int main() {
   return nythera::test::runTest([] {
     nythera::test::ScopedTestEnv env({.prefix = "nythera-fileops"});
     runTests(env);
+    runArchiveTests(env.work());
   });
 }

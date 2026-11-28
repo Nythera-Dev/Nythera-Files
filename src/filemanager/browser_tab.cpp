@@ -97,6 +97,15 @@ namespace filemanager {
   }
 
   TabCapabilities BrowserTab::capabilities() const noexcept {
+    if (session.browsingArchive()) {
+      auto caps = TabCapabilities::forLocal(false);
+      caps.canRunExternalTools = false;
+      caps.canGenerateThumbnails = false;
+      caps.canChecksum = false;
+      caps.canPinToPlaces = false;
+      caps.canUndo = false;
+      return caps;
+    }
     if (session.browsingTrash())
       return TabCapabilities::forWastebin();
     if (hasActiveAdminSession() || administratorBrowsing) {
@@ -118,7 +127,7 @@ namespace filemanager {
   }
 
   std::optional<std::pair<std::filesystem::path, bool>> BrowserTab::symlinkSelection() const {
-    if (session.browsingTrash() || session.loading() || selectedPaths.size() != 1)
+    if (session.browsingTrash() || session.browsingArchive() || session.loading() || selectedPaths.size() != 1)
       return std::nullopt;
     const auto selected = std::ranges::find_if(session.entries(), [this](const auto& entry) {
       return selectedPaths.contains(entry.absPath.string());
@@ -147,7 +156,7 @@ namespace filemanager {
 
   void BrowserTab::queryStatusFreeSpaceAsync(const std::filesystem::path& path) {
     cancelStatusFreeSpaceQuery();
-    if (path.empty() || isTrashTabPath(path))
+    if (session.browsingArchive() || path.empty() || isTrashTabPath(path))
       return;
     const auto generation = m_statusFreeSpaceGeneration;
     m_statusFreeSpacePath = path;
@@ -241,7 +250,7 @@ namespace filemanager {
 
   void BrowserTab::querySelectionInfoAsync(const std::filesystem::path& path) {
     cancelSelectionInfoQuery();
-    if (path.empty())
+    if (session.browsingArchive() || path.empty())
       return;
     const auto generation = m_selectionInfoGeneration;
     m_selectionInfoPendingPath = path;

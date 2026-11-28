@@ -69,6 +69,7 @@ namespace filemanager {
       std::function<void()> onCutStateChanged;
       std::function<void(std::string)> onStatus;
       std::function<void()> onMaybeStopMainLoop;
+      std::function<TabId(float, float)> fileDropTabAt;
     };
 
     FileTransferController(
@@ -128,6 +129,7 @@ namespace filemanager {
     bool refreshDropTargetAfterScroll();
     void stopDragScroll();
 
+    [[nodiscard]] bool switchingDragTab() const noexcept { return m_switchingDragTab; }
     [[nodiscard]] bool isDraggingFiles() const noexcept { return m_draggingFiles; }
     [[nodiscard]] bool isDragPending() const noexcept { return m_dragPending; }
     [[nodiscard]] bool isProtocolDragInside() const noexcept { return m_protocolDragInside; }
@@ -151,6 +153,8 @@ namespace filemanager {
     void updateDragScroll();
     void recordDragScrollOffsets();
     void updateLocalDragTarget(float x, float y);
+    void updateHoverDropTab();
+    void stopHoverDropTab();
 
     WaylandConnection& m_wayland;
     RenderContext& m_renderContext;
@@ -185,6 +189,12 @@ namespace filemanager {
     std::vector<std::string> m_protocolDropSources;
     std::optional<std::size_t> m_dragIndex;
     std::vector<std::string> m_dragSources;
+    TabId m_dragOriginTab = kInvalidTabId;
+    archive_backend::Selection m_archiveDrag;
+    FileOperationManager::ArchivePassword m_archiveDragPassword;
+    TabId m_hoverDropTab = kInvalidTabId;
+    Timer m_hoverDropTabTimer;
+    bool m_switchingDragTab = false;
     std::unique_ptr<RenderTarget> m_nativePreviewTarget;
     wl_surface* m_nativePreviewSurface = nullptr;
     bool m_nativePreviewQueued = false;

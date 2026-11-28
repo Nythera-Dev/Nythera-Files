@@ -1,6 +1,7 @@
 #include "core/build_info.h"
 #include "core/files/resource_paths.h"
 #include "core/input/key_modifiers.h"
+#include "filemanager/file_archive_actions.h"
 #include "filemanager/file_manager.h"
 #include "render/core/renderer.h"
 #include "render/scene/input_area.h"
@@ -9,14 +10,19 @@
 #include "ui/controls/button.h"
 #include "ui/controls/flex.h"
 #include "ui/controls/image.h"
+#include "ui/controls/input.h"
 #include "ui/controls/label.h"
 #include "ui/controls/scroll_view.h"
+#include "ui/controls/select.h"
+#include "ui/controls/select_popup_context.h"
 #include "ui/dialogs/dialog_background_artwork.h"
+#include "ui/dialogs/file_dialog.h"
 #include "ui/palette.h"
 #include "ui/style.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +31,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -174,6 +182,210 @@ namespace {
 
 class FileManagerTestAccess {
 public:
+#ifdef NYTHERA_FILES_ARCHIVES
+  static void validateArchiveUi(FileManager& manager, const std::filesystem::path& directory) {
+    using namespace filemanager::menu_id;
+    auto& session = manager.activeSession();
+    auto& tab = manager.activeTab();
+    const auto zip = directory / "download.zip";
+    const auto tgz = directory / "report.tgz";
+    const auto text = directory / "ordinary.txt";
+    session.m_entries = {
+        {.name = "download.zip", .absPath = zip},
+        {.name = "report.tgz", .absPath = tgz},
+        {.name = "ordinary.txt", .absPath = text}
+    };
+    session.m_directoryWritablePath = directory;
+    session.m_directoryWritable = true;
+    tab.selectedPaths = {zip.native(), tgz.native()};
+    tab.selectedPath = zip;
+    auto archiveMenu = manager.m_menus.archiveMenuEntries();
+    TEST_CHECK(
+        archiveMenu.size() == 2 && archiveMenu[0].id == kArchiveCompress && archiveMenu[1].id == kArchiveExtract
+    );
+    TEST_CHECK(archiveMenu[0].submenuEntries.front().label == R"(Compress to "Archive.tar.gz")");
+    TEST_CHECK(archiveMenu[1].submenuEntries.size() == 3);
+    const auto tools = manager.m_menus.toolsMenuEntries();
+    const auto extract = std::ranges::find(tools, kArchiveExtract, &ContextMenuControlEntry::id);
+    TEST_CHECK(extract != tools.end() && extract->submenuEntries[2].id == kExtractTo);
+    tab.selectedPaths.insert(text.native());
+    archiveMenu = manager.m_menus.archiveMenuEntries();
+    TEST_CHECK(archiveMenu.size() == 1 && archiveMenu.front().id == kArchiveCompress);
+    tab.selectedPaths = {zip.native(), tgz.native()};
+
+    class Picker : public FileDialogPresenter {
+    public:
+      int opens = 0;
+      bool openFileDialog() override {
+        ++opens;
+        return true;
+      }
+      void closeFileDialogWithoutResult() override {}
+    } picker;
+    FileDialog::setPresenter(&picker);
+    const auto restore = nythera::test::makeScopeExit([] {
+      FileDialog::cancelIfPending();
+      FileDialog::setPresenter(nullptr);
+    });
+    TEST_CHECK(manager.activateArchiveAction(kExtractTo));
+    TEST_CHECK(picker.opens == 1 && FileDialog::currentOptions().mode == FileDialogMode::SelectFolder);
+    FileDialog::complete(std::nullopt);
+    TEST_CHECK(manager.m_operations.operations().empty());
+    const auto previousWindowState = manager.m_windowOpen;
+    manager.m_windowOpen = true;
+    TEST_CHECK(manager.activateArchiveAction(kExtractTo));
+    TEST_CHECK(picker.opens == 2);
+    FileDialog::complete(directory);
+    manager.m_windowOpen = previousWindowState;
+    const auto& submitted = manager.m_operations.operations();
+    TEST_CHECK(submitted.size() == 2 && submitted[0].id != submitted[1].id);
+    TEST_CHECK(submitted[0].source != submitted[1].source);
+    TEST_CHECK(submitted[0].destination == directory && submitted[1].destination == directory);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (manager.m_operations.active() && std::chrono::steady_clock::now() < deadline) {
+      while (g_main_context_iteration(nullptr, false)) {
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    TEST_CHECK(!manager.m_operations.active());
+
+    auto& modal = manager.m_modalDialog;
+    StubRenderer renderer;
+    modal.m_initialLayoutRendererForTest = &renderer;
+    std::pair<std::uint32_t, std::uint32_t> dialogSize;
+    modal.m_presentToplevelForTest = [&](ToplevelSurface&, ToplevelSurface*, auto size) { dialogSize = size; };
+    manager.showCompressDialog({zip.native(), tgz.native()}, "Archive", false);
+    TEST_CHECK(modal.m_root != nullptr);
+    modal.prepareInitialLayout();
+    TEST_CHECK(dialogSize.second > 0 && dialogSize.second < modal.normalHeight());
+    const auto layout = [&] {
+      modal.m_root->setSize(dialogSize.first, dialogSize.second);
+      modal.m_root->layout(renderer);
+    };
+    layout();
+    std::vector<std::string> labels;
+    collectLabelTexts(modal.m_root.get(), labels);
+    TEST_CHECK(containsText(labels, ".tar.gz") && containsText(labels, "Compression settings"));
+    TEST_CHECK(containsText(labels, "Password protection"));
+    const auto find = [&](const auto& walk, Node& node, std::string_view name) -> Button* {
+      if (auto* button = dynamic_cast<Button*>(&node)) {
+        std::vector<std::string> texts;
+        collectLabelTexts(button, texts);
+        if (containsText(texts, name))
+          return button;
+      }
+      for (auto& child : node.children())
+        if (auto* button = walk(walk, *child, name))
+          return button;
+      return nullptr;
+    };
+    std::vector<Select*> selectors;
+    const auto findSelect = [&](const auto& walk, Node& node) -> void {
+      if (auto* select = dynamic_cast<Select*>(&node))
+        selectors.push_back(select);
+      for (auto& child : node.children())
+        walk(walk, *child);
+    };
+    findSelect(findSelect, *modal.m_root);
+    TEST_CHECK(selectors.size() == 2);
+    auto* formats = selectors.front();
+    auto* methods = selectors.back();
+    auto* password = find(find, *modal.m_root, "Password protection");
+    auto* settings = find(find, *modal.m_root, "Compression settings");
+    auto* browse = find(find, *modal.m_root, "Browse…");
+    TEST_CHECK(formats->selectedText() == "TAR.GZ");
+    TEST_CHECK(password && password->visible() && !password->enabled());
+    TEST_CHECK(settings && browse);
+    auto* destinationRow = browse->parent();
+    TEST_CHECK(destinationRow && destinationRow->children().size() == 2);
+    const auto* destination = dynamic_cast<const Input*>(destinationRow->children().front().get());
+    TEST_CHECK(destination && destination->width() > browse->width());
+    TEST_CHECK(destination->height() == browse->height() && destination->y() == browse->y());
+    TEST_CHECK(browse->x() + browse->width() == destinationRow->width());
+    class TestDropdown final : public SelectPopupContext {
+    public:
+      std::vector<std::string> options;
+      DropdownCallbacks callbacks;
+      void openSelectDropdown(const DropdownRequest& request, DropdownCallbacks next) override {
+        options = request.options;
+        callbacks = std::move(next);
+      }
+      void closeSelectDropdown() override {
+        if (auto dismiss = std::exchange(callbacks, {}).onDismiss)
+          dismiss();
+      }
+      bool isSelectDropdownOpen() const override { return static_cast<bool>(callbacks.onDismiss); }
+    } dropdown;
+    modal.m_root->setPopupContext(&dropdown);
+    const auto click = [](InputArea* area) {
+      area->dispatchPress(5, 5, BTN_LEFT, true);
+      area->dispatchPress(5, 5, BTN_LEFT, false);
+    };
+    const auto options = [&](Select& select) {
+      for (auto& child : select.children())
+        if (auto* area = dynamic_cast<InputArea*>(child.get()))
+          click(area);
+      TEST_CHECK(dropdown.isSelectDropdownOpen());
+      dropdown.closeSelectDropdown();
+      return dropdown.options;
+    };
+    const auto formatOptions = options(*formats);
+    TEST_CHECK(std::ranges::is_sorted(formatOptions));
+    TEST_CHECK(!containsText(formatOptions, "Gzip"));
+    const auto selectFormat = [&](std::string_view title) {
+      const auto found = std::ranges::find(formatOptions, title);
+      TEST_CHECK(found != formatOptions.end());
+      formats->setSelectedIndex(found - formatOptions.begin());
+    };
+    selectFormat("ZIP");
+    labels.clear();
+    collectLabelTexts(modal.m_root.get(), labels);
+    TEST_CHECK(containsText(labels, ".zip") && !containsText(labels, ".tar.gz"));
+    TEST_CHECK(password->enabled() == filemanager::archive_backend::canEncryptZip());
+    const auto fitted = [&] {
+      std::optional<float> height;
+      TEST_CHECK(modal.m_customContent->onInitialLayout(renderer, dialogSize.second, height));
+      return height.value();
+    };
+    layout();
+    const float collapsedHeight = fitted();
+    const auto toggleSettings = [&] {
+      click(settings->inputArea());
+      layout();
+    };
+    toggleSettings();
+    TEST_CHECK(fitted() > collapsedHeight);
+    const auto zipMethods = options(*methods);
+    TEST_CHECK(zipMethods == (std::vector<std::string>{"Deflate", "Store"}));
+    TEST_CHECK(methods->selectedText() == "Deflate");
+    auto* normal = find(find, *modal.m_root, "Normal");
+    TEST_CHECK(normal && normal->variant() == ButtonVariant::Primary && normal->enabled());
+    methods->setSelectedIndex(1);
+    TEST_CHECK(methods->selectedText() == "Store" && !normal->enabled());
+    selectFormat("TAR");
+    TEST_CHECK(!methods->parent()->visible() && !normal->enabled());
+    if (containsText(formatOptions, "7z")) {
+      selectFormat("7z");
+      layout();
+      const auto sevenZipMethods = options(*methods);
+      TEST_CHECK(sevenZipMethods == (std::vector<std::string>{"Copy", "Deflate", "LZMA", "LZMA2"}));
+      TEST_CHECK(methods->selectedText() == "LZMA2" && normal->enabled());
+      methods->setSelectedIndex(0);
+      TEST_CHECK(!normal->enabled());
+    }
+    selectFormat("ZIP");
+    TEST_CHECK(methods->selectedText() == "Deflate" && normal->enabled());
+    toggleSettings();
+    TEST_CHECK(fitted() == collapsedHeight);
+    modal.forceCloseImmediate();
+    modal.m_presentToplevelForTest = {};
+    modal.m_initialLayoutRendererForTest = nullptr;
+    tab.selectedPaths.clear();
+    tab.selectedPath.reset();
+    session.m_entries.clear();
+  }
+#endif
+
   static void run(const std::filesystem::path& browseDir) {
     const Palette initialPalette = makeTestPalette(
         rgba(0.85F, 0.12F, 0.32F, 1.0F), rgba(0.08F, 0.08F, 0.11F, 1.0F), rgba(0.14F, 0.14F, 0.19F, 1.0F),
@@ -183,6 +395,10 @@ public:
 
     FileManager manager(browseDir.string());
     StubRenderer renderer;
+
+#ifdef NYTHERA_FILES_ARCHIVES
+    validateArchiveUi(manager, browseDir);
+#endif
 
     // 1. Help entries in both normal and Wastebin browsing states.
     verifyHelpEntries(manager.helpMenuEntries());

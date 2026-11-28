@@ -2,6 +2,7 @@
 
 #include "core/files/directory_scanner.h"
 #include "filemanager/admin_protocol.h"
+#include "filemanager/archive/archive_backend.h"
 #include "filemanager/file_search_session.h"
 #include "ui/dialogs/file_dialog.h"
 
@@ -20,6 +21,15 @@
 class FileManagerTestAccess;
 
 namespace filemanager {
+
+  struct BrowserLocation {
+    std::filesystem::path path;
+    std::optional<std::string> archiveDirectory;
+    BrowserLocation() = default;
+    BrowserLocation(std::filesystem::path value, std::optional<std::string> member = {})
+        : path(std::move(value)), archiveDirectory(std::move(member)) {}
+    bool operator==(const BrowserLocation&) const = default;
+  };
 
   class DirectorySession {
   public:
@@ -55,6 +65,7 @@ namespace filemanager {
       std::function<void(std::string)> onStatus;
       std::function<void(std::string detail)> onEnumerateFailed;
       std::function<void(bool empty)> onEnumerateCompletedStatus;
+      std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)> archivePassword;
     };
 
     struct PrivilegedBackend {
@@ -86,16 +97,23 @@ namespace filemanager {
 
     void
     navigate(const std::filesystem::path& requestedPath, bool recordHistory = true, std::string_view revealName = {});
+    void navigateLocation(BrowserLocation location, bool recordHistory = true, std::string_view revealName = {});
+    [[nodiscard]] BrowserLocation location() const { return {m_path, m_archiveDirectory}; }
+    [[nodiscard]] bool browsingArchive() const noexcept { return m_archiveDirectory.has_value(); }
+    [[nodiscard]] const std::optional<std::string>& archiveDirectory() const noexcept { return m_archiveDirectory; }
+    [[nodiscard]] const auto& archiveCatalogue() const noexcept { return m_archiveCatalogue; }
+    [[nodiscard]] std::function<std::optional<std::string>(bool, GCancellable*)> archivePassword() const;
     void navigateTrash();
     void enumerate(const std::filesystem::path& path, bool refreshSearch = true);
     void refreshPreservingSelection(bool refreshSearch = true);
+    void reloadArchive();
     void cancelEnumeration();
     [[nodiscard]] AdminRequestId privilegedListingId() const noexcept { return m_privilegedListingId; }
     void discardPrivilegedListing();
     void bumpEnumerationGeneration() { ++m_enumerationGeneration; }
     void setActive(bool active);
     [[nodiscard]] bool active() const noexcept { return m_active; }
-    void setHistory(std::vector<std::filesystem::path> back, std::vector<std::filesystem::path> forward);
+    void setHistory(std::vector<BrowserLocation> back, std::vector<BrowserLocation> forward);
 
     void sortEntries(bool includeBrowsing = false);
     void setSearchQuery(std::string query);
@@ -122,7 +140,9 @@ namespace filemanager {
     [[nodiscard]] bool searchFiltersExpanded() const { return m_searchFiltersExpanded; }
     void setSearchFiltersExpanded(bool expanded) { m_searchFiltersExpanded = expanded; }
     void closeSearch();
-    [[nodiscard]] bool canSearch() const { return !m_browsingTrash && !isPrivilegedBackendActive(); }
+    [[nodiscard]] bool canSearch() const {
+      return !browsingArchive() && !m_browsingTrash && !isPrivilegedBackendActive();
+    }
     [[nodiscard]] bool searchOpen() const noexcept { return m_searchOpen; }
     void openSearch() noexcept { m_searchOpen = true; }
     [[nodiscard]] const FileSearchSession& search() const noexcept { return m_search; }
@@ -150,10 +170,10 @@ namespace filemanager {
     [[nodiscard]] std::vector<FileEntry>& entries() noexcept {
       return m_search.active() ? m_search.entries() : m_entries;
     }
-    [[nodiscard]] const std::vector<std::filesystem::path>& backHistory() const noexcept { return m_backHistory; }
-    [[nodiscard]] std::vector<std::filesystem::path>& backHistory() noexcept { return m_backHistory; }
-    [[nodiscard]] const std::vector<std::filesystem::path>& forwardHistory() const noexcept { return m_forwardHistory; }
-    [[nodiscard]] std::vector<std::filesystem::path>& forwardHistory() noexcept { return m_forwardHistory; }
+    [[nodiscard]] const auto& backHistory() const noexcept { return m_backHistory; }
+    [[nodiscard]] auto& backHistory() noexcept { return m_backHistory; }
+    [[nodiscard]] const auto& forwardHistory() const noexcept { return m_forwardHistory; }
+    [[nodiscard]] auto& forwardHistory() noexcept { return m_forwardHistory; }
     [[nodiscard]] const std::unordered_map<std::string, std::string>& trashUris() const noexcept { return m_trashUris; }
     [[nodiscard]] const std::unordered_map<std::string, std::string>& trashOriginalPaths() const noexcept {
       return m_trashOriginalPaths;
@@ -201,6 +221,8 @@ namespace filemanager {
         const std::filesystem::path& path, const std::filesystem::path& replacedPath = std::filesystem::path{}
     );
     void removeMonitoredFile(const std::filesystem::path& path);
+    void enumerateArchive();
+    void showArchiveEntries();
 
     Callbacks m_callbacks;
     std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
@@ -209,8 +231,12 @@ namespace filemanager {
     bool m_browsingTrash = false;
     std::unordered_map<std::string, std::string> m_trashUris;
     std::unordered_map<std::string, std::string> m_trashOriginalPaths;
-    std::vector<std::filesystem::path> m_backHistory;
-    std::vector<std::filesystem::path> m_forwardHistory;
+    std::vector<BrowserLocation> m_backHistory;
+    std::vector<BrowserLocation> m_forwardHistory;
+    struct ArchiveCredentials;
+    std::optional<std::string> m_archiveDirectory;
+    std::shared_ptr<const archive_backend::Catalogue> m_archiveCatalogue;
+    std::shared_ptr<ArchiveCredentials> m_archiveCredentials;
     std::vector<FileEntry> m_entries;
     std::vector<FileEntry> m_loadingEntries;
     FileSearchSession m_search;

@@ -10,6 +10,8 @@
 #include <cmath>
 
 bool FileManager::openQuickLook() {
+  if (activeSession().browsingArchive())
+    return false;
   const auto* entry = selectedPreviewEntry();
   if (!m_surface || !m_grid || m_modalDialog.isOpen() || !entry)
     return false;

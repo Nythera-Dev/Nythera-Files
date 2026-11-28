@@ -28,7 +28,9 @@ void FileManager::attachPreviewPane(Flex& host, float dividerWidth, const ColorS
 
 void FileManager::layoutPreviewPane(float available, float dividerSpace) {
   const float previewBudget = std::min(800.0F, available - 440.0F - dividerSpace);
-  const bool showPreview = m_settings.previewMode() != filemanager::PreviewMode::Hidden && previewBudget >= 208.0F;
+  const bool showPreview = !activeSession().browsingArchive()
+      && m_settings.previewMode() != filemanager::PreviewMode::Hidden
+      && previewBudget >= 208.0F;
   m_previewDivider->setVisible(showPreview);
   m_previewDivider->setParticipatesInLayout(showPreview);
   m_previewPane->setVisible(showPreview);

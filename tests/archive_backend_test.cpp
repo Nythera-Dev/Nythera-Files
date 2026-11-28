@@ -175,6 +175,14 @@ namespace {
       TEST_CHECK(fs::is_empty(out / "source/nested/empty"));
       TEST_CHECK(fs::read_symlink(out / "source/link") == "nested/café\nnotes.txt");
       noStage(out);
+      const auto catalogue = backend::inspect(archive);
+      TEST_CHECK(catalogue->entries.contains("source/nested"));
+      const auto selected = root / ("selected" + std::string(item.suffix));
+      fs::create_directory(selected);
+      ok(backend::extractSelected({catalogue, {"source/nested"}}, selected));
+      TEST_CHECK(!fs::exists(selected / "source"));
+      TEST_CHECK(read(selected / "nested/café\nnotes.txt") == "Archive payload");
+      TEST_CHECK(fs::is_empty(selected / "nested/empty"));
     }
     fs::copy_file(root / "roundtrip.tar.gz", root / "other.TGZ");
     const auto out = root / "tgz-result";
@@ -201,6 +209,12 @@ namespace {
       }
       ok(backend::extract(archive, out));
       TEST_CHECK(read(out / name) == (name == std::string_view("concat") ? data + data : data));
+      const auto selected = root / (std::string(name) + "-selected");
+      fs::create_directory(selected);
+      const auto catalogue = backend::inspect(archive);
+      TEST_CHECK(catalogue->entries.contains(name));
+      ok(backend::extractSelected({catalogue, {name}}, selected));
+      TEST_CHECK(read(selected / name) == read(out / name));
       for (const int field : {4, 8}) {
         auto corrupted = read(archive);
         corrupted[corrupted.size() - static_cast<std::size_t>(field)] ^= 0x01;
@@ -253,6 +267,12 @@ namespace {
             g_free
         );
         TEST_CHECK(hash.get() == reference.sha256);
+        const auto catalog = backend::inspect(path);
+        const auto selected = root / (std::string(reference.name) + "-selected");
+        fs::create_directory(selected);
+        TEST_CHECK(catalog->entries.contains(reference.member));
+        ok(backend::extractSelected({catalog, {std::string(reference.member)}}, selected));
+        TEST_CHECK(read(selected / fs::path(reference.member).filename()) == data);
       }
       noStage(out);
     }
@@ -279,7 +299,7 @@ namespace {
       noStage(out);
     }
     const auto zip = root / "encrypted.zip";
-    const std::array secret{Member{.name = "secret", .bytes = "no password support"}};
+    const std::array secret{Member{.name = "secret", .bytes = "legacy encrypted ZIP payload"}};
     fixture(zip, secret, [](auto* a) {
       TEST_CHECK(archive_write_set_format_zip(a) == ARCHIVE_OK);
       if (archive_write_set_options(a, "zip:encryption=zipcrypt") == ARCHIVE_OK)
@@ -290,6 +310,11 @@ namespace {
     const auto out = root / "encrypted-zip-out";
     fs::create_directory(out);
     TEST_CHECK(!backend::extract(zip, out).ok && fs::is_empty(out));
+    ok(backend::extract(zip, out, nullptr, {.password = [](bool retry) -> std::optional<std::string> {
+                          TEST_CHECK(!retry);
+                          return "public test password";
+                        }}));
+    TEST_CHECK(read(out / "secret") == secret.front().bytes);
   }
 
   void testHostile(const fs::path& root) {
@@ -497,6 +522,125 @@ namespace {
     noStage(root);
   }
 
+  void testStageThree(const fs::path& root) {
+    const auto parent = root / "stage-three";
+    const auto source = parent / "sample";
+    fs::create_directories(source);
+    write(source / "child.txt", "stage three payload");
+    const auto tarball = parent / "sample.tgz";
+    ok(backend::compress(std::array{source}, tarball, Format::TarGzip, Level::Balanced));
+    TEST_CHECK(backend::archiveStem("sample.TGZ") == "sample");
+    TEST_CHECK(backend::archiveStem("foo.tar.gz") == "foo");
+    TEST_CHECK(backend::archiveStem(".profile") == ".profile");
+    for (const auto mode :
+         {backend::Extraction::Direct, backend::Extraction::SmartFolder, backend::Extraction::Folder}) {
+      const auto out = parent / std::to_string(static_cast<int>(mode));
+      fs::create_directory(out);
+      const auto result = backend::extract(tarball, out, nullptr, {}, mode);
+      ok(result);
+      const auto folder = mode == backend::Extraction::Folder ? out / "sample" / "sample" : out / "sample";
+      TEST_CHECK(read(folder / "child.txt") == "stage three payload");
+      TEST_CHECK(result.completedEntries.size() == 1);
+      TEST_CHECK(result.completedEntries.front().path == (out / "sample"));
+      noStage(out);
+    }
+    for (const auto [format, method] : std::array{
+             std::pair{Format::Zip, backend::Method::Store}, std::pair{Format::Zip, backend::Method::Deflate},
+             std::pair{Format::SevenZip, backend::Method::Copy}, std::pair{Format::SevenZip, backend::Method::Lzma},
+             std::pair{Format::SevenZip, backend::Method::Lzma2}, std::pair{Format::SevenZip, backend::Method::Deflate}
+         }) {
+      TEST_CHECK(backend::canWriteMethod(format, method));
+      const auto stem =
+          "method-" + std::to_string(static_cast<int>(format)) + "-" + std::to_string(static_cast<int>(method));
+      const auto archive = parent / (stem + std::string(backend::extension(format)));
+      const auto out = parent / stem;
+      fs::create_directory(out);
+      ok(backend::compress(
+          std::array{source / "child.txt"}, archive, format, Level::Fast, nullptr, {}, {.method = method}
+      ));
+      if (format == Format::Zip)
+        TEST_CHECK(static_cast<unsigned char>(read(archive)[8]) == (method == backend::Method::Store ? 0 : 8));
+      ok(backend::extract(archive, out));
+      TEST_CHECK(read(out / "child.txt") == "stage three payload");
+    }
+    for (const auto format : {Format::Zip, Format::SevenZip}) {
+      if (format == Format::Zip ? !backend::canEncryptZip() : !backend::sevenZipProgram())
+        continue;
+      const auto archive =
+          (format == Format::Zip ? parent : source) / ("secret" + std::string(backend::extension(format)));
+      const auto extra = parent / "extra.txt";
+      write(extra, "second source for encryption");
+      const auto out = parent / (format == Format::Zip ? "aes-output" : "7z-output");
+      const auto aborted = parent / (format == Format::Zip ? "aes-cancel" : "7z-cancel");
+      fs::create_directory(out);
+      fs::create_directory(aborted);
+      bool suspended = false;
+      backend::Callbacks creation;
+      if (format == Format::SevenZip)
+        creation.helperCheckpoint = [&](const auto& changeState) {
+          if (!suspended) {
+            changeState(true);
+            changeState(false);
+            suspended = true;
+          }
+        };
+      ok(backend::compress(
+          std::array{source, extra}, archive, format, Level::Balanced, nullptr, creation,
+          {.password = "disposable-correct-password"}
+      ));
+      if (format == Format::SevenZip) {
+        TEST_CHECK(suspended);
+        const auto interrupted = parent / "paused-then-cancelled.7z";
+        g_autoptr(GCancellable) cancel = g_cancellable_new();
+        bool didStop = false;
+        const auto stopped = backend::compress(
+            std::array{source / "child.txt"}, interrupted, format, Level::Balanced, cancel,
+            {.helperCheckpoint =
+                 [&](const auto& changeState) {
+                   changeState(true);
+                   didStop = true;
+                   g_cancellable_cancel(cancel);
+                 }},
+            {.password = "disposable-correct-password"}
+        );
+        TEST_CHECK(didStop && stopped.cancelled && !stopped.mutated && !fs::exists(interrupted));
+        nythera::test::ScopedEnvVar noHelper("PATH", (parent / "no-helper").native());
+        TEST_CHECK(!backend::sevenZipProgram());
+        const auto unavailable = backend::extract(archive, aborted);
+        TEST_CHECK(!unavailable.ok && unavailable.message.contains("optional 7-Zip") && fs::is_empty(aborted));
+      }
+      int prompts = 0;
+      const auto result =
+          backend::extract(archive, out, nullptr, {.password = [&](bool retry) -> std::optional<std::string> {
+                             TEST_CHECK(retry == (prompts > 0));
+                             ++prompts;
+                             return retry ? "disposable-correct-password" : "incorrect";
+                           }});
+      ok(result);
+      TEST_CHECK(prompts == 2);
+      TEST_CHECK(read(out / "sample/child.txt") == "stage three payload");
+      TEST_CHECK(read(out / "extra.txt") == "second source for encryption");
+      TEST_CHECK(!fs::exists(out / "sample" / archive.filename()));
+      noStage(out / "sample");
+      const auto selected = parent / (format == Format::Zip ? "zip-selected" : "encrypted-seven-selected");
+      fs::create_directory(selected);
+      const backend::Callbacks password{.password = [](bool) -> std::optional<std::string> {
+        return "disposable-correct-password";
+      }};
+      const auto catalogue = backend::inspect(archive, nullptr, password);
+      TEST_CHECK(catalogue->entries.contains("sample/child.txt"));
+      ok(backend::extractSelected({catalogue, {"sample/child.txt"}}, selected, nullptr, password));
+      TEST_CHECK(read(selected / "child.txt") == "stage three payload" && !fs::exists(selected / "sample"));
+      const auto cancelled = backend::extract(
+          archive, aborted, nullptr, {.password = [](bool) -> std::optional<std::string> { return std::nullopt; }}
+      );
+      TEST_CHECK(cancelled.cancelled && !cancelled.mutated && fs::is_empty(aborted));
+      fs::remove(archive);
+    }
+    noStage(source);
+    noStage(parent);
+  }
+
   void testSinglePass(const fs::path& root) {
     for (const auto suffix : {".tar.gz", ".tar.xz", ".tar.zst"}) {
       const auto archive = root / ("roundtrip" + std::string(suffix));
@@ -546,6 +690,33 @@ namespace {
       }
     }
   }
+  // Selection fixtures adapted from Luciole's testLinksAndSelection (MIT).
+  void testArchiveSelection(const fs::path& root) {
+    const auto archive = root / "partial.tar";
+    const auto destination = root / "partial";
+    fs::create_directory(destination);
+    tar(archive,
+        {
+            {.name = "dir/content", .bytes = "payload"},
+            {.name = "dir/alias", .hardlink = "dir/content"},
+            {.name = "dir/dangling", .type = AE_IFLNK, .symlink = "missing"},
+            {.name = "dir/escape-when-projected", .type = AE_IFLNK, .symlink = "../missing"},
+        });
+    const auto catalogue = backend::inspect(archive);
+    ok(backend::extractSelected({catalogue, {"dir/alias", "dir/dangling"}}, destination));
+    TEST_CHECK(read(destination / "alias") == "payload");
+    TEST_CHECK(fs::read_symlink(destination / "dangling") == "missing");
+    TEST_CHECK(!fs::exists(destination / "dir") && !fs::exists(destination / "content"));
+    const auto escaping = backend::extractSelected({catalogue, {"dir/escape-when-projected"}}, destination);
+    TEST_CHECK(!escaping.ok && !escaping.mutated);
+    g_autoptr(GCancellable) cancel = g_cancellable_new();
+    g_cancellable_cancel(cancel);
+    TEST_CHECK(backend::extractSelected({catalogue, {"dir/content"}}, destination, cancel).cancelled);
+    write(archive, "different archive");
+    const auto changed = backend::extractSelected({catalogue, {"dir/content"}}, destination);
+    TEST_CHECK(!changed.ok && !changed.mutated && changed.message.contains("archive changed"));
+    noStage(destination);
+  }
 } // namespace
 
 int main() {
@@ -566,6 +737,8 @@ int main() {
     testWritesAndCancellation(root);
     testSinglePass(root);
     testSourceRevision(root);
+    testStageThree(root);
+    testArchiveSelection(root);
     TEST_CHECK(fs::is_empty(spool));
   });
 }

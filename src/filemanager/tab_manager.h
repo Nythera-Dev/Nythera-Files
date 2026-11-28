@@ -16,9 +16,9 @@ class FileManagerTestAccess;
 namespace filemanager {
 
   struct ClosedTabSnapshot {
-    std::filesystem::path path;
-    std::vector<std::filesystem::path> backHistory;
-    std::vector<std::filesystem::path> forwardHistory;
+    BrowserLocation path;
+    std::vector<BrowserLocation> backHistory;
+    std::vector<BrowserLocation> forwardHistory;
     TabViewState viewState;
     std::size_t index = 0;
   };
@@ -60,6 +60,7 @@ namespace filemanager {
       std::function<void(BrowserTab& tab, const AdminSessionStatus& status)> onTabAdminSessionChanged;
       std::function<void(const std::filesystem::path& path)> onInvalidateMountCapacities;
       std::function<void(const std::filesystem::path& path)> onResolvePathAsync;
+      std::function<std::optional<std::string>(const std::string&, bool, GCancellable*)> archivePassword;
     };
 
     TabManager(std::filesystem::path initialPath, TabViewState initialViewState, Callbacks callbacks);
@@ -71,9 +72,9 @@ namespace filemanager {
     TabManager& operator=(TabManager&&) = delete;
 
     TabId openTab(
-        const std::filesystem::path& path, const TabViewState& viewState, bool activate = true,
+        BrowserLocation location, const TabViewState& viewState, bool activate = true,
         std::optional<std::size_t> insertIndex = std::nullopt, bool startNavigation = true,
-        std::vector<std::filesystem::path> backHistory = {}, std::vector<std::filesystem::path> forwardHistory = {}
+        std::vector<BrowserLocation> backHistory = {}, std::vector<BrowserLocation> forwardHistory = {}
     );
     TabId duplicateTab(TabId sourceTabId);
     bool activateTab(TabId tabId);

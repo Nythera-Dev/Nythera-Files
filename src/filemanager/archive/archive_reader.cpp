@@ -7,6 +7,7 @@
 #include <archive_entry.h>
 #include <array>
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <set>
 #include <unistd.h>
@@ -75,6 +76,9 @@ namespace {
     ReaderHandle value{archive_read_new(), archive_read_free};
     std::array<char, 65536> encoded{}, decoded{};
     std::int64_t headerOffset = 0;
+    bool sevenZipSignature = false;
+    std::string passphrase;
+    std::size_t passwordAttempts = 0;
 
     Reader(const Source& source, Work& request)
         : work(request), input(source, work), expected(formatFromName(source.name)) {
@@ -84,6 +88,7 @@ namespace {
       const auto count = input.read(signature);
       input.seek(0, SEEK_SET);
       const auto magic = std::string_view(signature.data(), count);
+      sevenZipSignature = magic == "7z\xbc\xaf";
       if (magic.starts_with("\x1f\x8b")) {
         outer = Format::TarGzip;
         gzip.emplace(input, work);
@@ -122,6 +127,31 @@ namespace {
           requireArchive(archive_read_support_format_7zip(a), a, work);
         }
         requireArchive(archive_read_set_seek_callback(a, seekCallback), a, work);
+      }
+      if (work.callbacks.password) {
+        requireArchive(
+            archive_read_set_passphrase_callback(
+                a, this,
+                [](Archive*, void* context) -> const char* {
+                  auto& reader = *static_cast<Reader*>(context);
+                  try {
+                    reader.work.check();
+                    auto answer = reader.work.callbacks.password(reader.passwordAttempts++ > 0);
+                    if (!answer || answer->empty())
+                      throwFileError(FileErrorKind::Cancelled, "Archive password entry cancelled.");
+                    if (answer->contains('\0'))
+                      throwFileError(FileErrorKind::InvalidArgument, "Archive passwords cannot contain a NUL byte.");
+                    explicit_bzero(reader.passphrase.data(), reader.passphrase.size());
+                    reader.passphrase = std::move(*answer);
+                    return reader.passphrase.c_str();
+                  } catch (...) {
+                    reader.work.failure = std::current_exception();
+                    return nullptr;
+                  }
+                }
+            ),
+            a, work
+        );
       }
       requireArchive(archive_read_support_filter_none(a), a, work);
       requireArchive(archive_read_open(a, this, nullptr, readDecoded, nullptr), a, work);
@@ -195,9 +225,15 @@ namespace {
       work.check();
       const auto before = archive_filter_bytes(value.get(), -1);
       const auto status = archive_read_next_header(value.get(), &entry);
+      const int format = archive_format(value.get()) & ARCHIVE_FORMAT_BASE_MASK;
       if (archive_read_has_encrypted_entries(value.get()) > 0
-          || (status == ARCHIVE_OK && archive_entry_is_encrypted(entry) > 0))
-        throwFileError(FileErrorKind::Unsupported, "Encrypted archives are unsupported.");
+          || (status == ARCHIVE_OK && archive_entry_is_encrypted(entry) > 0)) {
+        if ((format == ARCHIVE_FORMAT_7ZIP || sevenZipSignature) && (!expected || *expected == Format::SevenZip))
+          throwFileError(FileErrorKind::EncryptedSevenZip, "Encrypted 7z requires the optional 7-Zip executable.");
+        if (format != ARCHIVE_FORMAT_ZIP || !work.callbacks.password)
+          throwFileError(FileErrorKind::Unsupported, "Encrypted archives are unsupported.");
+      }
+      passwordAttempts = 0;
       if (work.failure)
         std::rethrow_exception(work.failure);
       if (status != ARCHIVE_EOF)
@@ -374,6 +410,132 @@ namespace {
 } // namespace
 
 namespace filemanager::archive_backend::detail {
+  // Catalogue and hard-link selection adapted from Luciole archive_reader.cpp (MIT).
+  Entries inspectArchive(const Source& source, Work& work) {
+    Entries entries;
+    std::map<std::string, std::string> links;
+    Reader reader(source, work);
+    archive_entry* header = nullptr;
+    while (reader.next(header)) {
+      work.item();
+      const auto type = archive_entry_filetype(header);
+      const auto name = reader.detected == Format::Gzip ? safePath(fs::path(source.name).stem().native())
+                                                        : safePath(bounded(archive_entry_pathname(header)));
+      if (name.empty()) {
+        if (type == AE_IFDIR)
+          continue;
+        throwFileError(FileErrorKind::InvalidArgument, "Archive member has an empty name.");
+      }
+      for (auto parent = parentName(name); !parent.empty(); parent = parentName(parent)) {
+        if (entries.try_emplace(parent, Entry{.kind = EntryKind::Directory, .mode = 0755}).first->second.kind
+            != EntryKind::Directory)
+          throwFileError(FileErrorKind::InvalidArgument, "Archive entry traverses a file or link.");
+      }
+      const unsigned mode = archive_entry_perm(header) & 0777U;
+      Entry entry{.mode = 0600U | (mode & 0155U)};
+      if (const auto* link = archive_entry_hardlink(header)) {
+        entry.kind = EntryKind::Hardlink;
+        entry.link = safePath(bounded(link));
+      } else if (type == AE_IFLNK) {
+        entry.kind = EntryKind::Symlink;
+        entry.link = bounded(archive_entry_symlink(header));
+        checkLinkTarget(name, entry.link);
+        links.emplace(name, entry.link);
+      } else if (type == AE_IFDIR) {
+        entry.kind = EntryKind::Directory;
+        entry.mode = 0700U | (mode & 0055U);
+      } else if (type != AE_IFREG) {
+        throwFileError(FileErrorKind::Unsupported, "Archive contains an unsafe special file.");
+      } else if (reader.detected != Format::Gzip && archive_entry_size_is_set(header)) {
+        const auto size = archive_entry_size(header);
+        if (size < 0)
+          throwFileError(FileErrorKind::InvalidArgument, "Archive member has an invalid size.");
+        entry.size = size;
+      }
+      if (archive_entry_mtime_is_set(header))
+        entry.modified = archive_entry_mtime(header);
+      const auto [existing, inserted] = entries.try_emplace(name, entry);
+      if (!inserted && (existing->second.kind != EntryKind::Directory || entry.kind != EntryKind::Directory))
+        throwFileError(FileErrorKind::InvalidArgument, "Duplicate or conflicting archive member.");
+      existing->second = std::move(entry);
+      requireArchive(archive_read_data_skip(reader.value.get()), reader.value.get(), work);
+    }
+    reader.finish();
+    if (reader.detected == Format::Gzip && entries.empty())
+      entries.emplace(safePath(fs::path(source.name).stem().native()), Entry{.size = 0});
+    validateLinks(links, work);
+    for (auto& [name, entry] : entries)
+      if (entry.kind == EntryKind::Hardlink)
+        entry.size = entries.at(resolveHardlink(entry.link, entries, work)).size;
+    return entries;
+  }
+
+  void
+  readSelected(const Source& source, const Catalogue& catalogue, const Projection& items, Stage& stage, Work& work) {
+    std::map<std::string, std::vector<std::string>, std::less<>> bodies;
+    std::map<std::string, std::string> links;
+    for (const auto& [name, output] : items) {
+      const auto& entry = catalogue.entries.at(name);
+      work.item();
+      switch (entry.kind) {
+      case EntryKind::Directory:
+        makeDirectory(stage.path / output);
+        break;
+      case EntryKind::Symlink:
+        links.emplace(output, entry.link);
+        break;
+      case EntryKind::Hardlink:
+        bodies[resolveHardlink(entry.link, catalogue.entries, work)].push_back(output);
+        break;
+      case EntryKind::File:
+        bodies[name].push_back(output);
+        break;
+      }
+    }
+    validateLinks(links, work);
+    auto remaining = availableSpace(stage.directory.get());
+    Reader reader(source, work);
+    archive_entry* header = nullptr;
+    const auto write = [&](const std::string& name, auto found, bool sparse) {
+      const auto& entry = catalogue.entries.at(name);
+      const auto saved = stage.path / found->second.front();
+      const auto estimate = header ? storageSize(header, entry.size, archive_entry_sparse_reset(header)) : 0;
+      if (estimate > remaining && estimate > (remaining = availableSpace(stage.directory.get())))
+        throwFileError(FileErrorKind::NoSpace, "Not enough space for the staged archive member.");
+      const auto before = work.bytes;
+      stageBody(reader, saved, entry.mode, entry.size, sparse);
+      remaining -= std::min(remaining, work.bytes - before);
+      for (const auto& alias : std::span(found->second).subspan(1))
+        if (::link(saved.c_str(), (stage.path / alias).c_str()) != 0)
+          systemError("Could not stage an archive hard link");
+      bodies.erase(found);
+    };
+    while (reader.next(header)) {
+      const auto name = reader.detected == Format::Gzip ? safePath(fs::path(source.name).stem().native())
+                                                        : safePath(bounded(archive_entry_pathname(header)));
+      const auto found = bodies.find(name);
+      if (found != bodies.end())
+        write(name, found, archive_entry_sparse_reset(header) > 0);
+      else
+        requireArchive(archive_read_data_skip(reader.value.get()), reader.value.get(), work);
+    }
+    reader.finish();
+    if (reader.detected == Format::Gzip && !bodies.empty()) {
+      header = nullptr;
+      write(bodies.begin()->first, bodies.begin(), false);
+    }
+    if (!bodies.empty())
+      throwFileError(FileErrorKind::Changed, "An archive selection no longer exists.");
+    for (const auto& [output, target] : links)
+      if (::symlink(target.c_str(), (stage.path / output).c_str()) != 0)
+        systemError("Could not stage an archive symbolic link");
+    for (auto i = items.rbegin(); i != items.rend(); ++i) {
+      const auto& entry = catalogue.entries.at(i->first);
+      if (entry.kind == EntryKind::Directory && ::chmod((stage.path / i->second).c_str(), entry.mode) != 0)
+        systemError("Could not set staged archive directory permissions");
+    }
+  }
+
   void readArchive(const std::filesystem::path& path, const Source& source, Stage& stage, Work& work) {
     Entries entries;
     std::map<std::string, std::string> links;

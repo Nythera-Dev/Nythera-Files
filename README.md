@@ -225,7 +225,7 @@ DESTDIR=/path/to/stage meson install --no-rebuild -C build-debug
 
 Polkit execution checks require root ownership and non-writable ancestors down to `/`, so elevated Properties and Administrator Mode actions remain disabled in unprivileged or staged installs. Other environments outside Arch Linux have not been extensively tested.
 
-The optional [native archive backend](docs/FILE-MANAGER-ARCHIVES.md) is built with the standalone file manager. Archive actions will be connected in a later stage.
+The optional [native archive backend](docs/FILE-MANAGER-ARCHIVES.md) is built with the standalone file manager. Use the Compress and Extract submenus in the context and Tools menus. Password-protected 7z operations use the optional 7-Zip executable.
 
 There is no stable packaged release yet.
 
